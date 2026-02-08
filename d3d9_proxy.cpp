@@ -1,16 +1,15 @@
 /**
- * DMC4 Camera Proxy for RTX Remix
+ * DMC4 Camera Proxy for D3D9
  *
  * This proxy DLL intercepts D3D9 calls, extracts camera matrices from
- * vertex shader constants, and provides them to RTX Remix via SetTransform().
+ * vertex shader constants, and provides them via SetTransform().
  *
  * Build with Visual Studio Developer Command Prompt:
  *   cl /LD /EHsc d3d9_proxy.cpp /link /DEF:d3d9.def /OUT:d3d9.dll
  *
  * Setup:
- * 1. Rename Remix's d3d9.dll to d3d9_remix.dll
- * 2. Place this compiled d3d9.dll in the game folder
- * 3. Configure matrix extraction registers in camera_proxy.ini
+ * 1. Place this compiled d3d9.dll in the game folder
+ * 2. Configure matrix extraction registers in camera_proxy.ini
  */
 
 #define WIN32_LEAN_AND_MEAN
@@ -36,9 +35,43 @@ struct ProxyConfig {
 };
 
 static ProxyConfig g_config;
-static HMODULE g_hRemixD3D9 = nullptr;
+static HMODULE g_hD3D9 = nullptr;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
+
+struct CameraMatrices {
+    D3DMATRIX view;
+    D3DMATRIX projection;
+    bool hasView;
+    bool hasProjection;
+};
+
+static CameraMatrices g_cameraMatrices = {};
+
+static void StoreViewMatrix(const D3DMATRIX& view) {
+    g_cameraMatrices.view = view;
+    g_cameraMatrices.hasView = true;
+}
+
+static void StoreProjectionMatrix(const D3DMATRIX& projection) {
+    g_cameraMatrices.projection = projection;
+    g_cameraMatrices.hasProjection = true;
+}
+
+static HMODULE LoadSystemD3D9() {
+    char systemDir[MAX_PATH] = {};
+    if (GetSystemDirectoryA(systemDir, MAX_PATH) == 0) {
+        return LoadLibraryA("d3d9.dll");
+    }
+
+    char path[MAX_PATH] = {};
+    snprintf(path, MAX_PATH, "%s\\d3d9.dll", systemDir);
+    HMODULE module = LoadLibraryA(path);
+    if (!module) {
+        module = LoadLibraryA("d3d9.dll");
+    }
+    return module;
+}
 
 // Function pointer types
 typedef IDirect3D9* (WINAPI* Direct3DCreate9_t)(UINT SDKVersion);
@@ -231,7 +264,7 @@ public:
         }
 
         // DMC4-specific: c0-c3 contains combined MVP matrix
-        // Extract what we can and synthesize valid View/Projection for Remix
+        // Extract what we can and synthesize valid View/Projection data
         if (StartRegister == 0 && Vector4fCount >= 4) {
             D3DMATRIX mvp;
             memcpy(&mvp, pConstantData, sizeof(D3DMATRIX));
@@ -249,9 +282,11 @@ public:
                 // Create standard projection (60 degree FOV, 16:9 aspect)
                 CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                // Set both transforms for Remix
+                // Set both transforms for the runtime
                 m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
                 m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
+                StoreViewMatrix(m_lastViewMatrix);
+                StoreProjectionMatrix(m_lastProjMatrix);
 
                 if (!m_hasView) {
                     LogMsg("DMC4: Extracting camera from MVP at c0-c3");
@@ -280,12 +315,14 @@ public:
                         m_real->SetTransform(D3DTS_PROJECTION, &mat);
                         memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasProj = true;
+                        StoreProjectionMatrix(m_lastProjMatrix);
                     }
                     else if (LooksLikeView(mat)) {
                         LogMsg("AUTO-DETECT: VIEW matrix at c%d", reg);
                         m_real->SetTransform(D3DTS_VIEW, &mat);
                         memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasView = true;
+                        StoreViewMatrix(m_lastViewMatrix);
                     }
                 }
             }
@@ -308,6 +345,7 @@ public:
                     memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasView = true;
                     m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+                    StoreViewMatrix(m_lastViewMatrix);
                     LogMsg("Extracted VIEW matrix from c%d", g_config.viewMatrixRegister);
                 }
             }
@@ -329,6 +367,7 @@ public:
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
                     m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
+                    StoreProjectionMatrix(m_lastProjMatrix);
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
                     LogMsg("Extracted PROJECTION matrix from c%d (FOV: %.1f deg)",
@@ -703,43 +742,31 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 
         if (g_config.enableLogging) {
             g_logFile = fopen("camera_proxy.log", "w");
-            LogMsg("=== DMC4 Camera Proxy for RTX Remix ===");
+            LogMsg("=== DMC4 Camera Proxy for D3D9 ===");
             LogMsg("View matrix register: c%d-c%d", g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
             LogMsg("Projection matrix register: c%d-c%d", g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
             LogMsg("Auto-detect matrices: %s", g_config.autoDetectMatrices ? "ENABLED" : "disabled");
             LogMsg("Log all constants: %s", g_config.logAllConstants ? "ENABLED" : "disabled");
         }
 
-        // Load the real Remix d3d9.dll
-        char path[MAX_PATH];
-        GetModuleFileNameA(hinstDLL, path, MAX_PATH);
-        char* lastSlash = strrchr(path, '\\');
-        if (lastSlash) {
-            strcpy(lastSlash + 1, "d3d9_remix.dll");
-        }
+        // Load the real system d3d9.dll
+        g_hD3D9 = LoadSystemD3D9();
 
-        g_hRemixD3D9 = LoadLibraryA(path);
-        if (!g_hRemixD3D9) {
-            g_hRemixD3D9 = LoadLibraryA("d3d9_remix.dll");
-        }
-
-        if (g_hRemixD3D9) {
-            g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hRemixD3D9, "Direct3DCreate9");
-            g_origDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hRemixD3D9, "Direct3DCreate9Ex");
-            g_origD3DPERF_BeginEvent = (D3DPERF_BeginEvent_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_BeginEvent");
-            g_origD3DPERF_EndEvent = (D3DPERF_EndEvent_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_EndEvent");
-            g_origD3DPERF_GetStatus = (D3DPERF_GetStatus_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_GetStatus");
-            g_origD3DPERF_QueryRepeatFrame = (D3DPERF_QueryRepeatFrame_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_QueryRepeatFrame");
-            g_origD3DPERF_SetMarker = (D3DPERF_SetMarker_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_SetMarker");
-            g_origD3DPERF_SetOptions = (D3DPERF_SetOptions_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_SetOptions");
-            g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hRemixD3D9, "D3DPERF_SetRegion");
-            LogMsg("Loaded d3d9_remix.dll successfully");
+        if (g_hD3D9) {
+            g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
+            g_origDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hD3D9, "Direct3DCreate9Ex");
+            g_origD3DPERF_BeginEvent = (D3DPERF_BeginEvent_t)GetProcAddress(g_hD3D9, "D3DPERF_BeginEvent");
+            g_origD3DPERF_EndEvent = (D3DPERF_EndEvent_t)GetProcAddress(g_hD3D9, "D3DPERF_EndEvent");
+            g_origD3DPERF_GetStatus = (D3DPERF_GetStatus_t)GetProcAddress(g_hD3D9, "D3DPERF_GetStatus");
+            g_origD3DPERF_QueryRepeatFrame = (D3DPERF_QueryRepeatFrame_t)GetProcAddress(g_hD3D9, "D3DPERF_QueryRepeatFrame");
+            g_origD3DPERF_SetMarker = (D3DPERF_SetMarker_t)GetProcAddress(g_hD3D9, "D3DPERF_SetMarker");
+            g_origD3DPERF_SetOptions = (D3DPERF_SetOptions_t)GetProcAddress(g_hD3D9, "D3DPERF_SetOptions");
+            g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hD3D9, "D3DPERF_SetRegion");
+            LogMsg("Loaded system d3d9.dll successfully");
             LogMsg("  Direct3DCreate9: %p", g_origDirect3DCreate9);
             LogMsg("  Direct3DCreate9Ex: %p", g_origDirect3DCreate9Ex);
         } else {
-            LogMsg("ERROR: Failed to load d3d9_remix.dll!");
-            MessageBoxA(nullptr, "Failed to load d3d9_remix.dll!\n\nMake sure Remix's d3d9.dll is renamed to d3d9_remix.dll",
-                       "Camera Proxy Error", MB_OK | MB_ICONERROR);
+            LogMsg("ERROR: Failed to load system d3d9.dll!");
         }
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
@@ -748,8 +775,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Total frames: %d", g_frameCount);
             fclose(g_logFile);
         }
-        if (g_hRemixD3D9) {
-            FreeLibrary(g_hRemixD3D9);
+        if (g_hD3D9) {
+            FreeLibrary(g_hD3D9);
         }
     }
     return TRUE;
@@ -760,6 +787,10 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 // The .def file maps these to the real export names
 
 extern "C" {
+    __declspec(dllexport) const CameraMatrices* WINAPI Proxy_GetCameraMatrices() {
+        return &g_cameraMatrices;
+    }
+
     IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT SDKVersion) {
         LogMsg("Direct3DCreate9 called (SDK version: %d)", SDKVersion);
 
