@@ -19,6 +19,7 @@
 #include <cmath>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
+#define IMGUI_DEFINE_MATH_OPERATORS
 
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_dx9.h"
@@ -203,7 +204,7 @@ void LogMsg(const char* fmt, ...) {
 bool LooksLikeMatrix(const float* data) {
     float sum = 0;
     for (int i = 0; i < 16; i++) {
-        if (!isfinite(data[i])) return false;
+        if (!std::isfinite(data[i])) return false;
         sum += fabsf(data[i]);
     }
     if (sum < 0.001f || sum > 10000.0f) return false;
@@ -377,7 +378,7 @@ public:
             // Check for valid floats (skip LooksLikeMatrix - MVP has large values)
             bool validFloats = true;
             for (int i = 0; i < 16 && validFloats; i++) {
-                if (!isfinite(pConstantData[i])) validFloats = false;
+                if (!std::isfinite(pConstantData[i])) validFloats = false;
             }
 
             if (validFloats) {
