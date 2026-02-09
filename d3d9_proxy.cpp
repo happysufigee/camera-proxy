@@ -17,6 +17,8 @@
 #include <d3d9.h>
 #include <cstdio>
 #include <cmath>
+#include <unordered_map>
+#include <vector>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -76,24 +78,21 @@ static bool g_showConstantsView = false;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
 static bool g_showFpsStats = true;
-static bool g_freecamEnabled = false;
-static bool g_freecamToggleWasDown = false;
-static bool g_freecamHasState = false;
-static D3DVECTOR g_freecamPosition = {};
-static float g_freecamYaw = 0.0f;
-static float g_freecamPitch = 0.0f;
-static POINT g_freecamLastMouse = {};
-static bool g_freecamHasMouse = false;
-static LARGE_INTEGER g_freecamLastCounter = {};
-static bool g_freecamTimeInitialized = false;
+static bool g_showTransposedMatrices = false;
 
 static constexpr int kMaxConstantRegisters = 256;
-static float g_vertexConstants[kMaxConstantRegisters][4] = {};
-static bool g_vertexConstantsValid[kMaxConstantRegisters] = {};
-static float g_vertexConstantsSnapshot[kMaxConstantRegisters][4] = {};
-static bool g_vertexConstantsSnapshotValid[kMaxConstantRegisters] = {};
-static bool g_vertexConstantsSnapshotReady = false;
 static int g_selectedRegister = -1;
+static uintptr_t g_activeShaderKey = 0;
+static uintptr_t g_selectedShaderKey = 0;
+
+struct ShaderConstantState {
+    float constants[kMaxConstantRegisters][4] = {};
+    bool valid[kMaxConstantRegisters] = {};
+    bool snapshotReady = false;
+};
+
+static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
+static std::vector<uintptr_t> g_shaderOrder = {};
 
 static constexpr int kFrameTimeHistory = 120;
 static float g_frameTimeHistory[kFrameTimeHistory] = {};
@@ -203,43 +202,80 @@ static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) 
     ImGui::Text("[%.3f %.3f %.3f %.3f]", mat._41, mat._42, mat._43, mat._44);
 }
 
-static bool TryBuildMatrixFromSnapshot(int baseRegister, D3DMATRIX* outMatrix) {
-    if (!g_vertexConstantsSnapshotReady || baseRegister < 0 ||
+static D3DMATRIX TransposeMatrix(const D3DMATRIX& mat) {
+    D3DMATRIX out = {};
+    out._11 = mat._11; out._12 = mat._21; out._13 = mat._31; out._14 = mat._41;
+    out._21 = mat._12; out._22 = mat._22; out._23 = mat._32; out._24 = mat._42;
+    out._31 = mat._13; out._32 = mat._23; out._33 = mat._33; out._34 = mat._43;
+    out._41 = mat._14; out._42 = mat._24; out._43 = mat._34; out._44 = mat._44;
+    return out;
+}
+
+static void DrawMatrixWithTranspose(const char* label, const D3DMATRIX& mat, bool available,
+                                    bool transpose) {
+    if (!transpose) {
+        DrawMatrix(label, mat, available);
+        return;
+    }
+    D3DMATRIX transposed = TransposeMatrix(mat);
+    DrawMatrix(label, transposed, available);
+}
+
+static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing) {
+    if (shaderKey == 0 && !createIfMissing) {
+        return nullptr;
+    }
+    auto it = g_shaderConstants.find(shaderKey);
+    if (it != g_shaderConstants.end()) {
+        return &it->second;
+    }
+    if (!createIfMissing) {
+        return nullptr;
+    }
+    g_shaderOrder.push_back(shaderKey);
+    auto inserted = g_shaderConstants.emplace(shaderKey, ShaderConstantState{});
+    return &inserted.first->second;
+}
+
+static bool TryBuildMatrixFromSnapshot(const ShaderConstantState& state, int baseRegister,
+                                       D3DMATRIX* outMatrix) {
+    if (!state.snapshotReady || baseRegister < 0 ||
         baseRegister + 3 >= kMaxConstantRegisters) {
         return false;
     }
 
     for (int i = 0; i < 4; i++) {
-        if (!g_vertexConstantsSnapshotValid[baseRegister + i]) {
+        if (!state.valid[baseRegister + i]) {
             return false;
         }
     }
 
     memset(outMatrix, 0, sizeof(D3DMATRIX));
-    outMatrix->_11 = g_vertexConstantsSnapshot[baseRegister + 0][0];
-    outMatrix->_12 = g_vertexConstantsSnapshot[baseRegister + 0][1];
-    outMatrix->_13 = g_vertexConstantsSnapshot[baseRegister + 0][2];
-    outMatrix->_14 = g_vertexConstantsSnapshot[baseRegister + 0][3];
+    outMatrix->_11 = state.constants[baseRegister + 0][0];
+    outMatrix->_12 = state.constants[baseRegister + 0][1];
+    outMatrix->_13 = state.constants[baseRegister + 0][2];
+    outMatrix->_14 = state.constants[baseRegister + 0][3];
 
-    outMatrix->_21 = g_vertexConstantsSnapshot[baseRegister + 1][0];
-    outMatrix->_22 = g_vertexConstantsSnapshot[baseRegister + 1][1];
-    outMatrix->_23 = g_vertexConstantsSnapshot[baseRegister + 1][2];
-    outMatrix->_24 = g_vertexConstantsSnapshot[baseRegister + 1][3];
+    outMatrix->_21 = state.constants[baseRegister + 1][0];
+    outMatrix->_22 = state.constants[baseRegister + 1][1];
+    outMatrix->_23 = state.constants[baseRegister + 1][2];
+    outMatrix->_24 = state.constants[baseRegister + 1][3];
 
-    outMatrix->_31 = g_vertexConstantsSnapshot[baseRegister + 2][0];
-    outMatrix->_32 = g_vertexConstantsSnapshot[baseRegister + 2][1];
-    outMatrix->_33 = g_vertexConstantsSnapshot[baseRegister + 2][2];
-    outMatrix->_34 = g_vertexConstantsSnapshot[baseRegister + 2][3];
+    outMatrix->_31 = state.constants[baseRegister + 2][0];
+    outMatrix->_32 = state.constants[baseRegister + 2][1];
+    outMatrix->_33 = state.constants[baseRegister + 2][2];
+    outMatrix->_34 = state.constants[baseRegister + 2][3];
 
-    outMatrix->_41 = g_vertexConstantsSnapshot[baseRegister + 3][0];
-    outMatrix->_42 = g_vertexConstantsSnapshot[baseRegister + 3][1];
-    outMatrix->_43 = g_vertexConstantsSnapshot[baseRegister + 3][2];
-    outMatrix->_44 = g_vertexConstantsSnapshot[baseRegister + 3][3];
+    outMatrix->_41 = state.constants[baseRegister + 3][0];
+    outMatrix->_42 = state.constants[baseRegister + 3][1];
+    outMatrix->_43 = state.constants[baseRegister + 3][2];
+    outMatrix->_44 = state.constants[baseRegister + 3][3];
     return true;
 }
 
-static bool TryBuildMatrixSnapshotInfo(int baseRegister, D3DMATRIX* outMatrix, bool* looksLike) {
-    if (!TryBuildMatrixFromSnapshot(baseRegister, outMatrix)) {
+static bool TryBuildMatrixSnapshotInfo(const ShaderConstantState& state, int baseRegister,
+                                       D3DMATRIX* outMatrix, bool* looksLike) {
+    if (!TryBuildMatrixFromSnapshot(state, baseRegister, outMatrix)) {
         if (looksLike) {
             *looksLike = false;
         }
@@ -252,13 +288,9 @@ static bool TryBuildMatrixSnapshotInfo(int baseRegister, D3DMATRIX* outMatrix, b
 }
 
 static void UpdateConstantSnapshot() {
-    for (int i = 0; i < kMaxConstantRegisters; i++) {
-        g_vertexConstantsSnapshotValid[i] = g_vertexConstantsValid[i];
-        if (g_vertexConstantsValid[i]) {
-            memcpy(g_vertexConstantsSnapshot[i], g_vertexConstants[i], sizeof(g_vertexConstants[i]));
-        }
+    for (auto& entry : g_shaderConstants) {
+        entry.second.snapshotReady = true;
     }
-    g_vertexConstantsSnapshotReady = true;
 }
 
 static void UpdateImGuiToggle() {
@@ -311,189 +343,6 @@ static void UpdateFrameTimeStats() {
     g_frameTimeSamples++;
 }
 
-static D3DVECTOR AddVector(const D3DVECTOR& a, const D3DVECTOR& b) {
-    return {a.x + b.x, a.y + b.y, a.z + b.z};
-}
-
-static D3DVECTOR ScaleVector(const D3DVECTOR& v, float scale) {
-    return {v.x * scale, v.y * scale, v.z * scale};
-}
-
-static float DotVector(const D3DVECTOR& a, const D3DVECTOR& b) {
-    return a.x * b.x + a.y * b.y + a.z * b.z;
-}
-
-static D3DVECTOR CrossVector(const D3DVECTOR& a, const D3DVECTOR& b) {
-    return {a.y * b.z - a.z * b.y, a.z * b.x - a.x * b.z, a.x * b.y - a.y * b.x};
-}
-
-static D3DVECTOR NormalizeVector(const D3DVECTOR& v) {
-    float len = sqrtf(v.x * v.x + v.y * v.y + v.z * v.z);
-    if (len < 0.0001f) {
-        return {0.0f, 0.0f, 0.0f};
-    }
-    return {v.x / len, v.y / len, v.z / len};
-}
-
-static bool InitializeFreecamFromView(const D3DMATRIX& view) {
-    D3DVECTOR right = {view._11, view._12, view._13};
-    D3DVECTOR up = {view._21, view._22, view._23};
-    D3DVECTOR forward = {view._31, view._32, view._33};
-    right = NormalizeVector(right);
-    up = NormalizeVector(up);
-    forward = NormalizeVector(forward);
-
-    D3DVECTOR position = {
-        -(right.x * view._41 + up.x * view._42 + forward.x * view._43),
-        -(right.y * view._41 + up.y * view._42 + forward.y * view._43),
-        -(right.z * view._41 + up.z * view._42 + forward.z * view._43)
-    };
-
-    g_freecamPosition = position;
-    g_freecamYaw = atan2f(forward.x, forward.z);
-    g_freecamPitch = asinf(forward.y);
-    g_freecamHasState = true;
-    g_freecamHasMouse = false;
-    return true;
-}
-
-static D3DMATRIX BuildViewMatrixFromFreecam() {
-    float cosPitch = cosf(g_freecamPitch);
-    float sinPitch = sinf(g_freecamPitch);
-    float cosYaw = cosf(g_freecamYaw);
-    float sinYaw = sinf(g_freecamYaw);
-
-    D3DVECTOR forward = {sinYaw * cosPitch, sinPitch, cosYaw * cosPitch};
-    forward = NormalizeVector(forward);
-    D3DVECTOR worldUp = {0.0f, 1.0f, 0.0f};
-    D3DVECTOR right = NormalizeVector(CrossVector(worldUp, forward));
-    D3DVECTOR up = CrossVector(forward, right);
-
-    D3DMATRIX view = {};
-    view._11 = right.x;
-    view._12 = right.y;
-    view._13 = right.z;
-    view._14 = 0.0f;
-
-    view._21 = up.x;
-    view._22 = up.y;
-    view._23 = up.z;
-    view._24 = 0.0f;
-
-    view._31 = forward.x;
-    view._32 = forward.y;
-    view._33 = forward.z;
-    view._34 = 0.0f;
-
-    view._41 = -DotVector(right, g_freecamPosition);
-    view._42 = -DotVector(up, g_freecamPosition);
-    view._43 = -DotVector(forward, g_freecamPosition);
-    view._44 = 1.0f;
-
-    return view;
-}
-
-static void UpdateFreecamToggle() {
-    bool down = (GetAsyncKeyState(VK_F6) & 0x8000) != 0;
-    if (down && !g_freecamToggleWasDown) {
-        g_freecamEnabled = !g_freecamEnabled;
-        g_freecamHasState = false;
-        g_freecamTimeInitialized = false;
-        g_freecamHasMouse = false;
-    }
-    g_freecamToggleWasDown = down;
-}
-
-static void UpdateFreecam(IDirect3DDevice9* device, HWND hwnd) {
-    if (!g_freecamEnabled || !device) {
-        return;
-    }
-
-    if (!g_freecamHasState && g_cameraMatrices.hasView) {
-        InitializeFreecamFromView(g_cameraMatrices.view);
-    }
-
-    LARGE_INTEGER now = {};
-    QueryPerformanceCounter(&now);
-    if (!g_freecamTimeInitialized) {
-        g_freecamLastCounter = now;
-        g_freecamTimeInitialized = true;
-    }
-
-    double deltaSeconds = 0.0;
-    if (g_perfFrequency.QuadPart > 0) {
-        deltaSeconds = static_cast<double>(now.QuadPart - g_freecamLastCounter.QuadPart) /
-                       static_cast<double>(g_perfFrequency.QuadPart);
-    }
-    g_freecamLastCounter = now;
-
-    float moveSpeed = 6.0f;
-    float lookSpeed = 0.0025f;
-    if (GetAsyncKeyState(VK_SHIFT) & 0x8000) {
-        moveSpeed *= 2.5f;
-    }
-
-    if (hwnd) {
-        POINT pos = {};
-        if (GetCursorPos(&pos) && ScreenToClient(hwnd, &pos)) {
-            if (!g_freecamHasMouse) {
-                g_freecamLastMouse = pos;
-                g_freecamHasMouse = true;
-            }
-            ImGuiIO& io = ImGui::GetIO();
-            if (!io.WantCaptureMouse) {
-                int dx = pos.x - g_freecamLastMouse.x;
-                int dy = pos.y - g_freecamLastMouse.y;
-                g_freecamYaw += dx * lookSpeed;
-                g_freecamPitch += -dy * lookSpeed;
-                const float kPitchLimit = 1.55f;
-                if (g_freecamPitch > kPitchLimit) g_freecamPitch = kPitchLimit;
-                if (g_freecamPitch < -kPitchLimit) g_freecamPitch = -kPitchLimit;
-            }
-            g_freecamLastMouse = pos;
-        }
-    }
-
-    float cosPitch = cosf(g_freecamPitch);
-    float sinPitch = sinf(g_freecamPitch);
-    float cosYaw = cosf(g_freecamYaw);
-    float sinYaw = sinf(g_freecamYaw);
-    D3DVECTOR forward = {sinYaw * cosPitch, sinPitch, cosYaw * cosPitch};
-    forward = NormalizeVector(forward);
-    D3DVECTOR right = NormalizeVector(CrossVector({0.0f, 1.0f, 0.0f}, forward));
-    D3DVECTOR up = CrossVector(forward, right);
-
-    D3DVECTOR delta = {};
-    if (GetAsyncKeyState('W') & 0x8000) {
-        delta = AddVector(delta, forward);
-    }
-    if (GetAsyncKeyState('S') & 0x8000) {
-        delta = AddVector(delta, ScaleVector(forward, -1.0f));
-    }
-    if (GetAsyncKeyState('D') & 0x8000) {
-        delta = AddVector(delta, right);
-    }
-    if (GetAsyncKeyState('A') & 0x8000) {
-        delta = AddVector(delta, ScaleVector(right, -1.0f));
-    }
-    if (GetAsyncKeyState(VK_SPACE) & 0x8000) {
-        delta = AddVector(delta, up);
-    }
-    if (GetAsyncKeyState(VK_CONTROL) & 0x8000) {
-        delta = AddVector(delta, ScaleVector(up, -1.0f));
-    }
-
-    float deltaLen = sqrtf(delta.x * delta.x + delta.y * delta.y + delta.z * delta.z);
-    if (deltaLen > 0.0001f && deltaSeconds > 0.0) {
-        delta = ScaleVector(delta, 1.0f / deltaLen);
-        g_freecamPosition = AddVector(g_freecamPosition, ScaleVector(delta, moveSpeed * static_cast<float>(deltaSeconds)));
-    }
-
-    D3DMATRIX view = BuildViewMatrixFromFreecam();
-    device->SetTransform(D3DTS_VIEW, &view);
-    StoreViewMatrix(view);
-}
-
 static void RenderImGuiOverlay() {
     if (!g_imguiInitialized || !g_showImGui) {
         return;
@@ -510,11 +359,7 @@ static void RenderImGuiOverlay() {
                  ImGuiWindowFlags_NoSavedSettings);
     ImGui::Text("Toggle menu: Alt+M | Pause rendering: Pause");
     ImGui::Checkbox("Show FPS stats", &g_showFpsStats);
-    if (ImGui::Checkbox("Enable freecam (F6)", &g_freecamEnabled)) {
-        g_freecamHasState = false;
-        g_freecamTimeInitialized = false;
-        g_freecamHasMouse = false;
-    }
+    ImGui::Checkbox("Show transposed matrices", &g_showTransposedMatrices);
     if (g_showFpsStats && g_frameTimeSamples > 0) {
         float minMs = g_frameTimeHistory[0];
         float maxMs = g_frameTimeHistory[0];
@@ -543,16 +388,50 @@ static void RenderImGuiOverlay() {
 
     if (!g_showConstantsView) {
         if (ImGui::CollapsingHeader("Camera Matrices", ImGuiTreeNodeFlags_DefaultOpen)) {
-            DrawMatrix("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld);
+            DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
+                                    g_showTransposedMatrices);
             ImGui::Separator();
-            DrawMatrix("View", g_cameraMatrices.view, g_cameraMatrices.hasView);
+            DrawMatrixWithTranspose("View", g_cameraMatrices.view, g_cameraMatrices.hasView,
+                                    g_showTransposedMatrices);
             ImGui::Separator();
-            DrawMatrix("Projection", g_cameraMatrices.projection, g_cameraMatrices.hasProjection);
+            DrawMatrixWithTranspose("Projection", g_cameraMatrices.projection,
+                                    g_cameraMatrices.hasProjection, g_showTransposedMatrices);
             ImGui::Separator();
-            DrawMatrix("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP);
+            DrawMatrixWithTranspose("MVP (c0-c3)", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
+                                    g_showTransposedMatrices);
         }
     } else {
-        ImGui::Text("Snapshot updates every frame.");
+        ImGui::Text("Per-shader snapshots update every frame.");
+        if (g_selectedShaderKey == 0) {
+            if (g_activeShaderKey != 0) {
+                g_selectedShaderKey = g_activeShaderKey;
+            } else if (!g_shaderOrder.empty()) {
+                g_selectedShaderKey = g_shaderOrder.front();
+            }
+        }
+        if (!g_shaderOrder.empty()) {
+            char preview[64];
+            snprintf(preview, sizeof(preview), "0x%p%s", reinterpret_cast<void*>(g_selectedShaderKey),
+                     g_selectedShaderKey == g_activeShaderKey ? " (active)" : "");
+            if (ImGui::BeginCombo("Shader", preview)) {
+                for (uintptr_t key : g_shaderOrder) {
+                    char itemLabel[64];
+                    snprintf(itemLabel, sizeof(itemLabel), "0x%p%s", reinterpret_cast<void*>(key),
+                             key == g_activeShaderKey ? " (active)" : "");
+                    bool selected = (key == g_selectedShaderKey);
+                    if (ImGui::Selectable(itemLabel, selected)) {
+                        g_selectedShaderKey = key;
+                        g_selectedRegister = -1;
+                    }
+                    if (selected) {
+                        ImGui::SetItemDefaultFocus();
+                    }
+                }
+                ImGui::EndCombo();
+            }
+        } else {
+            ImGui::Text("<no shader constants captured yet>");
+        }
         ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
         ImGui::SameLine();
         ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
@@ -560,12 +439,13 @@ static void RenderImGuiOverlay() {
             ImGui::Text("Selected register: c%d", g_selectedRegister);
         }
         ImGui::BeginChild("ConstantsScroll", ImVec2(0, 340), true);
-        if (g_vertexConstantsSnapshotReady) {
+        ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
+        if (state && state->snapshotReady) {
             if (g_showConstantsAsMatrices) {
                 for (int base = 0; base < kMaxConstantRegisters; base += 4) {
                     D3DMATRIX mat = {};
                     bool looksLike = false;
-                    bool hasMatrix = TryBuildMatrixSnapshotInfo(base, &mat, &looksLike);
+                    bool hasMatrix = TryBuildMatrixSnapshotInfo(*state, base, &mat, &looksLike);
 
                     if (g_filterDetectedMatrices) {
                         if (!hasMatrix || !looksLike) {
@@ -574,7 +454,7 @@ static void RenderImGuiOverlay() {
                     } else {
                         bool anyValid = false;
                         for (int reg = base; reg < base + 4; reg++) {
-                            if (g_vertexConstantsSnapshotValid[reg]) {
+                            if (state->valid[reg]) {
                                 anyValid = true;
                                 break;
                             }
@@ -597,12 +477,23 @@ static void RenderImGuiOverlay() {
                         g_selectedRegister = base;
                     }
                     if (open) {
+                        D3DMATRIX displayMat = mat;
+                        if (g_showTransposedMatrices && hasMatrix) {
+                            displayMat = TransposeMatrix(mat);
+                        }
                         for (int reg = base; reg < base + 4; reg++) {
                             char rowLabel[128];
-                            if (g_vertexConstantsSnapshotValid[reg]) {
-                                const float* data = g_vertexConstantsSnapshot[reg];
-                                snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
-                                         reg, data[0], data[1], data[2], data[3]);
+                            if (state->valid[reg]) {
+                                if (g_showTransposedMatrices && hasMatrix) {
+                                    int row = reg - base;
+                                    const float* data = reinterpret_cast<const float*>(&displayMat) + row * 4;
+                                    snprintf(rowLabel, sizeof(rowLabel), "r%d: [%.3f %.3f %.3f %.3f]",
+                                             row, data[0], data[1], data[2], data[3]);
+                                } else {
+                                    const float* data = state->constants[reg];
+                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
+                                             reg, data[0], data[1], data[2], data[3]);
+                                }
                             } else {
                                 snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>", reg);
                             }
@@ -616,10 +507,10 @@ static void RenderImGuiOverlay() {
                 }
             } else {
                 for (int reg = 0; reg < kMaxConstantRegisters; reg++) {
-                    if (!g_vertexConstantsSnapshotValid[reg]) {
+                    if (!state->valid[reg]) {
                         continue;
                     }
-                    const float* data = g_vertexConstantsSnapshot[reg];
+                    const float* data = state->constants[reg];
                     char rowLabel[128];
                     snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]",
                              reg, data[0], data[1], data[2], data[3]);
@@ -777,6 +668,7 @@ private:
     D3DMATRIX m_lastProjMatrix;
     D3DMATRIX m_lastWorldMatrix;
     HWND m_hwnd = nullptr;
+    IDirect3DVertexShader9* m_currentVertexShader = nullptr;
     bool m_hasView = false;
     bool m_hasProj = false;
     int m_constantLogThrottle = 0;
@@ -826,14 +718,17 @@ public:
         const float* pConstantData,
         UINT Vector4fCount) override
     {
+        uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
+        ShaderConstantState* state = GetShaderState(shaderKey, true);
         for (UINT i = 0; i < Vector4fCount; i++) {
             UINT reg = StartRegister + i;
             if (reg >= kMaxConstantRegisters) {
                 break;
             }
-            memcpy(g_vertexConstants[reg], pConstantData + i * 4, sizeof(g_vertexConstants[reg]));
-            g_vertexConstantsValid[reg] = true;
+            memcpy(state->constants[reg], pConstantData + i * 4, sizeof(state->constants[reg]));
+            state->valid[reg] = true;
         }
+        state->snapshotReady = true;
 
         // Diagnostic logging mode - log ALL constant updates
         if (g_config.logAllConstants && m_constantLogThrottle == 0) {
@@ -1118,7 +1013,12 @@ public:
     HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { return m_real->SetFVF(FVF); }
     HRESULT STDMETHODCALLTYPE GetFVF(DWORD* pFVF) override { return m_real->GetFVF(pFVF); }
     HRESULT STDMETHODCALLTYPE CreateVertexShader(const DWORD* pFunction, IDirect3DVertexShader9** ppShader) override { return m_real->CreateVertexShader(pFunction, ppShader); }
-    HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* pShader) override { return m_real->SetVertexShader(pShader); }
+    HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* pShader) override {
+        m_currentVertexShader = pShader;
+        g_activeShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        GetShaderState(g_activeShaderKey, true);
+        return m_real->SetVertexShader(pShader);
+    }
     HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** ppShader) override { return m_real->GetVertexShader(ppShader); }
     HRESULT STDMETHODCALLTYPE GetVertexShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) override { return m_real->GetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
     HRESULT STDMETHODCALLTYPE SetVertexShaderConstantI(UINT StartRegister, const int* pConstantData, UINT Vector4iCount) override { return m_real->SetVertexShaderConstantI(StartRegister, pConstantData, Vector4iCount); }
