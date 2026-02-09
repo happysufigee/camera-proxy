@@ -36,6 +36,10 @@ extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              LPARAM lParam);
 
 bool LooksLikeMatrix(const float* data);
+static void LogMsg(const char* fmt, ...);
+static bool LooksLikeViewStrict(const D3DMATRIX& m);
+static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
+float ExtractFOV(const D3DMATRIX& proj);
 
 #pragma comment(lib, "user32.lib")
 
