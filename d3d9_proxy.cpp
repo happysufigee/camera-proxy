@@ -59,6 +59,9 @@ struct ProxyConfig {
     int memoryScannerIntervalSec = 0;
     int memoryScannerMaxResults = 25;
     char memoryScannerModule[MAX_PATH] = {};
+    bool useRemixRuntime = true;
+    char remixDllName[MAX_PATH] = "d3d9_remix.dll";
+    bool emitFixedFunctionTransforms = true;
 
     // Diagnostic mode - log ALL shader constant updates
     bool logAllConstants = false;
@@ -174,6 +177,23 @@ static HMODULE LoadSystemD3D9() {
         module = LoadLibraryA("d3d9.dll");
     }
     return module;
+}
+
+static HMODULE LoadTargetD3D9() {
+    if (g_config.useRemixRuntime) {
+        HMODULE remixModule = LoadLibraryA(g_config.remixDllName);
+        if (remixModule) {
+            LogMsg("Loaded Remix runtime: %s", g_config.remixDllName);
+            return remixModule;
+        }
+        LogMsg("WARNING: Failed to load Remix runtime '%s', falling back to system d3d9.dll", g_config.remixDllName);
+    }
+
+    HMODULE systemModule = LoadSystemD3D9();
+    if (systemModule) {
+        LogMsg("Loaded system d3d9.dll");
+    }
+    return systemModule;
 }
 
 static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
@@ -1024,6 +1044,7 @@ private:
     IDirect3DVertexShader9* m_currentVertexShader = nullptr;
     bool m_hasView = false;
     bool m_hasProj = false;
+    bool m_hasWorld = false;
     int m_constantLogThrottle = 0;
 
 public:
@@ -1043,6 +1064,21 @@ public:
 
     ~WrappedD3D9Device() {
         LogMsg("WrappedD3D9Device destroyed");
+    }
+
+    void EmitFixedFunctionTransforms() {
+        if (!g_config.emitFixedFunctionTransforms) {
+            return;
+        }
+        if (m_hasWorld) {
+            m_real->SetTransform(D3DTS_WORLD, &m_lastWorldMatrix);
+        }
+        if (m_hasView) {
+            m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+        }
+        if (m_hasProj) {
+            m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
+        }
     }
 
     // IUnknown
@@ -1125,10 +1161,9 @@ public:
                     // Create standard projection (60 degree FOV, 16:9 aspect)
                     CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                    // Set view transform for the runtime
-                    m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
                     StoreViewMatrix(m_lastViewMatrix);
                     StoreProjectionMatrix(m_lastProjMatrix);
+                    EmitFixedFunctionTransforms();
 
                     if (!m_hasView) {
                         LogMsg("DMC4: Extracting camera from MVP at c0-c3");
@@ -1160,14 +1195,15 @@ public:
                         memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasProj = true;
                         StoreProjectionMatrix(m_lastProjMatrix);
+                        EmitFixedFunctionTransforms();
                         UpdateStability(*state, static_cast<int>(reg), false, projStrict);
                     }
                     else if (viewStrict || LooksLikeView(mat)) {
                         LogMsg("AUTO-DETECT: VIEW matrix at c%d", reg);
-                        m_real->SetTransform(D3DTS_VIEW, &mat);
                         memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasView = true;
                         StoreViewMatrix(m_lastViewMatrix);
+                        EmitFixedFunctionTransforms();
                         UpdateStability(*state, static_cast<int>(reg), viewStrict, false);
                     }
                 }
@@ -1191,8 +1227,8 @@ public:
                 if (viewStrict || LooksLikeView(mat)) {
                     memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasView = true;
-                    m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
                     StoreViewMatrix(m_lastViewMatrix);
+                    EmitFixedFunctionTransforms();
                     LogMsg("Extracted VIEW matrix from c%d", g_config.viewMatrixRegister);
                     UpdateStability(*state, g_config.viewMatrixRegister, viewStrict, false);
                 }
@@ -1216,6 +1252,7 @@ public:
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
                     StoreProjectionMatrix(m_lastProjMatrix);
+                    EmitFixedFunctionTransforms();
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
                     LogMsg("Extracted PROJECTION matrix from c%d (FOV: %.1f deg)",
@@ -1237,7 +1274,9 @@ public:
                 D3DMATRIX mat;
                 memcpy(&mat, matrixData, sizeof(D3DMATRIX));
                 memcpy(&m_lastWorldMatrix, &mat, sizeof(D3DMATRIX));
+                m_hasWorld = true;
                 StoreWorldMatrix(m_lastWorldMatrix);
+                EmitFixedFunctionTransforms();
             }
         }
 
@@ -1652,6 +1691,10 @@ void LoadConfig() {
     g_config.memoryScannerMaxResults = GetPrivateProfileIntA("CameraProxy", "MemoryScannerMaxResults", 25, path);
     GetPrivateProfileStringA("CameraProxy", "MemoryScannerModule", "", g_config.memoryScannerModule,
                              MAX_PATH, path);
+    g_config.useRemixRuntime = GetPrivateProfileIntA("CameraProxy", "UseRemixRuntime", 1, path) != 0;
+    g_config.emitFixedFunctionTransforms = GetPrivateProfileIntA("CameraProxy", "EmitFixedFunctionTransforms", 1, path) != 0;
+    GetPrivateProfileStringA("CameraProxy", "RemixDllName", "d3d9_remix.dll", g_config.remixDllName,
+                             MAX_PATH, path);
 
     char buf[64];
     GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
@@ -1678,6 +1721,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Variance threshold: %.4f", g_config.varianceThreshold);
             LogMsg("Candidate summary: %s", g_config.logCandidateSummary ? "ENABLED" : "disabled");
             LogMsg("Memory scanner: %s", g_config.enableMemoryScanner ? "ENABLED" : "disabled");
+            LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
+            LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
+            LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
             if (g_config.enableMemoryScanner) {
                 LogMsg("Memory scanner interval: %d sec", g_config.memoryScannerIntervalSec);
                 LogMsg("Memory scanner module: %s", g_config.memoryScannerModule[0]
@@ -1686,8 +1732,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             }
         }
 
-        // Load the real system d3d9.dll
-        g_hD3D9 = LoadSystemD3D9();
+        // Load the real D3D9 runtime (Remix or system, based on config)
+        g_hD3D9 = LoadTargetD3D9();
 
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
@@ -1699,11 +1745,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             g_origD3DPERF_SetMarker = (D3DPERF_SetMarker_t)GetProcAddress(g_hD3D9, "D3DPERF_SetMarker");
             g_origD3DPERF_SetOptions = (D3DPERF_SetOptions_t)GetProcAddress(g_hD3D9, "D3DPERF_SetOptions");
             g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hD3D9, "D3DPERF_SetRegion");
-            LogMsg("Loaded system d3d9.dll successfully");
+            LogMsg("Loaded target d3d9 runtime successfully");
             LogMsg("  Direct3DCreate9: %p", g_origDirect3DCreate9);
             LogMsg("  Direct3DCreate9Ex: %p", g_origDirect3DCreate9Ex);
         } else {
-            LogMsg("ERROR: Failed to load system d3d9.dll!");
+            LogMsg("ERROR: Failed to load target d3d9 runtime!");
         }
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {

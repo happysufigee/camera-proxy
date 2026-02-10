@@ -13,7 +13,7 @@ DMC4 uses a fully programmable shader pipeline and never calls the fixed-functio
 5. Optionally copy `rtx.conf` for tuned Remix settings
 6. Run the game
 
-The proxy will load `d3d9_remix.dll` automatically and chain through to it.
+The proxy can chain to either `d3d9_remix.dll` (default) or the system `d3d9.dll`, controlled by `camera_proxy.ini`.
 
 ## Building
 
@@ -39,6 +39,9 @@ Edit `camera_proxy.ini` to adjust behavior:
 |---------|---------|-------------|
 | `ViewMatrixRegister` | 4 | Shader constant register for the view matrix |
 | `ProjMatrixRegister` | 8 | Shader constant register for the projection matrix |
+| `UseRemixRuntime` | 1 | Load Remix runtime DLL (`RemixDllName`) instead of system `d3d9.dll` |
+| `RemixDllName` | d3d9_remix.dll | Runtime DLL name/path used when `UseRemixRuntime=1` |
+| `EmitFixedFunctionTransforms` | 1 | Emit `SetTransform` for WORLD/VIEW/PROJECTION as matrices are extracted |
 | `EnableLogging` | 1 | Write diagnostic output to `camera_proxy.log` |
 | `AutoDetectMatrices` | 0 | Scan all constants for view/projection matrices |
 | `LogAllConstants` | 0 | Log all shader constant updates (very verbose) |
