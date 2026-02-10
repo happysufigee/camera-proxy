@@ -59,6 +59,9 @@ struct ProxyConfig {
     int memoryScannerIntervalSec = 0;
     int memoryScannerMaxResults = 25;
     char memoryScannerModule[MAX_PATH] = {};
+    bool useRemixRuntime = true;
+    char remixDllName[MAX_PATH] = "d3d9_remix.dll";
+    bool emitFixedFunctionTransforms = true;
 
     // Diagnostic mode - log ALL shader constant updates
     bool logAllConstants = false;
@@ -94,6 +97,7 @@ static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
 static bool g_showFpsStats = true;
 static bool g_showTransposedMatrices = false;
+static bool g_enableShaderEditing = false;
 
 static constexpr int kMaxConstantRegisters = 256;
 static int g_selectedRegister = -1;
@@ -103,6 +107,8 @@ static uintptr_t g_selectedShaderKey = 0;
 struct ShaderConstantState {
     float constants[kMaxConstantRegisters][4] = {};
     bool valid[kMaxConstantRegisters] = {};
+    float overrideConstants[kMaxConstantRegisters][4] = {};
+    bool overrideValid[kMaxConstantRegisters] = {};
     bool snapshotReady = false;
     unsigned long long sampleCount = 0;
     double mean[kMaxConstantRegisters][4] = {};
@@ -174,6 +180,23 @@ static HMODULE LoadSystemD3D9() {
         module = LoadLibraryA("d3d9.dll");
     }
     return module;
+}
+
+static HMODULE LoadTargetD3D9() {
+    if (g_config.useRemixRuntime) {
+        HMODULE remixModule = LoadLibraryA(g_config.remixDllName);
+        if (remixModule) {
+            LogMsg("Loaded Remix runtime: %s", g_config.remixDllName);
+            return remixModule;
+        }
+        LogMsg("WARNING: Failed to load Remix runtime '%s', falling back to system d3d9.dll", g_config.remixDllName);
+    }
+
+    HMODULE systemModule = LoadSystemD3D9();
+    if (systemModule) {
+        LogMsg("Loaded system d3d9.dll");
+    }
+    return systemModule;
 }
 
 static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
@@ -273,6 +296,63 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
     g_shaderOrder.push_back(shaderKey);
     auto inserted = g_shaderConstants.emplace(shaderKey, ShaderConstantState{});
     return &inserted.first->second;
+}
+
+static void ClearAllShaderOverrides() {
+    for (auto& entry : g_shaderConstants) {
+        ShaderConstantState& state = entry.second;
+        memset(state.overrideConstants, 0, sizeof(state.overrideConstants));
+        memset(state.overrideValid, 0, sizeof(state.overrideValid));
+    }
+}
+
+static void ClearShaderRegisterOverride(uintptr_t shaderKey, int reg) {
+    if (reg < 0 || reg >= kMaxConstantRegisters) {
+        return;
+    }
+    ShaderConstantState* state = GetShaderState(shaderKey, false);
+    if (!state) {
+        return;
+    }
+    memset(state->overrideConstants[reg], 0, sizeof(state->overrideConstants[reg]));
+    state->overrideValid[reg] = false;
+}
+
+static bool BuildOverriddenConstants(const ShaderConstantState& state,
+                                     UINT startRegister,
+                                     UINT vector4fCount,
+                                     const float* sourceData,
+                                     std::vector<float>& scratch) {
+    if (!g_enableShaderEditing || !sourceData || vector4fCount == 0) {
+        return false;
+    }
+
+    bool hasOverride = false;
+    for (UINT i = 0; i < vector4fCount; i++) {
+        UINT reg = startRegister + i;
+        if (reg >= kMaxConstantRegisters) {
+            break;
+        }
+        if (state.overrideValid[reg]) {
+            hasOverride = true;
+            break;
+        }
+    }
+    if (!hasOverride) {
+        return false;
+    }
+
+    scratch.assign(sourceData, sourceData + vector4fCount * 4);
+    for (UINT i = 0; i < vector4fCount; i++) {
+        UINT reg = startRegister + i;
+        if (reg >= kMaxConstantRegisters) {
+            break;
+        }
+        if (state.overrideValid[reg]) {
+            memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
+        }
+    }
+    return true;
 }
 
 static void UpdateVariance(ShaderConstantState& state, int reg, const float* values) {
@@ -688,10 +768,41 @@ static void RenderImGuiOverlay() {
         ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
         ImGui::SameLine();
         ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
+
+        ImGui::Separator();
+        ImGui::Checkbox("Enable shader constant editing", &g_enableShaderEditing);
+        ImGui::SameLine();
+        if (ImGui::Button("Reset all overrides")) {
+            ClearAllShaderOverrides();
+        }
+
+        ShaderConstantState* editState = GetShaderState(g_selectedShaderKey, false);
         if (g_selectedRegister >= 0) {
             ImGui::Text("Selected register: c%d", g_selectedRegister);
+            if (editState && g_selectedRegister < kMaxConstantRegisters) {
+                float editValues[4] = {};
+                if (editState->overrideValid[g_selectedRegister]) {
+                    memcpy(editValues, editState->overrideConstants[g_selectedRegister], sizeof(editValues));
+                } else if (editState->valid[g_selectedRegister]) {
+                    memcpy(editValues, editState->constants[g_selectedRegister], sizeof(editValues));
+                }
+
+                if (ImGui::InputFloat4("Override values", editValues, "%.6f")) {
+                    memcpy(editState->overrideConstants[g_selectedRegister], editValues,
+                           sizeof(editState->overrideConstants[g_selectedRegister]));
+                    editState->overrideValid[g_selectedRegister] = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset selected override")) {
+                    ClearShaderRegisterOverride(g_selectedShaderKey, g_selectedRegister);
+                }
+                if (!g_enableShaderEditing) {
+                    ImGui::TextDisabled("Editing is armed but inactive until enabled.");
+                }
+            }
         }
-        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 340), true);
+
+        ImGui::BeginChild("ConstantsScroll", ImVec2(0, 300), true);
         ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
         if (state && state->snapshotReady) {
             if (g_showConstantsAsMatrices) {
@@ -1024,6 +1135,7 @@ private:
     IDirect3DVertexShader9* m_currentVertexShader = nullptr;
     bool m_hasView = false;
     bool m_hasProj = false;
+    bool m_hasWorld = false;
     int m_constantLogThrottle = 0;
 
 public:
@@ -1043,6 +1155,21 @@ public:
 
     ~WrappedD3D9Device() {
         LogMsg("WrappedD3D9Device destroyed");
+    }
+
+    void EmitFixedFunctionTransforms() {
+        if (!g_config.emitFixedFunctionTransforms) {
+            return;
+        }
+        if (m_hasWorld) {
+            m_real->SetTransform(D3DTS_WORLD, &m_lastWorldMatrix);
+        }
+        if (m_hasView) {
+            m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
+        }
+        if (m_hasProj) {
+            m_real->SetTransform(D3DTS_PROJECTION, &m_lastProjMatrix);
+        }
     }
 
     // IUnknown
@@ -1073,14 +1200,21 @@ public:
     {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
         ShaderConstantState* state = GetShaderState(shaderKey, true);
+
+        std::vector<float> overrideScratch;
+        const float* effectiveConstantData = pConstantData;
+        if (BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+            effectiveConstantData = overrideScratch.data();
+        }
+
         for (UINT i = 0; i < Vector4fCount; i++) {
             UINT reg = StartRegister + i;
             if (reg >= kMaxConstantRegisters) {
                 break;
             }
-            memcpy(state->constants[reg], pConstantData + i * 4, sizeof(state->constants[reg]));
+            memcpy(state->constants[reg], effectiveConstantData + i * 4, sizeof(state->constants[reg]));
             state->valid[reg] = true;
-            UpdateVariance(*state, static_cast<int>(reg), pConstantData + i * 4);
+            UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
         }
         state->snapshotReady = true;
 
@@ -1094,8 +1228,8 @@ public:
                 for (UINT i = 0; i < Vector4fCount && i < 4; i++) {
                     LogMsg("  c%d: [%.3f, %.3f, %.3f, %.3f]",
                            StartRegister + i,
-                           pConstantData[i*4+0], pConstantData[i*4+1],
-                           pConstantData[i*4+2], pConstantData[i*4+3]);
+                           effectiveConstantData[i*4+0], effectiveConstantData[i*4+1],
+                           effectiveConstantData[i*4+2], effectiveConstantData[i*4+3]);
                 }
             }
         }
@@ -1104,7 +1238,7 @@ public:
         // Extract what we can and synthesize valid View/Projection data
         if (StartRegister == 0 && Vector4fCount >= 4) {
             D3DMATRIX mvp;
-            memcpy(&mvp, pConstantData, sizeof(D3DMATRIX));
+            memcpy(&mvp, effectiveConstantData, sizeof(D3DMATRIX));
             StoreMVPMatrix(mvp);
 
             bool allowMvpExtraction = g_config.autoDetectMatrices ||
@@ -1115,7 +1249,7 @@ public:
                 // Check for valid floats (skip LooksLikeMatrix - MVP has large values)
                 bool validFloats = true;
                 for (int i = 0; i < 16 && validFloats; i++) {
-                    if (!std::isfinite(pConstantData[i])) validFloats = false;
+                    if (!std::isfinite(effectiveConstantData[i])) validFloats = false;
                 }
 
                 if (validFloats) {
@@ -1125,10 +1259,9 @@ public:
                     // Create standard projection (60 degree FOV, 16:9 aspect)
                     CreateProjectionMatrix(&m_lastProjMatrix, 1.047f, 16.0f/9.0f, 0.1f, 10000.0f);
 
-                    // Set view transform for the runtime
-                    m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
                     StoreViewMatrix(m_lastViewMatrix);
                     StoreProjectionMatrix(m_lastProjMatrix);
+                    EmitFixedFunctionTransforms();
 
                     if (!m_hasView) {
                         LogMsg("DMC4: Extracting camera from MVP at c0-c3");
@@ -1146,7 +1279,7 @@ public:
         // Auto-detect mode - scan for matrices (fallback)
         if (g_config.autoDetectMatrices && Vector4fCount >= 4 && StartRegister != 0) {
             for (UINT offset = 0; offset + 4 <= Vector4fCount; offset++) {
-                const float* matData = pConstantData + offset * 4;
+                const float* matData = effectiveConstantData + offset * 4;
                 if (LooksLikeMatrix(matData)) {
                     D3DMATRIX mat;
                     memcpy(&mat, matData, sizeof(D3DMATRIX));
@@ -1160,14 +1293,15 @@ public:
                         memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasProj = true;
                         StoreProjectionMatrix(m_lastProjMatrix);
+                        EmitFixedFunctionTransforms();
                         UpdateStability(*state, static_cast<int>(reg), false, projStrict);
                     }
                     else if (viewStrict || LooksLikeView(mat)) {
                         LogMsg("AUTO-DETECT: VIEW matrix at c%d", reg);
-                        m_real->SetTransform(D3DTS_VIEW, &mat);
                         memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                         m_hasView = true;
                         StoreViewMatrix(m_lastViewMatrix);
+                        EmitFixedFunctionTransforms();
                         UpdateStability(*state, static_cast<int>(reg), viewStrict, false);
                     }
                 }
@@ -1181,7 +1315,7 @@ public:
             StartRegister + Vector4fCount >= (UINT)g_config.viewMatrixRegister + 4)
         {
             int offset = (g_config.viewMatrixRegister - StartRegister) * 4;
-            const float* matrixData = pConstantData + offset;
+            const float* matrixData = effectiveConstantData + offset;
 
             if (LooksLikeMatrix(matrixData)) {
                 D3DMATRIX mat;
@@ -1191,8 +1325,8 @@ public:
                 if (viewStrict || LooksLikeView(mat)) {
                     memcpy(&m_lastViewMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasView = true;
-                    m_real->SetTransform(D3DTS_VIEW, &m_lastViewMatrix);
                     StoreViewMatrix(m_lastViewMatrix);
+                    EmitFixedFunctionTransforms();
                     LogMsg("Extracted VIEW matrix from c%d", g_config.viewMatrixRegister);
                     UpdateStability(*state, g_config.viewMatrixRegister, viewStrict, false);
                 }
@@ -1205,7 +1339,7 @@ public:
             StartRegister + Vector4fCount >= (UINT)g_config.projMatrixRegister + 4)
         {
             int offset = (g_config.projMatrixRegister - StartRegister) * 4;
-            const float* matrixData = pConstantData + offset;
+            const float* matrixData = effectiveConstantData + offset;
 
             if (LooksLikeMatrix(matrixData)) {
                 D3DMATRIX mat;
@@ -1216,6 +1350,7 @@ public:
                     memcpy(&m_lastProjMatrix, &mat, sizeof(D3DMATRIX));
                     m_hasProj = true;
                     StoreProjectionMatrix(m_lastProjMatrix);
+                    EmitFixedFunctionTransforms();
 
                     float fov = ExtractFOV(mat) * 180.0f / 3.14159f;
                     LogMsg("Extracted PROJECTION matrix from c%d (FOV: %.1f deg)",
@@ -1231,13 +1366,15 @@ public:
             StartRegister + Vector4fCount >= (UINT)g_config.worldMatrixRegister + 4)
         {
             int offset = (g_config.worldMatrixRegister - StartRegister) * 4;
-            const float* matrixData = pConstantData + offset;
+            const float* matrixData = effectiveConstantData + offset;
 
             if (LooksLikeMatrix(matrixData)) {
                 D3DMATRIX mat;
                 memcpy(&mat, matrixData, sizeof(D3DMATRIX));
                 memcpy(&m_lastWorldMatrix, &mat, sizeof(D3DMATRIX));
+                m_hasWorld = true;
                 StoreWorldMatrix(m_lastWorldMatrix);
+                EmitFixedFunctionTransforms();
             }
         }
 
@@ -1249,7 +1386,7 @@ public:
             }
         }
 
-        return m_real->SetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+        return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
     }
 
     // Present - good place to do per-frame logging throttle
@@ -1652,6 +1789,10 @@ void LoadConfig() {
     g_config.memoryScannerMaxResults = GetPrivateProfileIntA("CameraProxy", "MemoryScannerMaxResults", 25, path);
     GetPrivateProfileStringA("CameraProxy", "MemoryScannerModule", "", g_config.memoryScannerModule,
                              MAX_PATH, path);
+    g_config.useRemixRuntime = GetPrivateProfileIntA("CameraProxy", "UseRemixRuntime", 1, path) != 0;
+    g_config.emitFixedFunctionTransforms = GetPrivateProfileIntA("CameraProxy", "EmitFixedFunctionTransforms", 1, path) != 0;
+    GetPrivateProfileStringA("CameraProxy", "RemixDllName", "d3d9_remix.dll", g_config.remixDllName,
+                             MAX_PATH, path);
 
     char buf[64];
     GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
@@ -1678,6 +1819,9 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             LogMsg("Variance threshold: %.4f", g_config.varianceThreshold);
             LogMsg("Candidate summary: %s", g_config.logCandidateSummary ? "ENABLED" : "disabled");
             LogMsg("Memory scanner: %s", g_config.enableMemoryScanner ? "ENABLED" : "disabled");
+            LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
+            LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
+            LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
             if (g_config.enableMemoryScanner) {
                 LogMsg("Memory scanner interval: %d sec", g_config.memoryScannerIntervalSec);
                 LogMsg("Memory scanner module: %s", g_config.memoryScannerModule[0]
@@ -1686,8 +1830,8 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             }
         }
 
-        // Load the real system d3d9.dll
-        g_hD3D9 = LoadSystemD3D9();
+        // Load the real D3D9 runtime (Remix or system, based on config)
+        g_hD3D9 = LoadTargetD3D9();
 
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
@@ -1699,11 +1843,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             g_origD3DPERF_SetMarker = (D3DPERF_SetMarker_t)GetProcAddress(g_hD3D9, "D3DPERF_SetMarker");
             g_origD3DPERF_SetOptions = (D3DPERF_SetOptions_t)GetProcAddress(g_hD3D9, "D3DPERF_SetOptions");
             g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hD3D9, "D3DPERF_SetRegion");
-            LogMsg("Loaded system d3d9.dll successfully");
+            LogMsg("Loaded target d3d9 runtime successfully");
             LogMsg("  Direct3DCreate9: %p", g_origDirect3DCreate9);
             LogMsg("  Direct3DCreate9Ex: %p", g_origDirect3DCreate9Ex);
         } else {
-            LogMsg("ERROR: Failed to load system d3d9.dll!");
+            LogMsg("ERROR: Failed to load target d3d9 runtime!");
         }
     }
     else if (fdwReason == DLL_PROCESS_DETACH) {
