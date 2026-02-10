@@ -93,7 +93,7 @@ static HWND g_imguiHwnd = nullptr;
 static bool g_showImGui = false;
 static bool g_toggleWasDown = false;
 static bool g_pauseRendering = false;
-static bool g_pauseToggleWasDown = false;
+static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
@@ -949,14 +949,6 @@ static void UpdateImGuiToggle() {
     g_toggleWasDown = togglePressed;
 }
 
-static void UpdatePauseToggle() {
-    bool pauseDown = (GetAsyncKeyState(VK_PAUSE) & 0x8000) != 0;
-    if (pauseDown && !g_pauseToggleWasDown) {
-        g_pauseRendering = !g_pauseRendering;
-    }
-    g_pauseToggleWasDown = pauseDown;
-}
-
 static void UpdateFrameTimeStats() {
     if (!g_perfInitialized) {
         QueryPerformanceFrequency(&g_perfFrequency);
@@ -996,6 +988,7 @@ static void RenderImGuiOverlay() {
 
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    ImGui::GetIO().MouseDrawCursor = true;
     ImGui::NewFrame();
 
     ImGui::SetNextWindowBgAlpha(0.7f);
@@ -1003,7 +996,12 @@ static void RenderImGuiOverlay() {
     ImGui::Begin("Camera Proxy for RTX Remix", nullptr,
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
-    ImGui::Text("Toggle menu: Alt+M | Pause rendering: Pause");
+    ImGui::Text("Toggle menu: Alt+M");
+    if (ImGui::Button(g_pauseRendering ? "Resume game rendering" : "Pause game rendering")) {
+        g_pauseRendering = !g_pauseRendering;
+    }
+    ImGui::SameLine();
+    ImGui::Text("Status: %s", g_pauseRendering ? "Paused" : "Running");
     ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them "
                        "to the RTX Remix runtime through SetTransform() so Remix gets camera data in D3D9 titles.");
 
@@ -1402,7 +1400,9 @@ static void RenderImGuiOverlay() {
 
     ImGui::EndFrame();
     ImGui::Render();
+    g_isRenderingImGui = true;
     ImGui_ImplDX9_RenderDrawData(ImGui::GetDrawData());
+    g_isRenderingImGui = false;
 }
 
 // Function pointer types
@@ -1955,18 +1955,15 @@ public:
             InitializeImGui(m_real, m_hwnd);
         }
         UpdateImGuiToggle();
-        UpdatePauseToggle();
+        if (g_imguiInitialized) {
+            ImGui::GetIO().MouseDrawCursor = g_showImGui;
+        }
         RenderImGuiOverlay();
         if (g_requestManualEmit) {
             EmitFixedFunctionTransforms();
             g_requestManualEmit = false;
             snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
                      "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
-        }
-
-        if (g_pauseRendering) {
-            Sleep(1);
-            return D3D_OK;
         }
 
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
@@ -2059,10 +2056,30 @@ public:
     BOOL STDMETHODCALLTYPE GetSoftwareVertexProcessing() override { return m_real->GetSoftwareVertexProcessing(); }
     HRESULT STDMETHODCALLTYPE SetNPatchMode(float nSegments) override { return m_real->SetNPatchMode(nSegments); }
     float STDMETHODCALLTYPE GetNPatchMode() override { return m_real->GetNPatchMode(); }
-    HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) override { return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount); }
-    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override { return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount); }
-    HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override { return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride); }
-    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void* pIndexData, D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override { return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride); }
+    HRESULT STDMETHODCALLTYPE DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) override {
+        if (g_pauseRendering && !g_isRenderingImGui) {
+            return D3D_OK;
+        }
+        return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
+    }
+    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override {
+        if (g_pauseRendering && !g_isRenderingImGui) {
+            return D3D_OK;
+        }
+        return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
+    }
+    HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
+        if (g_pauseRendering && !g_isRenderingImGui) {
+            return D3D_OK;
+        }
+        return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
+    }
+    HRESULT STDMETHODCALLTYPE DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT MinVertexIndex, UINT NumVertices, UINT PrimitiveCount, const void* pIndexData, D3DFORMAT IndexDataFormat, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
+        if (g_pauseRendering && !g_isRenderingImGui) {
+            return D3D_OK;
+        }
+        return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
+    }
     HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) override { return m_real->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags); }
     HRESULT STDMETHODCALLTYPE CreateVertexDeclaration(const D3DVERTEXELEMENT9* pVertexElements, IDirect3DVertexDeclaration9** ppDecl) override { return m_real->CreateVertexDeclaration(pVertexElements, ppDecl); }
     HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override { return m_real->SetVertexDeclaration(pDecl); }
