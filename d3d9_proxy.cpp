@@ -1007,6 +1007,32 @@ static void StopAutoDetectSampling() {
     g_autoDetectSamplingPausedByUser = true;
 }
 
+static void ResetAutoDetectToLegacyDefaults() {
+    g_runtimeAutoDetectEnabled = false;
+    g_autoApplyDetectedMatrices = false;
+    g_autoDetectMode = AutoDetect_IndividualWVP;
+    g_autoDetectMinFramesSeen = 12;
+    g_autoDetectMinConsecutiveFrames = 4;
+    g_autoDetectSamplingFrames = 180;
+    g_layoutStrategyMode = Layout_Auto;
+    g_probeTransposedLayouts = true;
+    g_probeInverseView = true;
+    g_autoPickCandidates = true;
+    g_autoDetectSamplingStartFrame = -1;
+    g_autoDetectSamplingPausedByUser = false;
+    g_autoCandidateStats.clear();
+    StopAutoDetectSampling();
+
+    g_manualBindings[MatrixSlot_World].enabled = false;
+    g_manualBindings[MatrixSlot_View].enabled = false;
+    g_manualBindings[MatrixSlot_Projection].enabled = false;
+    g_manualBindings[MatrixSlot_MVP].enabled = false;
+
+    g_config.worldMatrixRegister = g_iniWorldMatrixRegister;
+    g_config.viewMatrixRegister = g_iniViewMatrixRegister;
+    g_config.projMatrixRegister = g_iniProjMatrixRegister;
+}
+
 static bool IsAutoDetectSamplingWindowOpen() {
     if (!g_autoDetectSamplingActive) {
         return false;
@@ -1839,6 +1865,12 @@ static void RenderImGuiOverlay() {
                 g_autoCandidateStats.clear();
                 StopAutoDetectSampling();
             }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset to original auto-detect method")) {
+                ResetAutoDetectToLegacyDefaults();
+                snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                         "Reset auto-detect to legacy defaults (INI register mapping + strict heuristics).");
+            }
 
             if (ImGui::Button("Auto detect and select matrices (legacy)")) {
                 int applied = 0;
@@ -2665,24 +2697,46 @@ public:
                         D3DMATRIX mat = {};
                         memcpy(&mat, matData, sizeof(D3DMATRIX));
 
-                        bool projStrict = LooksLikeProjectionStrict(mat) && PassesPerspectiveHeuristics(mat);
-                        bool viewStrict = LooksLikeViewStrict(mat);
-                        if (projStrict) {
-                            float fov = ExtractFOV(mat);
-                            AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, false, MatrixSlot_Projection};
-                            ObserveAutoCandidate(key, mat, fov);
-                            m_pendingProjCandidate = key;
-                            m_hasPendingProjCandidate = true;
-                            UpdateStability(*state, static_cast<int>(reg), false, true);
-                        } else if (viewStrict || LooksLikeView(mat)) {
-                            AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, false, MatrixSlot_View};
-                            ObserveAutoCandidate(key, mat);
-                            m_pendingViewCandidate = key;
-                            m_hasPendingViewCandidate = true;
-                            UpdateStability(*state, static_cast<int>(reg), viewStrict, false);
-                        } else if (g_autoDetectMode == AutoDetect_IndividualWVP) {
-                            AutoCandidateKey worldKey = {shaderKey, static_cast<int>(reg), 4, false, MatrixSlot_World};
-                            ObserveAutoCandidate(worldKey, mat);
+                        auto observe4x4Variant = [&](const D3DMATRIX& candidate, bool transposed) {
+                            bool projStrict = LooksLikeProjectionStrict(candidate) && PassesPerspectiveHeuristics(candidate);
+                            bool projLike = !projStrict && ComputeProjectionLikeScore(candidate) > 1.0f &&
+                                            PassesPerspectiveHeuristics(candidate);
+                            bool viewStrict = LooksLikeViewStrict(candidate);
+                            bool viewLike = viewStrict || LooksLikeView(candidate);
+
+                            if (!viewLike && g_probeInverseView) {
+                                D3DMATRIX inv = InvertSimpleRigidView(candidate);
+                                if (LooksLikeViewStrict(inv) || LooksLikeView(inv)) {
+                                    AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_View};
+                                    ObserveAutoCandidate(key, inv);
+                                    m_pendingViewCandidate = key;
+                                    m_hasPendingViewCandidate = true;
+                                    UpdateStability(*state, static_cast<int>(reg), true, false);
+                                }
+                            }
+
+                            if (projStrict || projLike) {
+                                float fov = ExtractFOV(candidate);
+                                AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_Projection};
+                                ObserveAutoCandidate(key, candidate, fov);
+                                m_pendingProjCandidate = key;
+                                m_hasPendingProjCandidate = true;
+                                UpdateStability(*state, static_cast<int>(reg), false, projStrict);
+                            } else if (viewLike) {
+                                AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_View};
+                                ObserveAutoCandidate(key, candidate);
+                                m_pendingViewCandidate = key;
+                                m_hasPendingViewCandidate = true;
+                                UpdateStability(*state, static_cast<int>(reg), viewStrict, false);
+                            } else if (g_autoDetectMode == AutoDetect_IndividualWVP) {
+                                AutoCandidateKey worldKey = {shaderKey, static_cast<int>(reg), 4, transposed, MatrixSlot_World};
+                                ObserveAutoCandidate(worldKey, candidate);
+                            }
+                        };
+
+                        observe4x4Variant(mat, false);
+                        if (g_probeTransposedLayouts) {
+                            observe4x4Variant(TransposeMatrix(mat), true);
                         }
 
                         if (g_autoDetectMode == AutoDetect_MVPOnly && reg == 0) {
@@ -2690,6 +2744,12 @@ public:
                             ObserveAutoCandidate(key, mat);
                             m_pendingMVPCandidate = key;
                             m_hasPendingMVPCandidate = true;
+                            if (g_probeTransposedLayouts) {
+                                AutoCandidateKey keyT = {shaderKey, static_cast<int>(reg), 4, true, MatrixSlot_MVP};
+                                ObserveAutoCandidate(keyT, TransposeMatrix(mat));
+                                m_pendingMVPCandidate = keyT;
+                                m_hasPendingMVPCandidate = true;
+                            }
                         }
                     }
                 }
@@ -2698,11 +2758,17 @@ public:
                     D3DMATRIX mat43 = {};
                     if (TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                          static_cast<int>(reg), 3, false, &mat43)) {
-                        if (LooksLikeViewStrict(mat43)) {
-                            AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, false, MatrixSlot_View};
-                            ObserveAutoCandidate(key, mat43);
-                            m_pendingViewCandidate = key;
-                            m_hasPendingViewCandidate = true;
+                        auto observe4x3Variant = [&](const D3DMATRIX& candidate, bool transposed) {
+                            if (LooksLikeViewStrict(candidate) || LooksLikeView(candidate)) {
+                                AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, transposed, MatrixSlot_View};
+                                ObserveAutoCandidate(key, candidate);
+                                m_pendingViewCandidate = key;
+                                m_hasPendingViewCandidate = true;
+                            }
+                        };
+                        observe4x3Variant(mat43, false);
+                        if (g_probeTransposedLayouts) {
+                            observe4x3Variant(TransposeMatrix(mat43), true);
                         }
                         if (g_autoDetectMode == AutoDetect_MVPOnly) {
                             AutoCandidateKey key = {shaderKey, static_cast<int>(reg), 3, false, MatrixSlot_MVP};
