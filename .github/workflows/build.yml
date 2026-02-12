@@ -31,4 +31,4 @@ jobs:
         path: |
           d3d9.dll
           camera_proxy.ini
-          README.md
+          INSTALL.txt
