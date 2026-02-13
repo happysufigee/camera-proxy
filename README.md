@@ -62,6 +62,18 @@ This branch includes configurable UI scaling:
 
 Scaling is applied to both style metrics and fonts.
 
+
+### 7) Input compatibility and hotkeys
+
+To support titles where ImGui input is unreliable, single-key hotkeys are polled every frame and can drive core actions even with the overlay hidden:
+
+- `HotkeyToggleMenuVK` (default F10)
+- `HotkeyTogglePauseVK` (default F9)
+- `HotkeyEmitMatricesVK` (default F8)
+- `HotkeyResetMatrixOverridesVK` (default F7)
+
+Resetting matrix register overrides returns `View/Proj/WorldMatrixRegister` to `-1`; if `AutoDetectMatrices=1`, the proxy falls back to heuristic candidate selection.
+
 ---
 
 ## Setup
@@ -70,7 +82,7 @@ Scaling is applied to both style metrics and fonts.
 2. Rename Remix's runtime DLL to `d3d9_remix.dll` (or update `RemixDllName`).
 3. Copy this project’s built `d3d9.dll` into the game directory.
 4. Copy `camera_proxy.ini` into the same directory.
-5. Launch the game. Toggle the overlay with **Alt+M**.
+5. Launch the game. Toggle the overlay with **F10** (configurable in `camera_proxy.ini`).
 
 ## Build
 

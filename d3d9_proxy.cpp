@@ -71,6 +71,10 @@ struct ProxyConfig {
     bool logAllConstants = false;
     bool autoDetectMatrices = false;
     float imguiScale = 1.0f;
+    int hotkeyToggleMenuVk = VK_F10;
+    int hotkeyTogglePauseVk = VK_F9;
+    int hotkeyEmitMatricesVk = VK_F8;
+    int hotkeyResetMatrixOverridesVk = VK_F7;
 };
 
 static ProxyConfig g_config;
@@ -137,7 +141,6 @@ static void UpdateMatrixSource(MatrixSlot slot,
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
 static bool g_showImGui = false;
-static bool g_toggleWasDown = false;
 static bool g_pauseRendering = false;
 static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
@@ -162,6 +165,16 @@ static int g_autoDetectSamplingFrames = 180;
 static int g_autoDetectSamplingStartFrame = -1;
 static bool g_autoDetectSamplingActive = false;
 static bool g_autoDetectSamplingPausedByUser = false;
+
+enum HotkeyAction {
+    HotkeyAction_ToggleMenu = 0,
+    HotkeyAction_TogglePause,
+    HotkeyAction_EmitMatrices,
+    HotkeyAction_ResetMatrixOverrides,
+    HotkeyAction_Count
+};
+
+static bool g_hotkeyWasDown[HotkeyAction_Count] = {};
 
 static int g_iniViewMatrixRegister = -1;
 static int g_iniProjMatrixRegister = -1;
@@ -276,7 +289,17 @@ static bool g_logSnapshotDirty = true;
 
 static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (g_imguiInitialized) {
-        ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam);
+        if (ImGui_ImplWin32_WndProcHandler(hwnd, msg, wParam, lParam) && g_showImGui) {
+            return TRUE;
+        }
+        if (g_showImGui) {
+            ImGuiIO& io = ImGui::GetIO();
+            const bool keyboardMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_CHAR || msg == WM_SYSCHAR;
+            const bool mouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+            if ((keyboardMsg && io.WantCaptureKeyboard) || (mouseMsg && io.WantCaptureMouse)) {
+                return TRUE;
+            }
+        }
     }
     if (g_imguiPrevWndProc) {
         return CallWindowProc(g_imguiPrevWndProc, hwnd, msg, wParam, lParam);
@@ -674,6 +697,38 @@ static bool SaveConfigRegisterValue(const char* key, int value) {
     char valueBuf[32] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%d", value);
     return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+}
+
+static bool ConsumeSingleKeyHotkey(HotkeyAction action, int virtualKey) {
+    if (action < 0 || action >= HotkeyAction_Count || virtualKey <= 0) {
+        return false;
+    }
+    bool keyDown = (GetAsyncKeyState(virtualKey) & 0x8000) != 0;
+    bool pressed = keyDown && !g_hotkeyWasDown[action];
+    g_hotkeyWasDown[action] = keyDown;
+    return pressed;
+}
+
+static void ResetMatrixRegisterOverridesToAuto() {
+    g_config.worldMatrixRegister = -1;
+    g_config.viewMatrixRegister = -1;
+    g_config.projMatrixRegister = -1;
+    memset(g_manualBindings, 0, sizeof(g_manualBindings));
+
+    bool savedWorld = SaveConfigRegisterValue("WorldMatrixRegister", -1);
+    bool savedView = SaveConfigRegisterValue("ViewMatrixRegister", -1);
+    bool savedProj = SaveConfigRegisterValue("ProjMatrixRegister", -1);
+    bool savedAll = savedWorld && savedView && savedProj;
+    if (g_config.autoDetectMatrices) {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                 "Cleared matrix register overrides. Falling back to heuristic auto-detect (AutoDetectMatrices=1).%s",
+                 savedAll ? "" : " Failed to persist at least one key to camera_proxy.ini.");
+    } else {
+        snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
+                 "Cleared matrix register overrides. Runtime now uses structural detection.%s",
+                 savedAll ? "" : " Failed to persist at least one key to camera_proxy.ini.");
+    }
+    LogMsg("Matrix register overrides reset to auto (heuristics=%s).", g_config.autoDetectMatrices ? "on" : "off");
 }
 
 static void PinRegisterFromSource(MatrixSlot slot) {
@@ -1715,14 +1770,29 @@ static void UpdateConstantSnapshot() {
     }
 }
 
-static void UpdateImGuiToggle() {
-    bool altDown = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
-    bool mDown = (GetAsyncKeyState('M') & 0x8000) != 0;
-    bool togglePressed = altDown && mDown;
-    if (togglePressed && !g_toggleWasDown) {
+static void UpdateHotkeys() {
+    if (ConsumeSingleKeyHotkey(HotkeyAction_ToggleMenu, g_config.hotkeyToggleMenuVk)) {
         g_showImGui = !g_showImGui;
     }
-    g_toggleWasDown = togglePressed;
+
+    if (ConsumeSingleKeyHotkey(HotkeyAction_TogglePause, g_config.hotkeyTogglePauseVk)) {
+        g_pauseRendering = !g_pauseRendering;
+    }
+
+    if (ConsumeSingleKeyHotkey(HotkeyAction_EmitMatrices, g_config.hotkeyEmitMatricesVk)) {
+        if (!g_config.emitFixedFunctionTransforms) {
+            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                     "Blocked: set EmitFixedFunctionTransforms=1 in camera_proxy.ini first.");
+        } else {
+            g_requestManualEmit = true;
+            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                     "Pending (hotkey): pass cached World/View/Projection matrices to RTX Remix this frame.");
+        }
+    }
+
+    if (ConsumeSingleKeyHotkey(HotkeyAction_ResetMatrixOverrides, g_config.hotkeyResetMatrixOverridesVk)) {
+        ResetMatrixRegisterOverridesToAuto();
+    }
 }
 
 static void UpdateFrameTimeStats() {
@@ -1773,7 +1843,7 @@ static void RenderImGuiOverlay() {
     ImGui::Begin("Camera Proxy for RTX Remix", nullptr,
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
-    ImGui::Text("Toggle menu: Alt+M");
+    ImGui::Text("Hotkeys: Toggle menu(F10) Pause(F9) Emit matrices(F8) Reset matrix overrides(F7)");
     if (ImGui::Button(g_pauseRendering ? "Resume game rendering" : "Pause game rendering")) {
         g_pauseRendering = !g_pauseRendering;
     }
@@ -1853,7 +1923,7 @@ static void RenderImGuiOverlay() {
 
             ImGui::Separator();
             ImGui::Text("Register pinning (camera tab)");
-            ImGui::TextWrapped("Pin currently detected matrix registers directly from this tab. Values are saved to camera_proxy.ini immediately.");
+            ImGui::TextWrapped("Pin currently detected matrix registers directly from this tab. Values are saved to camera_proxy.ini immediately. Use reset to return to auto-detect.");
             if (ImGui::Button("Pin World register")) {
                 PinRegisterFromSource(MatrixSlot_World);
             }
@@ -1864,6 +1934,10 @@ static void RenderImGuiOverlay() {
             ImGui::SameLine();
             if (ImGui::Button("Pin Projection register")) {
                 PinRegisterFromSource(MatrixSlot_Projection);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Reset register overrides to auto")) {
+                ResetMatrixRegisterOverridesToAuto();
             }
             ImGui::Text("Pinned registers: World=c%d View=c%d Projection=c%d",
                         g_config.worldMatrixRegister, g_config.viewMatrixRegister,
@@ -2935,7 +3009,7 @@ public:
         if (!g_imguiInitialized) {
             InitializeImGui(m_real, m_hwnd);
         }
-        UpdateImGuiToggle();
+        UpdateHotkeys();
         if (g_imguiInitialized) {
             ImGui::GetIO().MouseDrawCursor = g_showImGui;
         }
@@ -3356,6 +3430,10 @@ void LoadConfig() {
     g_autoDetectMinConsecutiveFrames = GetPrivateProfileIntA("CameraProxy", "AutoDetectMinConsecutiveFrames", 4, path);
     g_autoDetectSamplingFrames = GetPrivateProfileIntA("CameraProxy", "AutoDetectSamplingFrames", 180, path);
     g_autoApplyDetectedMatrices = GetPrivateProfileIntA("CameraProxy", "AutoApplyDetectedMatrices", 1, path) != 0;
+    g_config.hotkeyToggleMenuVk = GetPrivateProfileIntA("CameraProxy", "HotkeyToggleMenuVK", VK_F10, path);
+    g_config.hotkeyTogglePauseVk = GetPrivateProfileIntA("CameraProxy", "HotkeyTogglePauseVK", VK_F9, path);
+    g_config.hotkeyEmitMatricesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyEmitMatricesVK", VK_F8, path);
+    g_config.hotkeyResetMatrixOverridesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyResetMatrixOverridesVK", VK_F7, path);
 
     char buf[64];
     GetPrivateProfileStringA("CameraProxy", "MinFOV", "0.1", buf, sizeof(buf), path);
@@ -3405,6 +3483,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
                    g_autoDetectMode, g_autoDetectMinFramesSeen, g_autoDetectMinConsecutiveFrames);
             LogMsg("Auto detect legacy compatibility keys: samplingFrames=%d autoApply=%s (not used by refined detector)",
                    g_autoDetectSamplingFrames, g_autoApplyDetectedMatrices ? "ENABLED" : "disabled");
+            LogMsg("Hotkeys (VK): menu=%d pause=%d emit=%d resetOverrides=%d",
+                   g_config.hotkeyToggleMenuVk,
+                   g_config.hotkeyTogglePauseVk,
+                   g_config.hotkeyEmitMatricesVk,
+                   g_config.hotkeyResetMatrixOverridesVk);
             if (g_config.enableMemoryScanner) {
                 LogMsg("Memory scanner interval: %d sec", g_config.memoryScannerIntervalSec);
                 LogMsg("Memory scanner module: %s", g_config.memoryScannerModule[0]
