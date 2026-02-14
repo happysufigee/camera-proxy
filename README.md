@@ -1,168 +1,122 @@
-# camera-proxy (experimental branch)
+# camera-proxy
 
-Experimental Direct3D9 proxy DLL for RTX Remix.
+Direct3D9 proxy DLL for RTX Remix camera/transform reconstruction.
 
-This branch is focused on **deterministic matrix extraction** for arbitrary DX9 engines instead of DMC4-only assumptions. The proxy wraps `IDirect3D9` / `IDirect3DDevice9`, observes vertex shader constant uploads, caches current transform state, and forwards fixed-function transforms immediately before draw calls.
+This project wraps `IDirect3D9` and `IDirect3DDevice9`, inspects vertex shader constant uploads, reconstructs camera transforms, and forwards fixed-function `WORLD` / `VIEW` / `PROJECTION` state before draw calls so Remix can consume consistent matrices in programmable DX9 games.
 
-## Why this exists
+## What the current main branch does
 
-Many programmable DX9 games never call fixed-function `SetTransform()` while RTX Remix depends on those transform states for scene reconstruction. A naive approach that forwards transforms during `SetVertexShaderConstantF()` is often out-of-sync with the actual draw that consumes those constants.
+- Caches matrix candidates from `SetVertexShaderConstantF` uploads.
+- Classifies matrices deterministically (World/View/Projection) using structural checks.
+- Supports register overrides (`ViewMatrixRegister`, `ProjMatrixRegister`, `WorldMatrixRegister`) when a game uses known fixed slots.
+- Emits `SetTransform(D3DTS_WORLD/VIEW/PROJECTION)` at draw time (`DrawPrimitive`, `DrawIndexedPrimitive`, `DrawPrimitiveUP`, `DrawIndexedPrimitiveUP`).
+- Falls back to identity for missing matrix slots to keep fixed-function state valid.
 
-This proxy solves that by:
+## Detection and reconstruction paths
 
-- tracking matrix state from constant uploads,
-- and emitting `SetTransform(D3DTS_WORLD/VIEW/PROJECTION)` **per draw call** (`DrawPrimitive`, `DrawIndexedPrimitive`, `DrawPrimitiveUP`, `DrawIndexedPrimitiveUP`).
+### 1) Deterministic structural detection
 
-## Current behavior (experimental)
+When `AutoDetectMatrices=1`, uploaded 4x4 / 4x3 ranges are analyzed and classified:
 
-### 1) Matrix state caching
+- **Projection**: perspective-style structure + FOV validation (`MinFOV`, `MaxFOV`).
+- **View**: strict camera-style affine/orthonormal checks.
+- **World**: affine matrix that is not classified as strict view.
 
-The proxy maintains three cached matrices:
+Optional probes:
 
-- current World
-- current View
-- current Projection
+- `ProbeTransposedLayouts=1` checks one transposed candidate pass.
+- `ProbeInverseView=1` allows inverse-view style view recovery checks.
 
-State is updated when constant uploads match structural rules, but forwarding is deferred until draw time.
+### 2) Optional combined-MVP decomposition fallback
 
-### 2) Deterministic structural classification
+If full W/V/P is not resolved, combined MVP decomposition can be enabled:
 
-Constant upload windows are interpreted as potential `4x4` and `4x3` matrices.
+- `EnableCombinedMVP`
+- `CombinedMVPRequireWorld`
+- `CombinedMVPAssumeIdentityWorld`
+- `CombinedMVPForceDecomposition`
+- `CombinedMVPLogDecomposition`
 
-- **Projection**: strict perspective structure + FOV validation (`MinFOV`, `MaxFOV`).
-- **View**: strict orthonormal affine camera-style matrix.
-- **World**: affine matrix that is not strict View.
-- **Combined perspective fallback**: if perspective-like but not strict Projection, World/View are set to identity and the matrix is forwarded as Projection.
+### 3) Optional experimental custom projection fallback
 
-No probabilistic ranking or MVP decomposition is performed in this path.
+For difficult titles, an experimental projection fallback can be enabled:
 
-### 3) Transpose probing
+- Manual 4x4 projection matrix mode.
+- Auto-generated projection mode (FOV / near / far / aspect / handedness controls).
+- Optional override flags for detected projection and combined-MVP projection.
 
-If enabled (`ProbeTransposedLayouts=1`), a failing candidate is transposed once and re-checked deterministically.
+Relevant keys are prefixed with `ExperimentalCustomProjection*` in `camera_proxy.ini`.
 
-### 4) Register overrides
+## Game profiles
 
-`ViewMatrixRegister`, `ProjMatrixRegister`, and `WorldMatrixRegister`:
+`GameProfile` can switch from general structural detection to game-aware register mapping:
 
-- `>= 0` means only that base register is accepted for that type.
-- `-1` means classify from all observed constant ranges.
+- `MetalGearRising`
+  - Projection `c4-c7`
+  - ViewProjection `c8-c11` (proxy derives View)
+  - World `c16-c19`
+  - Tracks optional WorldView `c20-c23`
+- `DevilMayCry4` (or `DMC4`)
+  - Combined MVP `c0-c3`
+  - World `c0-c3`
+  - View `c4-c7`
+  - Projection `c8-c11`
 
-### 5) Game profiles
+If no profile is set, the proxy uses structural detection + optional register overrides.
 
-You can enable fixed-profile extraction via `camera_proxy.ini`:
+## Overlay and runtime controls
 
-- `GameProfile=MetalGearRising`
-- `GameProfile=Barnyard2006`
+Built-in ImGui overlay includes:
 
-**Metal Gear Rising profile**
+- Camera matrix display/state source info.
+- Shader constant inspection and editing tools.
+- Optional memory scanner panel.
+- In-overlay logs.
 
-- `c4-c7`   → Projection
-- `c12-c15` → View Inverse (inverted deterministically to derive View)
-- `c16-c19` → World
-- optional tracking only: `c8-c11` (ViewProjection), `c20-c23` (WorldView)
+Runtime controls:
 
-If expected uploads are not matched or inverse-view inversion fails (non-invertible matrix), the proxy logs a warning/status and falls back to structural detection.
-
-**Barnyard 2006 profile (dedicated transform reconstruction)**
-
-Barnyard shaders use a combined path similar to:
-
-- `vertexViewSpace = modelViews[i] * position`
-- `gl_Position = u_Projection * vertexViewSpace`
-
-and also provide `u_ViewWorld` (camera→world, i.e. inverse View).
-
-Profile behavior:
-
-- Extract `u_Projection` from `BarnyardProjectionBase`.
-- Extract `u_ViewWorld` from `BarnyardViewWorldBase`, derive `View = inverse(u_ViewWorld)`.
-- Verify `View * u_ViewWorld ≈ I` and report consistency in overlay/log.
-- For each per-instance `modelViews[i]` upload (`BarnyardModelViewBase`, `BarnyardModelViewCount`), derive:
-  - `World = inverse(View) * modelViews[i]`
-- Emit fixed-function transforms per draw (`WORLD`, `VIEW`, `PROJECTION`) from these derived matrices.
-- While Barnyard profile is active, structural auto-detection is disabled to avoid misclassifying combined `modelViews` data.
-- Optional shader signature gating via `BarnyardShaderHash` ensures the profile only activates on expected shader bytecode.
-
-### 6) Draw-time emission
-
-When `EmitFixedFunctionTransforms=1`, cached WORLD/VIEW/PROJECTION are emitted before each intercepted draw call.
-
-If a matrix type is unknown, identity is used as fallback to keep fixed-function state valid.
-
-### 7) ImGui overlay scaling
-
-This branch includes configurable UI scaling:
-
-- `ImGuiScalePercent` in `camera_proxy.ini`, and
-- runtime slider in the overlay.
-
-Scaling is applied to both style metrics and fonts.
-
-
-### 8) Input compatibility and hotkeys
-
-To support titles where ImGui input is unreliable, single-key hotkeys are polled every frame and can drive core actions even with the overlay hidden:
-
-- `HotkeyToggleMenuVK` (default F10)
-- `HotkeyTogglePauseVK` (default F9)
-- `HotkeyEmitMatricesVK` (default F8)
-- `HotkeyResetMatrixOverridesVK` (default F7)
-
-Resetting matrix register overrides returns `View/Proj/WorldMatrixRegister` to `-1`; if `AutoDetectMatrices=1`, the proxy falls back to deterministic structural auto-detection.
-
----
+- `ImGuiScalePercent` for global overlay scaling.
+- Hotkeys (default):
+  - F10 menu toggle (`HotkeyToggleMenuVK`)
+  - F9 pause rendering (`HotkeyTogglePauseVK`)
+  - F8 emit cached matrices (`HotkeyEmitMatricesVK`)
+  - F7 reset matrix register overrides (`HotkeyResetMatrixOverridesVK`)
 
 ## Setup
 
 1. Install RTX Remix runtime files in your game directory.
-2. Rename Remix's runtime DLL to `d3d9_remix.dll` (or update `RemixDllName`).
-3. Copy this project’s built `d3d9.dll` into the game directory.
+2. Rename Remix runtime DLL to `d3d9_remix.dll` (or set `RemixDllName`).
+3. Copy this project's built `d3d9.dll` into the game directory.
 4. Copy `camera_proxy.ini` into the same directory.
-5. Launch the game. Toggle the overlay with **F10** (configurable in `camera_proxy.ini`).
+5. Launch the game and toggle the overlay with F10 (default).
 
 ## Build
 
-### Option A (VS Developer Command Prompt)
+### Option A (Visual Studio Developer Command Prompt)
 
 ```bat
 build.bat
 ```
 
-### Option B (generic shell; script locates VS toolchain)
+### Option B (generic shell script that locates VS toolchain)
 
 ```bat
 do_build.bat
 ```
 
-Output is a 32-bit `d3d9.dll`.
+Build output is 32-bit `d3d9.dll`.
 
 ## Key config options
 
-See `camera_proxy.ini` for full comments. Most important keys:
+See `camera_proxy.ini` for complete comments and defaults. Commonly used keys:
 
-- `UseRemixRuntime`
-- `RemixDllName`
-- `EmitFixedFunctionTransforms`
-- `ViewMatrixRegister`
-- `ProjMatrixRegister`
-- `WorldMatrixRegister`
-- `AutoDetectMatrices`
-- `ProbeTransposedLayouts`
-- `ProbeInverseView`
-- `ImGuiScalePercent`
-- `EnableLogging`
-- `GameProfile`
-
-## Overlay overview
-
-- **Camera**: live World/View/Projection/MVP display and source metadata.
-- **Constants**: captured registers and shader-constant editing tools.
-- **Memory Scanner**: optional background memory scan controls and matrix assignment actions.
-- **Logs**: in-overlay log stream.
-
-## Notes
-
-- This is an **experimental branch** intended for iterative engine compatibility testing.
+- Runtime/output: `UseRemixRuntime`, `RemixDllName`, `EmitFixedFunctionTransforms`
+- Detection: `AutoDetectMatrices`, `ProbeTransposedLayouts`, `ProbeInverseView`
+- Register control: `ViewMatrixRegister`, `ProjMatrixRegister`, `WorldMatrixRegister`
+- Profiles: `GameProfile`
+- Fallbacks: `EnableCombinedMVP`, `ExperimentalCustomProjection*`
+- UI/input: `ImGuiScalePercent`, `Hotkey*`
+- Diagnostics: `EnableLogging`, `LogAllConstants`
 
 ## Credits
 
