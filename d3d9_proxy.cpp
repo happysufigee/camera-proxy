@@ -119,7 +119,7 @@ static bool g_profileHasViewInverseMatrix = false;
 static bool g_profileHasDerivedWorldMatrix = false;
 static bool g_profileHasLastModelViewMatrix = false;
 static bool g_profileViewInverseConsistencyOk = false;
-static float g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
+static float g_profileViewInverseConsistencyError = (std::numeric_limits<float>::max)();
 static bool g_profileDisableStructuralDetection = false;
 static bool g_mgrProjCapturedThisFrame = false;
 static bool g_mgrViewCapturedThisFrame = false;
@@ -2666,7 +2666,7 @@ public:
                     profileHardFailure = true;
                     g_profileViewDerivedFromInverse = false;
                     g_profileViewInverseConsistencyOk = false;
-                    g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
+                    g_profileViewInverseConsistencyError = (std::numeric_limits<float>::max)();
                     snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                              "WARNING: Barnyard profile failed to invert u_ViewWorld (det=%.9f).", determinant);
                     LogMsg("WARNING: Barnyard profile failed to invert u_ViewWorld at c%d-c%d (det=%.9f).",
@@ -3358,7 +3358,7 @@ void LoadConfig() {
     g_profileHasDerivedWorldMatrix = false;
     g_profileHasLastModelViewMatrix = false;
     g_profileViewInverseConsistencyOk = false;
-    g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
+    g_profileViewInverseConsistencyError = (std::numeric_limits<float>::max)();
     g_profileDisableStructuralDetection = false;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
