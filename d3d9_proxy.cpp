@@ -203,6 +203,7 @@ static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
 static ImGuiStyle g_imguiBaseStyle = {};
+static bool g_imguiMgrrInvertView = true;
 static bool g_imguiBaseStyleCaptured = false;
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
@@ -2147,6 +2148,12 @@ static void RenderImGuiOverlay() {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
             if (g_activeGameProfile == GameProfile_MetalGearRising) {
                 ImGui::Text("MGR layout: Proj=c4-c7, ViewInverse=c12-c15, World=c16-c19");
+                ImGui::Checkbox("Invert c12 View Matrix", &g_imguiMgrrInvertView);
+                ImGui::Text("Current inversion mode: %s", g_imguiMgrrInvertView ? "Inverted" : "Direct");
+                float activeViewDeterminant = 0.0f;
+                D3DMATRIX activeViewInverse = {};
+                InvertMatrix4x4Deterministic(g_cameraMatrices.view, &activeViewInverse, &activeViewDeterminant);
+                ImGui::Text("Determinant of active View matrix: %.6f", activeViewDeterminant);
                 ImGui::Text("Captured this frame: Proj=%s View=%s",
                             g_mgrProjCapturedThisFrame ? "yes" : "no",
                             g_mgrViewCapturedThisFrame ? "yes" : "no");
@@ -3045,6 +3052,7 @@ private:
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
+    bool m_mgrrInvertView = true;
     int m_constantLogThrottle = 0;
 
 public:
@@ -3097,6 +3105,7 @@ public:
         m_real->SetTransform(D3DTS_VIEW, &m_currentView);
         m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
     }
+
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
@@ -3235,22 +3244,32 @@ public:
             if (tryExtractMgrMatrix(12, &mat)) {
                 g_profileCoreRegistersSeen[1] = true;
                 float determinant = 0.0f;
-                D3DMATRIX derivedView = {};
-                if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
-                    // c12-c15 is view inverse (camera->world). Invert exactly once.
-                    m_currentView = derivedView;
+                if (m_mgrrInvertView) {
+                    D3DMATRIX derivedView = {};
+                    if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
+                        m_currentView = derivedView;
+                        m_hasView = true;
+                        g_mgrViewCapturedThisFrame = true;
+                        g_profileViewDerivedFromInverse = true;
+                        snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                                 "MGR view updated from c12-c15 inverse (det=%.6f).", determinant);
+                        StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
+                                        "MetalGearRising profile view derived from inverse", 12);
+                    } else {
+                        g_profileViewDerivedFromInverse = false;
+                        snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                                 "WARNING: MGR c12-c15 inversion failed (det=%.9f); preserving previous View.",
+                                 determinant);
+                    }
+                } else {
+                    m_currentView = mat;
                     m_hasView = true;
                     g_mgrViewCapturedThisFrame = true;
-                    g_profileViewDerivedFromInverse = true;
-                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "MGR view updated from c12-c15 inverse (det=%.6f).", determinant);
-                    StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
-                                    "MetalGearRising profile view derived from inverse", 12);
-                } else {
                     g_profileViewDerivedFromInverse = false;
                     snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "WARNING: MGR c12-c15 inversion failed (det=%.9f); preserving previous View.",
-                             determinant);
+                             "MGR view updated from c12-c15 directly.");
+                    StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
+                                    "MetalGearRising profile view direct from c12-c15", 12);
                 }
             }
 
@@ -3614,7 +3633,9 @@ public:
         if (g_imguiInitialized) {
             ImGui::GetIO().MouseDrawCursor = g_showImGui;
         }
+        g_imguiMgrrInvertView = m_mgrrInvertView;
         RenderImGuiOverlay();
+        m_mgrrInvertView = g_imguiMgrrInvertView;
         if (g_requestManualEmit) {
             EmitFixedFunctionTransforms();
             g_requestManualEmit = false;
