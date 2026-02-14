@@ -60,6 +60,10 @@ struct ProjectionAnalysis {
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
 static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
 class WrappedD3D9Device;
+static WrappedD3D9Device* g_wrappedDeviceForImGui = nullptr;
+static bool GetMgrrInvertViewForUi();
+static void SetMgrrInvertViewForUi(bool invert);
+static float GetMgrrActiveViewDeterminantForUi();
 
 #pragma comment(lib, "user32.lib")
 
@@ -125,6 +129,9 @@ static bool g_profileHasLastModelViewMatrix = false;
 static bool g_profileViewInverseConsistencyOk = false;
 static float g_profileViewInverseConsistencyError = std::numeric_limits<float>::max();
 static bool g_profileDisableStructuralDetection = false;
+static bool g_mgrProjCapturedThisFrame = false;
+static bool g_mgrViewCapturedThisFrame = false;
+static bool g_mgrWorldCapturedForDraw = false;
 static uint32_t g_barnyardShaderHash = 0;
 
 static ProxyConfig g_config;
@@ -2144,14 +2151,21 @@ static void RenderImGuiOverlay() {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
             if (g_activeGameProfile == GameProfile_MetalGearRising) {
                 ImGui::Text("MGR layout: Proj=c4-c7, ViewInverse=c12-c15, World=c16-c19");
-                ImGui::Text("Optional combined: ViewProjection=c8-c11, WorldView=c20-c23");
+                bool invertView = GetMgrrInvertViewForUi();
+                if (ImGui::Checkbox("Invert c12 View Matrix", &invertView)) {
+                    SetMgrrInvertViewForUi(invertView);
+                }
+                ImGui::Text("Current inversion mode: %s", invertView ? "Inverted" : "Direct");
+                ImGui::Text("Determinant of active View matrix: %.6f",
+                            GetMgrrActiveViewDeterminantForUi());
+                ImGui::Text("Captured this frame: Proj=%s View=%s",
+                            g_mgrProjCapturedThisFrame ? "yes" : "no",
+                            g_mgrViewCapturedThisFrame ? "yes" : "no");
+                ImGui::Text("Captured for draw: World=%s", g_mgrWorldCapturedForDraw ? "yes" : "no");
                 ImGui::Text("Core seen: Proj=%s ViewInv=%s World=%s",
                             g_profileCoreRegistersSeen[0] ? "yes" : "no",
                             g_profileCoreRegistersSeen[1] ? "yes" : "no",
                             g_profileCoreRegistersSeen[2] ? "yes" : "no");
-                ImGui::Text("Optional seen: ViewProjection=%s WorldView=%s",
-                            g_profileOptionalRegistersSeen[0] ? "yes" : "no",
-                            g_profileOptionalRegistersSeen[1] ? "yes" : "no");
                 ImGui::Text("View source: %s", g_profileViewDerivedFromInverse ? "Derived by inversion" : "Not yet derived");
                 if (g_profileStatusMessage[0] != '\0') {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
@@ -3042,6 +3056,8 @@ private:
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
+    bool m_mgrrInvertView = true;
+    float m_mgrrActiveViewDeterminant = 0.0f;
     int m_constantLogThrottle = 0;
 
 public:
@@ -3056,17 +3072,43 @@ public:
         if (!m_hwnd) {
             m_hwnd = GetForegroundWindow();
         }
+        g_wrappedDeviceForImGui = this;
         LogMsg("WrappedD3D9Device created, wrapping device at %p", real);
     }
 
     ~WrappedD3D9Device() {
+        if (g_wrappedDeviceForImGui == this) {
+            g_wrappedDeviceForImGui = nullptr;
+        }
         LogMsg("WrappedD3D9Device destroyed");
     }
+
+    bool GetMgrrInvertView() const { return m_mgrrInvertView; }
+    void SetMgrrInvertView(bool invert) { m_mgrrInvertView = invert; }
+    float GetMgrrActiveViewDeterminant() const { return m_mgrrActiveViewDeterminant; }
 
     void EmitFixedFunctionTransforms() {
         if (!g_config.emitFixedFunctionTransforms) {
             return;
         }
+        if (g_activeGameProfile == GameProfile_MetalGearRising) {
+            // MGR profile is strict: only emit transforms when all three known registers
+            // have been captured. Never emit identity/fallback transforms in this mode.
+            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "MGR draw skipped: missing matrix/matrices (Proj=%s View=%s World=%s).",
+                         m_hasProj ? "ready" : "missing",
+                         m_hasView ? "ready" : "missing",
+                         m_hasWorld ? "ready" : "missing");
+                return;
+            }
+
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            m_real->SetTransform(D3DTS_VIEW, &m_currentView);
+            m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
+            return;
+        }
+
         D3DMATRIX identity = {};
         CreateIdentityMatrix(&identity);
         if (!m_hasWorld) m_currentWorld = identity;
@@ -3105,10 +3147,12 @@ public:
     {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
         ShaderConstantState* state = GetShaderState(shaderKey, true);
+        const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
 
         std::vector<float> overrideScratch;
         const float* effectiveConstantData = pConstantData;
-        if (BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+        // Keep MGR profile extraction isolated from manual/override paths.
+        if (!profileIsMgr && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
             effectiveConstantData = overrideScratch.data();
         }
 
@@ -3137,7 +3181,7 @@ public:
         bool slotResolvedByOverride[MatrixSlot_Count] = {};
         bool slotResolvedStructurally[MatrixSlot_Count] = {};
 
-        if (shaderKey != 0) {
+        if (!profileIsMgr && shaderKey != 0) {
             for (int slot = 0; slot < MatrixSlot_Count; slot++) {
                 const ManualMatrixBinding& binding = g_manualBindings[slot];
                 if (!binding.enabled || binding.shaderKey != shaderKey) {
@@ -3170,7 +3214,97 @@ public:
             }
         }
 
-        const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
+        if (profileIsMgr) {
+            g_profileDisableStructuralDetection = true;
+            // MGR strict known-layout mode:
+            // - capture only c4-c7 projection, c12-c15 viewInverse (invert once), c16-c19 world
+            // - do not run structural detection, heuristic fallback, or candidate scanning
+            // - persist projection/view across draws until overwritten by the same known registers
+            auto tryExtractMgrMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
+                if (!outMat || !effectiveConstantData || baseRegister < 0) {
+                    return false;
+                }
+                const UINT uploadStart = StartRegister;
+                const UINT uploadEnd = (Vector4fCount == 0) ? StartRegister : (StartRegister + Vector4fCount - 1);
+                const UINT matrixEnd = static_cast<UINT>(baseRegister + 3);
+                if (uploadStart > static_cast<UINT>(baseRegister) || uploadEnd < matrixEnd) {
+                    return false;
+                }
+                return TryBuildMatrixFromConstantUpdate(effectiveConstantData,
+                                                        StartRegister,
+                                                        Vector4fCount,
+                                                        baseRegister,
+                                                        4,
+                                                        false,
+                                                        outMat);
+            };
+
+            D3DMATRIX mat = {};
+            if (tryExtractMgrMatrix(4, &mat)) {
+                m_currentProj = mat;
+                m_hasProj = true;
+                g_mgrProjCapturedThisFrame = true;
+                g_profileCoreRegistersSeen[0] = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = 4;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = ExtractFOV(mat);
+                StoreProjectionMatrix(m_currentProj, shaderKey, 4, 4, false, true,
+                                      "MetalGearRising profile projection (c4-c7)");
+            }
+
+            if (tryExtractMgrMatrix(12, &mat)) {
+                g_profileCoreRegistersSeen[1] = true;
+                if (m_mgrrInvertView) {
+                    float determinant = 0.0f;
+                    D3DMATRIX derivedView = {};
+                    if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
+                        // c12-c15 is treated as view inverse (camera->world) in inverted mode.
+                        m_currentView = derivedView;
+                        m_hasView = true;
+                        g_mgrViewCapturedThisFrame = true;
+                        g_profileViewDerivedFromInverse = true;
+                        m_mgrrActiveViewDeterminant = (fabsf(determinant) > 1e-8f) ? (1.0f / determinant) : 0.0f;
+                        snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                                 "MGR view updated from c12-c15 inverse (det=%.6f).", determinant);
+                        StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
+                                        "MetalGearRising profile view derived from inverse", 12);
+                    } else {
+                        g_profileViewDerivedFromInverse = false;
+                        snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                                 "WARNING: MGR c12-c15 inversion failed (det=%.9f); preserving previous View.",
+                                 determinant);
+                    }
+                } else {
+                    m_currentView = mat;
+                    m_hasView = true;
+                    g_mgrViewCapturedThisFrame = true;
+                    g_profileViewDerivedFromInverse = false;
+                    D3DMATRIX invView = {};
+                    if (InvertMatrix4x4Deterministic(m_currentView, &invView, &m_mgrrActiveViewDeterminant)) {
+                        // out determinant from inversion helper is determinant(input matrix).
+                    } else {
+                        m_mgrrActiveViewDeterminant = 0.0f;
+                    }
+                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                             "MGR view updated directly from c12-c15 (inversion disabled).");
+                    StoreViewMatrix(m_currentView, shaderKey, 12, 4, false, true,
+                                    "MetalGearRising profile view direct from c12-c15", 12);
+                }
+            }
+
+            if (tryExtractMgrMatrix(16, &mat)) {
+                m_currentWorld = mat;
+                m_hasWorld = true;
+                g_mgrWorldCapturedForDraw = true;
+                g_profileCoreRegistersSeen[2] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, 16, 4, false, true,
+                                 "MetalGearRising profile world (c16-c19)");
+            }
+
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+        }
+
         const bool profileIsBarnyardRequested = g_activeGameProfile == GameProfile_Barnyard2006;
         uint32_t activeShaderHash = 0;
         const bool hasActiveShaderHash = TryGetShaderBytecodeHash(shaderKey, &activeShaderHash);
@@ -3188,68 +3322,6 @@ public:
             return TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                     baseRegister, 4, false, outMat);
         };
-
-        if (profileIsMgr) {
-            D3DMATRIX mat = {};
-            if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
-                profileMatchedKnownConstants = true;
-                m_currentProj = mat;
-                m_hasProj = true;
-                slotResolvedByOverride[MatrixSlot_Projection] = true;
-                g_projectionDetectedByNumericStructure = false;
-                g_projectionDetectedRegister = g_profileLayout.projectionBase;
-                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
-                g_projectionDetectedFovRadians = ExtractFOV(mat);
-                g_profileCoreRegistersSeen[0] = true;
-                StoreProjectionMatrix(m_currentProj, shaderKey, g_profileLayout.projectionBase, 4, false, true,
-                                      "MetalGearRising profile projection (c4-c7)");
-            }
-
-            if (tryExtractProfileMatrix(g_profileLayout.worldBase, &mat)) {
-                profileMatchedKnownConstants = true;
-                m_currentWorld = mat;
-                m_hasWorld = true;
-                slotResolvedByOverride[MatrixSlot_World] = true;
-                g_profileCoreRegistersSeen[2] = true;
-                StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 4, false, true,
-                                 "MetalGearRising profile world (c16-c19)");
-            }
-
-            if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
-                profileMatchedKnownConstants = true;
-                g_profileCoreRegistersSeen[1] = true;
-                float determinant = 0.0f;
-                D3DMATRIX derivedView = {};
-                if (InvertMatrix4x4Deterministic(mat, &derivedView, &determinant)) {
-                    m_currentView = derivedView;
-                    m_hasView = true;
-                    slotResolvedByOverride[MatrixSlot_View] = true;
-                    g_profileViewDerivedFromInverse = true;
-                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "View derived from c12-c15 inverse matrix (det=%.6f).", determinant);
-                    StoreViewMatrix(m_currentView, shaderKey, g_profileLayout.viewInverseBase, 4, false, true,
-                                    "MetalGearRising profile view derived from inverse", g_profileLayout.viewInverseBase);
-                    LogMsg("MGR profile: derived View by inverting c12-c15 (det=%.6f)", determinant);
-                } else {
-                    profileHardFailure = true;
-                    g_profileViewDerivedFromInverse = false;
-                    snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                             "WARNING: Failed to invert c12-c15 viewInverse (det=%.9f). Falling back to structural detection.",
-                             determinant);
-                    LogMsg("WARNING: MGR profile inversion failed for c12-c15 (det=%.9f); structural fallback enabled.", determinant);
-                }
-            }
-
-            if (tryExtractProfileMatrix(g_profileLayout.viewProjectionBase, &mat)) {
-                g_profileOptionalRegistersSeen[0] = true;
-                StoreMVPMatrix(mat, shaderKey, g_profileLayout.viewProjectionBase, 4, false, false,
-                               "MetalGearRising profile optional viewProjection (c8-c11)");
-            }
-
-            if (tryExtractProfileMatrix(g_profileLayout.worldViewBase, &mat)) {
-                g_profileOptionalRegistersSeen[1] = true;
-            }
-        }
 
         if (profileIsBarnyard) {
             D3DMATRIX mat = {};
@@ -3449,14 +3521,9 @@ public:
                      g_barnyardShaderHash);
         }
 
-        if (profileActive && !profileMatchedKnownConstants && !profileHardFailure) {
-            if (profileIsBarnyard) {
-                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "Barnyard profile active but upload did not hit configured transform registers.");
-            } else {
-                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "MGR profile active but this upload did not hit c4-c7/c12-c15/c16-c19; structural fallback used.");
-            }
+        if (profileIsBarnyard && !profileMatchedKnownConstants && !profileHardFailure) {
+            snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                     "Barnyard profile active but upload did not hit configured transform registers.");
         }
 
         g_profileDisableStructuralDetection = profileIsBarnyard && !profileHardFailure;
@@ -3571,7 +3638,7 @@ public:
         // Log periodic status
         if (g_frameCount % 300 == 0) {
             LogMsg("Frame %d - hasView: %d, hasProj: %d", g_frameCount, m_hasView, m_hasProj);
-            if (g_config.logCandidateSummary) {
+            if (g_config.logCandidateSummary && g_activeGameProfile != GameProfile_MetalGearRising) {
                 ShaderConstantState* state = GetShaderState(g_activeShaderKey, false);
                 if (state) {
                     LogTopCandidates(*state, g_activeShaderKey);
@@ -3644,7 +3711,18 @@ public:
     HRESULT STDMETHODCALLTYPE GetRenderTarget(DWORD RenderTargetIndex, IDirect3DSurface9** ppRenderTarget) override { return m_real->GetRenderTarget(RenderTargetIndex, ppRenderTarget); }
     HRESULT STDMETHODCALLTYPE SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil) override { return m_real->SetDepthStencilSurface(pNewZStencil); }
     HRESULT STDMETHODCALLTYPE GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface) override { return m_real->GetDepthStencilSurface(ppZStencilSurface); }
-    HRESULT STDMETHODCALLTYPE BeginScene() override { return m_real->BeginScene(); }
+    HRESULT STDMETHODCALLTYPE BeginScene() override {
+        if (g_activeGameProfile == GameProfile_MetalGearRising) {
+            // MGR frame lifecycle: keep projection/view persistent across draws and frames,
+            // but require a fresh world upload for each frame.
+            CreateIdentityMatrix(&m_currentWorld);
+            m_hasWorld = false;
+            g_mgrWorldCapturedForDraw = false;
+            g_mgrProjCapturedThisFrame = false;
+            g_mgrViewCapturedThisFrame = false;
+        }
+        return m_real->BeginScene();
+    }
     HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
     HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override { return m_real->SetTransform(State, pMatrix); }
@@ -3759,6 +3837,26 @@ public:
     HRESULT STDMETHODCALLTYPE DeletePatch(UINT Handle) override { return m_real->DeletePatch(Handle); }
     HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9** ppQuery) override { return m_real->CreateQuery(Type, ppQuery); }
 };
+
+static bool GetMgrrInvertViewForUi() {
+    if (!g_wrappedDeviceForImGui) {
+        return true;
+    }
+    return g_wrappedDeviceForImGui->GetMgrrInvertView();
+}
+
+static void SetMgrrInvertViewForUi(bool invert) {
+    if (g_wrappedDeviceForImGui) {
+        g_wrappedDeviceForImGui->SetMgrrInvertView(invert);
+    }
+}
+
+static float GetMgrrActiveViewDeterminantForUi() {
+    if (!g_wrappedDeviceForImGui) {
+        return 0.0f;
+    }
+    return g_wrappedDeviceForImGui->GetMgrrActiveViewDeterminant();
+}
 
 /**
  * Wrapped IDirect3D9 - intercepts CreateDevice to return wrapped devices
