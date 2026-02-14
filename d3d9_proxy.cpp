@@ -221,6 +221,7 @@ static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
 static bool g_showAllConstantRegisters = false;
+static int g_allConstantStageFilter = 0;
 static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
@@ -302,6 +303,12 @@ struct ShaderConstantState {
 enum ConstantUploadStage {
     ConstantUploadStage_Vertex = 0,
     ConstantUploadStage_Pixel = 1
+};
+
+enum ConstantUploadStageFilter {
+    ConstantUploadStageFilter_All = 0,
+    ConstantUploadStageFilter_Vertex = 1,
+    ConstantUploadStageFilter_Pixel = 2
 };
 
 struct ConstantUploadEvent {
@@ -1965,35 +1972,90 @@ static void RenderImGuiOverlay() {
             ImGui::BeginChild("ConstantsScroll", ImVec2(0, 270), true);
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
             if (g_showAllConstantRegisters) {
+                static const char* kStageFilters[] = {"All", "Vertex (VS)", "Pixel (PS)"};
+                ImGui::SetNextItemWidth(190.0f);
+                ImGui::Combo("Stage filter", &g_allConstantStageFilter, kStageFilters, IM_ARRAYSIZE(kStageFilters));
+
                 std::vector<ConstantUploadEvent> events;
                 {
                     std::lock_guard<std::mutex> lock(g_uiDataMutex);
                     events.assign(g_constantUploadEvents.begin(), g_constantUploadEvents.end());
                 }
-                if (events.empty()) {
-                    ImGui::Text("<no constant uploads captured yet>");
-                } else {
-                    ImGui::Text("Latest constant uploads (newest first):");
-                    for (int idx = static_cast<int>(events.size()) - 1; idx >= 0; --idx) {
-                        const ConstantUploadEvent& ev = events[static_cast<size_t>(idx)];
-                        const UINT endRegister = ev.vectorCount > 0 ? (ev.startRegister + ev.vectorCount - 1) : ev.startRegister;
-                        char itemLabel[256] = {};
-                        snprintf(itemLabel, sizeof(itemLabel),
-                                 "%s c%u-c%u (%u vectors) | shader 0x%p | hash 0x%08X###upload_%llu",
-                                 ConstantUploadStageLabel(ev.stage),
-                                 ev.startRegister,
-                                 endRegister,
-                                 ev.vectorCount,
-                                 reinterpret_cast<void*>(ev.shaderKey),
-                                 ev.shaderHash,
-                                 ev.changeSerial);
-                        if (ImGui::Selectable(itemLabel, false)) {
-                            if (ev.shaderKey != 0) {
-                                g_selectedShaderKey = ev.shaderKey;
-                            }
-                            g_selectedRegister = static_cast<int>(ev.startRegister);
+
+                struct RegisterAggregate {
+                    bool seen = false;
+                    unsigned int touches = 0;
+                    unsigned long long lastSerial = 0;
+                    ConstantUploadStage lastStage = ConstantUploadStage_Vertex;
+                    UINT lastStartRegister = 0;
+                    UINT lastVectorCount = 0;
+                    uintptr_t lastShaderKey = 0;
+                    uint32_t lastShaderHash = 0;
+                };
+
+                RegisterAggregate aggregates[kMaxConstantRegisters] = {};
+                for (const ConstantUploadEvent& ev : events) {
+                    if (g_allConstantStageFilter == ConstantUploadStageFilter_Vertex &&
+                        ev.stage != ConstantUploadStage_Vertex) {
+                        continue;
+                    }
+                    if (g_allConstantStageFilter == ConstantUploadStageFilter_Pixel &&
+                        ev.stage != ConstantUploadStage_Pixel) {
+                        continue;
+                    }
+
+                    const UINT uploadEndExclusive = (ev.vectorCount == 0)
+                        ? (ev.startRegister + 1)
+                        : (ev.startRegister + ev.vectorCount);
+                    for (UINT reg = ev.startRegister;
+                         reg < uploadEndExclusive && reg < static_cast<UINT>(kMaxConstantRegisters);
+                         ++reg) {
+                        RegisterAggregate& agg = aggregates[reg];
+                        agg.seen = true;
+                        agg.touches++;
+                        if (ev.changeSerial >= agg.lastSerial) {
+                            agg.lastSerial = ev.changeSerial;
+                            agg.lastStage = ev.stage;
+                            agg.lastStartRegister = ev.startRegister;
+                            agg.lastVectorCount = ev.vectorCount;
+                            agg.lastShaderKey = ev.shaderKey;
+                            agg.lastShaderHash = ev.shaderHash;
                         }
                     }
+                }
+
+                bool anyShown = false;
+                ImGui::Text("All constant registers (ascending):");
+                for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
+                    const RegisterAggregate& agg = aggregates[reg];
+                    if (!agg.seen) {
+                        continue;
+                    }
+                    anyShown = true;
+                    const UINT endRegister = agg.lastVectorCount > 0
+                        ? (agg.lastStartRegister + agg.lastVectorCount - 1)
+                        : agg.lastStartRegister;
+                    char itemLabel[320] = {};
+                    snprintf(itemLabel, sizeof(itemLabel),
+                             "c%d | hits:%u | last:%s c%u-c%u (%u vectors) | shader 0x%p | hash 0x%08X###all_reg_%d",
+                             reg,
+                             agg.touches,
+                             ConstantUploadStageLabel(agg.lastStage),
+                             agg.lastStartRegister,
+                             endRegister,
+                             agg.lastVectorCount,
+                             reinterpret_cast<void*>(agg.lastShaderKey),
+                             agg.lastShaderHash,
+                             reg);
+                    if (ImGui::Selectable(itemLabel, g_selectedRegister == reg)) {
+                        if (agg.lastShaderKey != 0) {
+                            g_selectedShaderKey = agg.lastShaderKey;
+                        }
+                        g_selectedRegister = reg;
+                    }
+                }
+                if (!anyShown) {
+                    ImGui::Text("<no constant uploads captured for current stage filter>");
                 }
             } else if (state && state->snapshotReady) {
                 if (g_showConstantsAsMatrices) {
