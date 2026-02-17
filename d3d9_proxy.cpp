@@ -231,7 +231,6 @@ static void UpdateMatrixSource(MatrixSlot slot,
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
 static bool g_showImGui = false;
-static bool g_imguiWasVisible = false;
 static bool g_prevShowImGui = false;
 static bool g_pauseRendering = false;
 static bool g_isRenderingImGui = false;
@@ -414,26 +413,6 @@ static void EnsureWndProcHookInstalled() {
         g_imguiPrevWndProc = current;
         SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
                          reinterpret_cast<LONG_PTR>(ImGuiWndProcHook));
-    }
-}
-
-static void NormalizeShowCursorCount(bool wantVisible) {
-    if (wantVisible) {
-        int count = ShowCursor(TRUE);
-        while (count < 0) {
-            count = ShowCursor(TRUE);
-        }
-        while (count > 0) {
-            count = ShowCursor(FALSE);
-        }
-    } else {
-        int count = ShowCursor(FALSE);
-        while (count >= 0) {
-            count = ShowCursor(FALSE);
-        }
-        while (count < -1) {
-            count = ShowCursor(TRUE);
-        }
     }
 }
 
@@ -668,11 +647,6 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
 static void ShutdownImGui() {
     if (!g_imguiInitialized) {
         return;
-    }
-
-    if (g_imguiWasVisible) {
-        NormalizeShowCursorCount(false);
-        g_imguiWasVisible = false;
     }
 
     // Remove our hook first so ImGui_ImplWin32_Shutdown restores correctly.
@@ -1760,18 +1734,10 @@ static void RenderImGuiOverlay() {
 
     if (!g_imguiInitialized || !g_showImGui) {
         g_constantUploadRecordingEnabled = false;
-        if (g_imguiWasVisible) {
-            NormalizeShowCursorCount(false);
-            g_imguiWasVisible = false;
-        }
         return;
     }
 
     ClipCursor(NULL);
-    if (!g_imguiWasVisible) {
-        NormalizeShowCursorCount(true);
-        g_imguiWasVisible = true;
-    }
 
     CameraMatrices camSnapshot = {};
     {
@@ -1792,6 +1758,19 @@ static void RenderImGuiOverlay() {
         ImGuiIO& io = ImGui::GetIO();
         io.MouseDown[0] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
         io.MouseDown[1] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+
+        io.KeyCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        io.KeyShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        io.KeyAlt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+        static const int kNavKeys[] = {
+            VK_TAB, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
+            VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE,
+            VK_BACK, VK_RETURN, VK_ESCAPE, VK_SPACE
+        };
+        for (int vk : kNavKeys) {
+            io.KeysDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        }
     }
     ImGui::GetIO().MouseDrawCursor = true;
     ImGui::NewFrame();
@@ -2876,7 +2855,7 @@ static bool CrossValidateViewAgainstProjection(const D3DMATRIX& candidateView,
         return true;
     }
 
-    constexpr float kTol = 0.05f;
+    constexpr float kTol = 0.15f;
     return (fabsf(vp_c0 - p_c0) / p_c0 < kTol) &&
            (fabsf(vp_c1 - p_c1) / p_c1 < kTol);
 }
@@ -3314,6 +3293,7 @@ private:
     int m_constantLogThrottle = 0;
     int m_viewLastFrame = -1;
     int m_projLastFrame = -1;
+    int m_projDetectedFrame = -1;
     int m_worldLastFrame = -1;
     uintptr_t m_viewLockedShader = 0;
     int m_viewLockedRegister = -1;
@@ -3328,6 +3308,7 @@ public:
         CreateIdentityMatrix(&m_currentView);
         CreateIdentityMatrix(&m_currentProj);
         CreateIdentityMatrix(&m_currentWorld);
+        m_projDetectedFrame = -1;
         m_mgrrUseAutoProjection = g_config.mgrrUseAutoProjectionWhenC4Invalid;
         D3DDEVICE_CREATION_PARAMETERS params = {};
         if (SUCCEEDED(m_real->GetCreationParameters(&params))) {
@@ -3988,7 +3969,8 @@ public:
             m_hasView = true;
                 m_viewLastFrame = g_frameCount;
             m_hasProj = true;
-                m_projLastFrame = g_frameCount;
+            m_projLastFrame = g_frameCount;
+            m_projDetectedFrame = g_frameCount;
             slotResolvedStructurally[MatrixSlot_World] = true;
             slotResolvedStructurally[MatrixSlot_View] = true;
             slotResolvedStructurally[MatrixSlot_Projection] = true;
@@ -4041,6 +4023,7 @@ public:
                     m_currentProj = mat;
                     m_hasProj = true;
                     m_projLastFrame = g_frameCount;
+                    m_projDetectedFrame = g_frameCount;
                     slotResolvedStructurally[MatrixSlot_Projection] = true;
                     g_projectionDetectedByNumericStructure = true;
                     g_projectionDetectedFovRadians = projectionInfo.fovRadians;
@@ -4064,7 +4047,8 @@ public:
                     (shaderKey == m_viewLockedShader &&
                      static_cast<int>(baseReg) == m_viewLockedRegister);
                 if (sameSource) {
-                    if (m_hasProj && !CrossValidateViewAgainstProjection(mat, m_currentProj)) {
+                    if (m_hasProj && m_projDetectedFrame == g_frameCount &&
+                        !CrossValidateViewAgainstProjection(mat, m_currentProj)) {
                         // Column norms of candidateView * P do not match column norms of P.
                         // This is WV, VP, or some other combined form — not a pure view matrix.
                         // Do not mark slotResolvedStructurally so detection can continue.
@@ -4102,23 +4086,23 @@ public:
         g_profileDisableStructuralDetection = false;
         const bool allowStructuralDetection = !profileActive;
 
-        if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 4) {
+        if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 12) {
             if (CountStridedCandidates(effectiveConstantData, StartRegister,
-                                      Vector4fCount, 4u, MatrixClass_View) > 1) {
+                                      Vector4fCount, 4u, MatrixClass_View) > 2) {
                 suppressViewFromUpload = true;
             }
             if (CountStridedCandidates(effectiveConstantData, StartRegister,
-                                      Vector4fCount, 4u, MatrixClass_World) > 1) {
+                                      Vector4fCount, 4u, MatrixClass_World) > 2) {
                 suppressWorldFromUpload = true;
             }
             if (!suppressViewFromUpload &&
                 CountStridedCandidates(effectiveConstantData, StartRegister,
-                                      Vector4fCount, 3u, MatrixClass_View) > 1) {
+                                      Vector4fCount, 3u, MatrixClass_View) > 2) {
                 suppressViewFromUpload = true;
             }
             if (!suppressWorldFromUpload &&
                 CountStridedCandidates(effectiveConstantData, StartRegister,
-                                      Vector4fCount, 3u, MatrixClass_World) > 1) {
+                                      Vector4fCount, 3u, MatrixClass_World) > 2) {
                 suppressWorldFromUpload = true;
             }
         }
@@ -4203,6 +4187,17 @@ public:
     HRESULT STDMETHODCALLTYPE Present(const RECT* pSourceRect, const RECT* pDestRect,
                                        HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override {
         g_frameCount++;
+
+        // Reset per-frame source locks. Locks set during SetVertexShaderConstantF calls
+        // this frame will be validated against these — after Present they reset for the
+        // next frame. This ensures correct behavior regardless of BeginScene call count.
+        if (g_activeGameProfile == GameProfile_None) {
+            m_viewLockedShader = 0;
+            m_viewLockedRegister = -1;
+            m_projLockedShader = 0;
+            m_projLockedRegister = -1;
+        }
+
         UpdateFrameTimeStats();
         // Throttle constant logging to every 60 frames
         if (g_config.logAllConstants) {
