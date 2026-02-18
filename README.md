@@ -2,7 +2,7 @@
 
 Experimental Direct3D9 proxy DLL for RTX Remix.
 
-This branch is focused on **deterministic matrix extraction** for arbitrary DX9 engines instead of DMC4-only assumptions. The proxy wraps `IDirect3D9` / `IDirect3DDevice9`, observes vertex shader constant uploads, caches current transform state, and forwards fixed-function transforms immediately before draw calls.
+This branch is focused on **deterministic matrix extraction** for arbitrary DX9 engines while still supporting fixed-profile game layouts when needed. The proxy wraps `IDirect3D9` / `IDirect3DDevice9`, observes vertex shader constant uploads, caches current transform state, and forwards fixed-function transforms immediately before draw calls.
 
 ## Why this exists
 
@@ -52,6 +52,7 @@ If enabled (`ProbeTransposedLayouts=1`), a failing candidate is transposed once 
 You can enable fixed-profile extraction via `camera_proxy.ini`:
 
 - `GameProfile=MetalGearRising`
+- `GameProfile=DevilMayCry4` (or `DMC4`)
 - `GameProfile=Barnyard` (or `Barnyard2006`)
 
 **Metal Gear Rising profile**
@@ -71,6 +72,15 @@ If expected uploads are not matched or inverse-view inversion fails (non-inverti
 - Optional toggles:
   - `BarnyardForceWorldFromC0=1` forces c0-c3 to be treated as WORLD whenever uploaded.
   - `BarnyardUseGameSetTransformsForViewProjection=1` enables interception/capture of game VIEW/PROJECTION transforms.
+
+**Devil May Cry 4 profile**
+
+- Strict fixed mapping:
+  - `c0-c3`   → Combined MVP
+  - `c0-c3`   → World
+  - `c4-c7`   → View
+  - `c8-c11`  → Projection
+- This profile intentionally prefers fixed mapping behavior for compatibility testing over structural fallback heuristics.
 
 ### 6) Draw-time emission
 
@@ -98,6 +108,57 @@ To support titles where ImGui input is unreliable, single-key hotkeys are polled
 - `HotkeyResetMatrixOverridesVK` (default F7)
 
 Resetting matrix register overrides returns `View/Proj/WorldMatrixRegister` to `-1`; if `AutoDetectMatrices=1`, the proxy falls back to deterministic structural auto-detection.
+
+### 9) SetTransform compatibility controls
+
+These options help with engines that still call fixed-function transforms directly:
+
+- `SetTransformBypassProxyWhenGameProvides=1`
+  - when game-provided SetTransform activity is observed, proxy draw-time W/V/P emission can be bypassed.
+- `SetTransformRoundTripCompatibilityMode=1`
+  - round-trips SetTransform through `GetTransform()` and reapplies it for strict compatibility behavior.
+
+### 10) Combined MVP fallback (optional)
+
+Combined-MVP decomposition is now configurable and remains disabled by default:
+
+- `EnableCombinedMVP`
+- `CombinedMVPRequireWorld`
+- `CombinedMVPAssumeIdentityWorld`
+- `CombinedMVPForceDecomposition`
+- `CombinedMVPLogDecomposition`
+
+This path is used only when full W/V/P resolution was not already achieved.
+
+### 11) Experimental custom projection fallback
+
+An optional projection fallback can be enabled when no usable projection matrix is detected.
+
+- `ExperimentalCustomProjectionEnabled`
+- `ExperimentalCustomProjectionMode`
+  - `1` = manual 4x4 matrix (`ExperimentalCustomProjectionM11..M44`)
+  - `2` = auto-projection from FOV/near/far/aspect parameters
+- `ExperimentalCustomProjectionOverrideDetectedProjection`
+- `ExperimentalCustomProjectionOverrideCombinedMVP`
+- `ExperimentalCustomProjectionAutoFovDeg`
+- `ExperimentalCustomProjectionAutoNearZ`
+- `ExperimentalCustomProjectionAutoFarZ`
+- `ExperimentalCustomProjectionAutoAspectFallback`
+- `ExperimentalCustomProjectionAutoHandedness` (`1`=LH, `2`=RH)
+
+MGRR-specific helper:
+
+- `MGRRUseAutoProjectionWhenC4Invalid=1` prefers auto-generating projection from ViewProjection data if `c4-c7` fails projection validation.
+
+### 12) Experimental inverse-view world emission
+
+Optional world synthesis from inverse view:
+
+- `ExperimentalInverseViewAsWorld`
+- `ExperimentalInverseViewAsWorldAllowUnverified`
+- `ExperimentalInverseViewAsWorldFast`
+
+Useful for engines that expose a reliable VIEW but unstable/absent WORLD data.
 
 ---
 
@@ -138,6 +199,12 @@ See `camera_proxy.ini` for full comments. Most important keys:
 - `AutoDetectMatrices`
 - `ProbeTransposedLayouts`
 - `ProbeInverseView`
+- `EnableCombinedMVP`
+- `ExperimentalCustomProjectionEnabled`
+- `ExperimentalInverseViewAsWorld`
+- `SetTransformBypassProxyWhenGameProvides`
+- `SetTransformRoundTripCompatibilityMode`
+- `DisableGameInputWhileMenuOpen`
 - `ImGuiScalePercent`
 - `EnableLogging`
 - `GameProfile`
