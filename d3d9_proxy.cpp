@@ -29,7 +29,6 @@
 #include <chrono>
 #include <cstdint>
 #include <cstring>
-#include <atomic>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -139,9 +138,7 @@ struct TbnDiagnostics {
     uint64_t drawsScanned = 0;
     uint64_t drawsPatched = 0;
     uint64_t drawsMissingNormals = 0;
-    uint64_t drawsMissingAnyTbn = 0;
-    uint64_t drawsMissingTangents = 0;
-    uint64_t drawsMissingBinormals = 0;
+    uint64_t drawsMissingFullTBN = 0;
     uint64_t cacheHits = 0;
     uint64_t cacheMisses = 0;
     uint64_t skipsUnsupportedPrimitive = 0;
@@ -149,8 +146,6 @@ struct TbnDiagnostics {
     uint64_t skipsMissingPosition = 0;
     uint64_t skipsMissingUv = 0;
     uint64_t skipsDecodeFailure = 0;
-    uint64_t skipsStream1Occupied = 0;
-    uint64_t skipsNoExplicitDecl = 0;
     uint64_t skipsDrawTooLarge = 0;
     uint64_t generationTimeUs = 0;
 };
@@ -211,7 +206,7 @@ static HMODULE g_hD3D9 = nullptr;
 static HINSTANCE g_moduleInstance = nullptr;
 static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
-static uint32_t g_frameCount = 0;
+static int g_frameCount = 0;
 
 struct CameraMatrices {
     D3DMATRIX view;
@@ -347,7 +342,6 @@ static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
     if (!outHash || shaderKey == 0) {
         return false;
     }
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     auto it = g_shaderBytecodeHashes.find(shaderKey);
     if (it == g_shaderBytecodeHashes.end() || it->second == 0) {
         return false;
@@ -361,7 +355,7 @@ struct ShaderConstantState {
     bool valid[kMaxConstantRegisters] = {};
     float overrideConstants[kMaxConstantRegisters][4] = {};
     bool overrideValid[kMaxConstantRegisters] = {};
-    uint32_t overrideExpiresAtFrame[kMaxConstantRegisters];
+    int overrideExpiresAtFrame[kMaxConstantRegisters];
     bool snapshotReady = false;
     unsigned long long sampleCounts[kMaxConstantRegisters] = {};
     double mean[kMaxConstantRegisters][4] = {};
@@ -397,13 +391,13 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
 static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {};
 static std::vector<uintptr_t> g_shaderOrder = {};
 static std::unordered_map<uintptr_t, bool> g_disabledShaders = {};
-static std::mutex g_shaderStateMutex;
 static unsigned long long g_constantChangeSerial = 0;
 static unsigned long long g_constantUploadSerial = 0;
 static std::deque<ConstantUploadEvent> g_constantUploadEvents = {};
 static constexpr size_t kMaxConstantUploadEvents = 2000;
 static GlobalVertexRegisterState g_allVertexRegisters[kMaxConstantRegisters] = {};
-static std::atomic<bool> g_memoryScannerRunning{false};
+static HANDLE g_memoryScannerThread = nullptr;
+static DWORD g_memoryScannerThreadId = 0;
 static DWORD g_memoryScannerLastTick = 0;
 
 static constexpr int kFrameTimeHistory = 120;
@@ -943,7 +937,6 @@ static void RecordConstantUpload(ConstantUploadStage stage,
 }
 
 static bool IsShaderDisabled(uintptr_t shaderKey) {
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     auto it = g_disabledShaders.find(shaderKey);
     return it != g_disabledShaders.end() && it->second;
 }
@@ -952,7 +945,6 @@ static void SetShaderDisabled(uintptr_t shaderKey, bool disabled) {
     if (shaderKey == 0) {
         return;
     }
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     g_disabledShaders[shaderKey] = disabled;
 }
 
@@ -1253,7 +1245,6 @@ static void DrawMatrixWithTranspose(const char* label, const D3DMATRIX& mat, boo
 }
 
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing) {
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     if (shaderKey == 0 && !createIfMissing) {
         return nullptr;
     }
@@ -1266,13 +1257,12 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
     }
     g_shaderOrder.push_back(shaderKey);
     auto inserted = g_shaderConstants.emplace(shaderKey, ShaderConstantState{});
-    for (int i = 0; i < kMaxConstantRegisters; ++i) inserted.first->second.overrideExpiresAtFrame[i] = UINT32_MAX;
+    for (int i = 0; i < kMaxConstantRegisters; ++i) inserted.first->second.overrideExpiresAtFrame[i] = -1;
     return &inserted.first->second;
 }
 
 
 static void OnVertexShaderReleased(uintptr_t shaderKey) {
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     if (shaderKey == 0) {
         return;
     }
@@ -1567,12 +1557,11 @@ static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, fl
 }
 
 static void ClearAllShaderOverrides() {
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     for (auto& entry : g_shaderConstants) {
         ShaderConstantState& state = entry.second;
         memset(state.overrideConstants, 0, sizeof(state.overrideConstants));
         memset(state.overrideValid, 0, sizeof(state.overrideValid));
-        for (int i = 0; i < kMaxConstantRegisters; ++i) state.overrideExpiresAtFrame[i] = UINT32_MAX;
+        for (int i = 0; i < kMaxConstantRegisters; ++i) state.overrideExpiresAtFrame[i] = -1;
     }
 }
 
@@ -1586,15 +1575,14 @@ static void ClearShaderRegisterOverride(uintptr_t shaderKey, int reg) {
     }
     memset(state->overrideConstants[reg], 0, sizeof(state->overrideConstants[reg]));
     state->overrideValid[reg] = false;
-    state->overrideExpiresAtFrame[reg] = UINT32_MAX;
+    state->overrideExpiresAtFrame[reg] = -1;
 }
 
 static bool BuildOverriddenConstants(ShaderConstantState& state,
                                      UINT startRegister,
                                      UINT vector4fCount,
                                      const float* sourceData,
-                                     float* scratch,
-                                     UINT scratchCapacity) {
+                                     std::vector<float>& scratch) {
     if (!g_enableShaderEditing || !sourceData || vector4fCount == 0) {
         return false;
     }
@@ -1614,10 +1602,7 @@ static bool BuildOverriddenConstants(ShaderConstantState& state,
         return false;
     }
 
-    if (!scratch || scratchCapacity < kMaxConstantRegisters * 4 || vector4fCount * 4 > scratchCapacity) {
-        return false;
-    }
-    memcpy(scratch, sourceData, vector4fCount * 4 * sizeof(float));
+    scratch.assign(sourceData, sourceData + vector4fCount * 4);
     for (UINT i = 0; i < vector4fCount; i++) {
         UINT reg = startRegister + i;
         if (reg >= kMaxConstantRegisters) {
@@ -1627,14 +1612,14 @@ static bool BuildOverriddenConstants(ShaderConstantState& state,
             continue;
         }
 
-        if (state.overrideExpiresAtFrame[reg] != UINT32_MAX &&
-            static_cast<uint32_t>(g_frameCount - state.overrideExpiresAtFrame[reg]) < 0x80000000u) {
+        memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
+
+        if (state.overrideExpiresAtFrame[reg] >= 0 &&
+            g_frameCount >= state.overrideExpiresAtFrame[reg]) {
             state.overrideValid[reg] = false;
-            state.overrideExpiresAtFrame[reg] = UINT32_MAX;
+            state.overrideExpiresAtFrame[reg] = -1;
             continue;
         }
-
-        memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
     }
     return true;
 }
@@ -1863,7 +1848,7 @@ static DWORD WINAPI MemoryScannerThread(LPVOID lpParam) {
                                       : GetModuleHandleA(moduleName.c_str());
     if (!hmod) {
         LogMsg("Memory scan failed: module not found (%s)", moduleName.c_str());
-        g_memoryScannerRunning.store(false);
+        g_memoryScannerThread = nullptr;
         return 0;
     }
 
@@ -1871,7 +1856,7 @@ static DWORD WINAPI MemoryScannerThread(LPVOID lpParam) {
     SIZE_T len = VirtualQuery(hmod, &info, sizeof(info));
     if (len == 0) {
         LogMsg("Memory scan failed: VirtualQuery base.");
-        g_memoryScannerRunning.store(false);
+        g_memoryScannerThread = nullptr;
         return 0;
     }
 
@@ -1897,12 +1882,12 @@ static DWORD WINAPI MemoryScannerThread(LPVOID lpParam) {
     }
 
     LogMsg("Memory scan complete: %d results", resultsFound);
-    g_memoryScannerRunning.store(false);
+    g_memoryScannerThread = nullptr;
     return 0;
 }
 
 static void StartMemoryScanner() {
-    if (g_memoryScannerRunning.load()) {
+    if (g_memoryScannerThread) {
         return;
     }
     const char* moduleName = g_config.memoryScannerModule[0] ? g_config.memoryScannerModule : nullptr;
@@ -1915,21 +1900,22 @@ static void StartMemoryScanner() {
     if (moduleName) {
         moduleCopy = _strdup(moduleName);
     }
-    g_memoryScannerRunning.store(true);
-    HANDLE hThread = CreateThread(nullptr, 0, MemoryScannerThread, moduleCopy, 0, nullptr);
-    if (!hThread) {
-        g_memoryScannerRunning.store(false);
+    g_memoryScannerThread = CreateThread(
+        nullptr,
+        0,
+        MemoryScannerThread,
+        moduleCopy,
+        0,
+        &g_memoryScannerThreadId);
+    if (!g_memoryScannerThread) {
         LogMsg("WARNING: Failed to create memory scan thread.");
         if (moduleCopy) {
             free(moduleCopy);
         }
-        return;
     }
-    CloseHandle(hThread);
 }
 
 static void UpdateConstantSnapshot() {
-    std::lock_guard<std::mutex> lock(g_shaderStateMutex);
     for (auto& entry : g_shaderConstants) {
         entry.second.snapshotReady = true;
     }
@@ -2387,20 +2373,18 @@ static void RenderImGuiOverlay() {
         if (ImGui::BeginTabItem("Constants")) {
             g_constantUploadRecordingEnabled = true;
             ImGui::Text("Per-shader snapshots update every frame.");
-            std::vector<uintptr_t> shaderOrderSnapshot;
-            { std::lock_guard<std::mutex> lock(g_shaderStateMutex); shaderOrderSnapshot = g_shaderOrder; }
             if (g_selectedShaderKey == 0) {
                 if (g_activeShaderKey != 0) {
                     g_selectedShaderKey = g_activeShaderKey;
-                } else if (!shaderOrderSnapshot.empty()) {
-                    g_selectedShaderKey = shaderOrderSnapshot.front();
+                } else if (!g_shaderOrder.empty()) {
+                    g_selectedShaderKey = g_shaderOrder.front();
                 }
             }
-            if (!shaderOrderSnapshot.empty()) {
+            if (!g_shaderOrder.empty()) {
                 char preview[128];
                 BuildShaderComboLabel(g_selectedShaderKey, preview, sizeof(preview));
                 if (ImGui::BeginCombo("Shader", preview)) {
-                    for (uintptr_t key : shaderOrderSnapshot) {
+                    for (uintptr_t key : g_shaderOrder) {
                         char itemLabel[128];
                         BuildShaderComboLabel(key, itemLabel, sizeof(itemLabel));
                         ShaderConstantState* itemState = GetShaderState(key, false);
@@ -2482,7 +2466,7 @@ static void RenderImGuiOverlay() {
                         } else if (g_overrideScopeMode == Override_NFrames) {
                             editState->overrideExpiresAtFrame[g_selectedRegister] = g_frameCount + g_overrideNFrames;
                         } else {
-                            editState->overrideExpiresAtFrame[g_selectedRegister] = UINT32_MAX;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = -1;
                         }
                     }
                     ImGui::SameLine();
@@ -2750,11 +2734,11 @@ static void RenderImGuiOverlay() {
                 SaveConfigBoolValue("GenerateBinormalsIfMissing", g_config.generateBinormalsIfMissing);
             }
             ImGui::InputInt("Max vertices per draw", &g_config.tbnMaxVerticesPerDraw);
-            if (g_config.tbnMaxVerticesPerDraw < 128) g_config.tbnMaxVerticesPerDraw = 128;
-            if (ImGui::IsItemDeactivatedAfterEdit()) SaveConfigIntValue("TBNMaxVerticesPerDraw", g_config.tbnMaxVerticesPerDraw);
             ImGui::InputInt("Max triangles per draw", &g_config.tbnMaxTrianglesPerDraw);
+            if (g_config.tbnMaxVerticesPerDraw < 128) g_config.tbnMaxVerticesPerDraw = 128;
             if (g_config.tbnMaxTrianglesPerDraw < 128) g_config.tbnMaxTrianglesPerDraw = 128;
-            if (ImGui::IsItemDeactivatedAfterEdit()) SaveConfigIntValue("TBNMaxTrianglesPerDraw", g_config.tbnMaxTrianglesPerDraw);
+            SaveConfigIntValue("TBNMaxVerticesPerDraw", g_config.tbnMaxVerticesPerDraw);
+            SaveConfigIntValue("TBNMaxTrianglesPerDraw", g_config.tbnMaxTrianglesPerDraw);
             if (ImGui::Checkbox("Verbose TBN logs", &g_config.tbnLogVerbose)) {
                 SaveConfigBoolValue("TBNLogVerbose", g_config.tbnLogVerbose);
             }
@@ -2762,9 +2746,7 @@ static void RenderImGuiOverlay() {
             ImGui::Text("draws scanned: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsScanned));
             ImGui::Text("draws patched: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsPatched));
             ImGui::Text("draws missing normals: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingNormals));
-            ImGui::Text("draws missing tangents: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingTangents));
-            ImGui::Text("draws missing binormals: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingBinormals));
-            ImGui::Text("draws missing any TBN: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingAnyTbn));
+            ImGui::Text("draws missing full TBN: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.drawsMissingFullTBN));
             ImGui::Text("cache hits/misses: %llu / %llu", static_cast<unsigned long long>(g_tbnDiagnostics.cacheHits), static_cast<unsigned long long>(g_tbnDiagnostics.cacheMisses));
             ImGui::Text("generation time total: %llu us", static_cast<unsigned long long>(g_tbnDiagnostics.generationTimeUs));
             ImGui::Text("skips unsupported primitive: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsUnsupportedPrimitive));
@@ -2772,8 +2754,6 @@ static void RenderImGuiOverlay() {
             ImGui::Text("skips missing position: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsMissingPosition));
             ImGui::Text("skips missing uv: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsMissingUv));
             ImGui::Text("skips decode failure: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsDecodeFailure));
-            ImGui::Text("skips stream1 occupied: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsStream1Occupied));
-            ImGui::Text("skips no explicit decl (FVF path): %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsNoExplicitDecl));
             ImGui::Text("skips draw too large: %llu", static_cast<unsigned long long>(g_tbnDiagnostics.skipsDrawTooLarge));
             ImGui::EndTabItem();
         }
@@ -2783,7 +2763,7 @@ static void RenderImGuiOverlay() {
                 StartMemoryScanner();
             }
             ImGui::SameLine();
-            ImGui::Text("Status: %s", g_memoryScannerRunning.load() ? "running" : "idle");
+            ImGui::Text("Status: %s", g_memoryScannerThread ? "running" : "idle");
             ImGui::SameLine();
             if (ImGui::Button("Clear results")) {
                 std::lock_guard<std::mutex> lock(g_uiDataMutex);
@@ -3676,32 +3656,19 @@ class WrappedVertexShader9 : public IDirect3DVertexShader9 {
 private:
     IDirect3DVertexShader9* m_real;
     uintptr_t m_key;
-    LONG m_refCount = 1;
 public:
     explicit WrappedVertexShader9(IDirect3DVertexShader9* real)
-        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {
-        if (m_real) m_real->AddRef();
-    }
+        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {}
 
     IDirect3DVertexShader9* GetReal() const { return m_real; }
     uintptr_t GetKey() const { return m_key; }
 
-    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override {
-        if (!ppv) return E_POINTER;
-        if (riid == IID_IUnknown || riid == __uuidof(IDirect3DVertexShader9)) {
-            *ppv = static_cast<IDirect3DVertexShader9*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppv = nullptr;
-        return E_NOINTERFACE;
-    }
-    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refCount)); }
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override { return m_real->QueryInterface(riid, ppv); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
     ULONG STDMETHODCALLTYPE Release() override {
-        ULONG count = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
+        ULONG count = m_real->Release();
         if (count == 0) {
             OnVertexShaderReleased(m_key);
-            if (m_real) { m_real->Release(); m_real = nullptr; }
             delete this;
         }
         return count;
@@ -3756,22 +3723,9 @@ struct LayoutSemanticsState {
     UINT texcoord0Stream = 0;
 };
 
-struct PatchedDeclKey {
-    IDirect3DVertexDeclaration9* decl = nullptr;
-    uint8_t flags = 0;
-    bool operator==(const PatchedDeclKey& o) const { return decl == o.decl && flags == o.flags; }
-};
-
-struct PatchedDeclKeyHash {
-    size_t operator()(const PatchedDeclKey& k) const {
-        return std::hash<uintptr_t>()(reinterpret_cast<uintptr_t>(k.decl)) ^ (size_t(k.flags) << 32);
-    }
-};
-
 class WrappedD3D9Device : public IDirect3DDevice9Ex {
 private:
     IDirect3DDevice9* m_real;
-    LONG m_refCount = 1;
     IDirect3DDevice9Ex* m_realEx = nullptr;
     D3DMATRIX m_currentView;
     D3DMATRIX m_currentProj;
@@ -3784,10 +3738,10 @@ private:
     bool m_hasWorld = false;
     bool m_mgrrUseAutoProjection = false;
     int m_constantLogThrottle = 0;
-    uint32_t m_viewLastFrame = UINT32_MAX;
-    uint32_t m_projLastFrame = UINT32_MAX;
-    uint32_t m_projDetectedFrame = UINT32_MAX;
-    uint32_t m_worldLastFrame = UINT32_MAX;
+    int m_viewLastFrame = -1;
+    int m_projLastFrame = -1;
+    int m_projDetectedFrame = -1;
+    int m_worldLastFrame = -1;
     uintptr_t m_viewLockedShader = 0;
     int m_viewLockedRegister = -1;
     uintptr_t m_projLockedShader = 0;
@@ -3800,7 +3754,7 @@ private:
     IDirect3DIndexBuffer9* m_currentIndexBuffer = nullptr;
     IDirect3DVertexBuffer9* m_tbnGeneratedStream = nullptr;
     UINT m_tbnGeneratedStreamCapacity = 0;
-    std::unordered_map<PatchedDeclKey, IDirect3DVertexDeclaration9*, PatchedDeclKeyHash> m_patchedDeclCache;
+    std::unordered_map<uintptr_t, IDirect3DVertexDeclaration9*> m_patchedDeclCache;
 
 
     static bool IsInstancedFrequency(UINT setting) {
@@ -3857,7 +3811,7 @@ private:
         out->assign(positions.size(), {});
         std::vector<Float3> nsum(positions.size(), {});
         std::vector<Float3> tsum(positions.size(), {});
-        std::vector<float> handedness(positions.size(), 0.0f);
+        std::vector<float> handedness(positions.size(), 1.0f);
         for (size_t i = 0; i + 2 < indices.size(); i += 3) {
             uint32_t i0 = indices[i], i1 = indices[i+1], i2 = indices[i+2];
             if (i0 >= positions.size() || i1 >= positions.size() || i2 >= positions.size()) continue;
@@ -3876,7 +3830,7 @@ private:
                     tsum[i0] = Add3(tsum[i0], t); tsum[i1] = Add3(tsum[i1], t); tsum[i2] = Add3(tsum[i2], t);
                     Float3 b = Mul3(Sub3(Mul3(e2, x1), Mul3(e1, x2)), r);
                     const float s = Dot3f(Cross3(fn, t), b) < 0.0f ? -1.0f : 1.0f;
-                    handedness[i0] += s; handedness[i1] += s; handedness[i2] += s;
+                    handedness[i0] = s; handedness[i1] = s; handedness[i2] = s;
                 }
             }
         }
@@ -3884,8 +3838,7 @@ private:
         for (size_t i = 0; i < positions.size(); ++i) {
             Float3 n = Normalize3(nsum[i], MakeFloat3(0.0f, 1.0f, 0.0f));
             Float3 t = Normalize3(Sub3(tsum[i], Mul3(n, Dot3f(n, tsum[i]))), MakeFloat3(1.0f, 0.0f, 0.0f));
-            float h = (handedness[i] >= 0.0f) ? 1.0f : -1.0f;
-            Float3 b = Normalize3(Mul3(Cross3(n, t), h), MakeFloat3(0.0f, 0.0f, 1.0f));
+            Float3 b = Normalize3(Mul3(Cross3(n, t), handedness[i]), MakeFloat3(0.0f, 0.0f, 1.0f));
             (*out)[i] = {n.x,n.y,n.z,t.x,t.y,t.z,b.x,b.y,b.z};
         }
         return true;
@@ -3894,8 +3847,7 @@ private:
 
     IDirect3DVertexDeclaration9* GetOrCreatePatchedDecl(bool needN, bool needT, bool needB) {
         if (!m_currentVertexDecl) return nullptr;
-        uint8_t flags = static_cast<uint8_t>((needN?1u:0u) | (needT?2u:0u) | (needB?4u:0u));
-        PatchedDeclKey key = { m_currentVertexDecl, flags };
+        uintptr_t key = reinterpret_cast<uintptr_t>(m_currentVertexDecl) ^ (needN?1u:0u) ^ (needT?2u:0u) ^ (needB?4u:0u);
         auto it = m_patchedDeclCache.find(key);
         if (it != m_patchedDeclCache.end()) {
             g_tbnDiagnostics.cacheHits++;
@@ -3930,9 +3882,7 @@ private:
         const bool missingT = !layout.hasTangent;
         const bool missingB = !layout.hasBinormal;
         if (missingN) g_tbnDiagnostics.drawsMissingNormals++;
-        if (missingN || missingT || missingB) g_tbnDiagnostics.drawsMissingAnyTbn++;
-        if (missingT) g_tbnDiagnostics.drawsMissingTangents++;
-        if (missingB) g_tbnDiagnostics.drawsMissingBinormals++;
+        if (missingN || missingT || missingB) g_tbnDiagnostics.drawsMissingFullTBN++;
         if (!g_config.enableTBNForwarding || PrimitiveType != D3DPT_TRIANGLELIST || !m_currentVertexDecl || !m_currentIndexBuffer) {
             if (g_config.tbnLogVerbose) LogMsg("[TBN_SKIP] forwarding disabled/unsupported path (prim=%u, decl=%p, ib=%p)", (unsigned)PrimitiveType, m_currentVertexDecl, m_currentIndexBuffer);
             if (PrimitiveType != D3DPT_TRIANGLELIST) g_tbnDiagnostics.skipsUnsupportedPrimitive++;
@@ -3961,7 +3911,7 @@ private:
         IDirect3DVertexBuffer9* vb = m_streamBindings[layout.positionStream].vb;
         const UINT stride = m_streamBindings[layout.positionStream].stride;
         if (stride < layout.positionOffset + 12) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
-        const UINT firstVertex = MinVertexIndex;
+        const UINT firstVertex = MinVertexIndex + (BaseVertexIndex > 0 ? (UINT)BaseVertexIndex : 0);
         BYTE* vbData = nullptr;
         if (FAILED(vb->Lock(m_streamBindings[layout.positionStream].offset + firstVertex * stride, vertCount * stride, (void**)&vbData, D3DLOCK_READONLY)) || !vbData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         std::vector<Float3> pos(vertCount);
@@ -3985,27 +3935,14 @@ private:
         if (FAILED(m_currentIndexBuffer->Lock(startIndex * indexStride, indexCount * indexStride, (void**)&ibData, D3DLOCK_READONLY)) || !ibData) { g_tbnDiagnostics.skipsDecodeFailure++; return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         std::vector<uint32_t> indices(indexCount);
         for (UINT i=0;i<indexCount;++i) {
-            uint32_t rawIdx = (ibDesc.Format == D3DFMT_INDEX16) ? ((const uint16_t*)ibData)[i] : ((const uint32_t*)ibData)[i];
-            int64_t localIdx = static_cast<int64_t>(rawIdx) + static_cast<int64_t>(BaseVertexIndex) - static_cast<int64_t>(MinVertexIndex);
-            if (localIdx < 0 || localIdx >= static_cast<int64_t>(vertCount)) {
-                indices[i] = 0;
-            } else {
-                indices[i] = static_cast<uint32_t>(localIdx);
-            }
+            uint32_t idx = (ibDesc.Format == D3DFMT_INDEX16) ? ((const uint16_t*)ibData)[i] : ((const uint32_t*)ibData)[i];
+            if (idx < MinVertexIndex) idx = 0; else idx -= MinVertexIndex;
+            indices[i] = idx;
         }
         m_currentIndexBuffer->Unlock();
 
         std::vector<TbnGeneratedVertex> generated;
-        auto t0 = std::chrono::high_resolution_clock::now();
-        if (!BuildGeneratedTbn(pos, uv, indices, &generated)) {
-            auto t1 = std::chrono::high_resolution_clock::now();
-            g_tbnDiagnostics.generationTimeUs += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
-            g_tbnDiagnostics.skipsDecodeFailure++;
-            if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generation failed");
-            return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
-        }
-        auto t1 = std::chrono::high_resolution_clock::now();
-        g_tbnDiagnostics.generationTimeUs += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1 - t0).count();
+        if (!BuildGeneratedTbn(pos, uv, indices, &generated)) { g_tbnDiagnostics.skipsDecodeFailure++; if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generation failed"); return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount); }
         if (g_config.tbnLogVerbose) LogMsg("[TBN_GEN] generated attributes for %u vertices", vertCount);
         const bool needN = missingN && g_config.generateNormalsIfMissing;
         const bool needT = missingT && g_config.generateTangentsIfMissing && layout.hasTexcoord0;
@@ -4035,17 +3972,6 @@ private:
         }
         m_tbnGeneratedStream->Unlock();
 
-        D3DVERTEXELEMENT9 checkElems[MAXD3DDECLLENGTH] = {};
-        UINT checkCount = MAXD3DDECLLENGTH;
-        if (SUCCEEDED(m_currentVertexDecl->GetDeclaration(checkElems, &checkCount))) {
-            for (UINT i = 0; i < checkCount; ++i) {
-                if (checkElems[i].Stream == 0xFF) break;
-                if (checkElems[i].Stream == 1) {
-                    g_tbnDiagnostics.skipsStream1Occupied++;
-                    return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, PrimitiveCount);
-                }
-            }
-        }
         IDirect3DVertexDeclaration9* prevDecl = m_currentVertexDecl;
         IDirect3DVertexBuffer9* prevStream1 = m_streamBindings[1].vb;
         UINT prevOffset1 = m_streamBindings[1].offset;
@@ -4059,6 +3985,8 @@ private:
             g_tbnDiagnostics.drawsPatched++;
             if (g_config.tbnLogVerbose) LogMsg("[TBN_PATCH] Patched indexed triangle draw: verts=%u tris=%u needN=%d needT=%d needB=%d", vertCount, triCount, needN ? 1 : 0, needT ? 1 : 0, needB ? 1 : 0);
             if (patchedOut) *patchedOut = true;
+            auto t1 = std::chrono::high_resolution_clock::now();
+            g_tbnDiagnostics.generationTimeUs += (uint64_t)std::chrono::duration_cast<std::chrono::microseconds>(t1-t0).count();
         }
         return hr;
     }
@@ -4066,14 +3994,13 @@ private:
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
-        if (m_real) m_real->AddRef();
         if (m_real) {
             m_real->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&m_realEx));
         }
         CreateIdentityMatrix(&m_currentView);
         CreateIdentityMatrix(&m_currentProj);
         CreateIdentityMatrix(&m_currentWorld);
-        m_projDetectedFrame = UINT32_MAX;
+        m_projDetectedFrame = -1;
         m_mgrrUseAutoProjection = g_config.mgrrUseAutoProjectionWhenC4Invalid;
         D3DDEVICE_CREATION_PARAMETERS params = {};
         if (SUCCEEDED(m_real->GetCreationParameters(&params))) {
@@ -4099,10 +4026,6 @@ public:
         if (m_realEx) {
             m_realEx->Release();
             m_realEx = nullptr;
-        }
-        if (m_real) {
-            m_real->Release();
-            m_real = nullptr;
         }
         LogMsg("WrappedD3D9Device destroyed");
     }
@@ -4266,15 +4189,15 @@ public:
         if (!m_hasView) emitView = identity;
         if (!m_hasProj) emitProj = identity;
 
-        if (m_worldLastFrame != UINT32_MAX && static_cast<uint32_t>(g_frameCount - m_worldLastFrame) > 1u) {
+        if (m_worldLastFrame >= 0 && g_frameCount > m_worldLastFrame + 1) {
             LogMsg("World matrix stale (last update frame %d, current %d); emitting identity.", m_worldLastFrame, g_frameCount);
             emitWorld = identity;
         }
-        if (m_viewLastFrame != UINT32_MAX && static_cast<uint32_t>(g_frameCount - m_viewLastFrame) > 1u) {
+        if (m_viewLastFrame >= 0 && g_frameCount > m_viewLastFrame + 1) {
             LogMsg("View matrix stale (last update frame %d, current %d); emitting identity.", m_viewLastFrame, g_frameCount);
             emitView = identity;
         }
-        if (m_projLastFrame != UINT32_MAX && static_cast<uint32_t>(g_frameCount - m_projLastFrame) > 1u) {
+        if (m_projLastFrame >= 0 && g_frameCount > m_projLastFrame + 1) {
             LogMsg("Projection matrix stale (last update frame %d, current %d); emitting identity.", m_projLastFrame, g_frameCount);
             emitProj = identity;
         }
@@ -4320,16 +4243,15 @@ public:
             AddRef();
             return S_OK;
         }
-        *ppvObj = nullptr;
-        return E_NOINTERFACE;
+        return m_real->QueryInterface(riid, ppvObj);
     }
 
     ULONG STDMETHODCALLTYPE AddRef() override {
-        return static_cast<ULONG>(InterlockedIncrement(&m_refCount));
+        return m_real->AddRef();
     }
 
     ULONG STDMETHODCALLTYPE Release() override {
-        ULONG count = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
+        ULONG count = m_real->Release();
         if (count == 0) {
             ShutdownImGui();
             delete this;
@@ -4348,15 +4270,14 @@ public:
             RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
         }
         ShaderConstantState* state = GetShaderState(shaderKey, true);
-        std::unique_lock<std::mutex> shaderStateLock(g_shaderStateMutex);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
         const bool profileIsBarnyard = g_activeGameProfile == GameProfile_Barnyard;
 
-        thread_local float overrideScratch[kMaxConstantRegisters * 4] = {};
+        std::vector<float> overrideScratch;
         const float* effectiveConstantData = pConstantData;
         // Keep MGR profile extraction isolated from manual/override paths.
-        if (!profileIsMgr && !profileIsBarnyard && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch, kMaxConstantRegisters * 4)) {
-            effectiveConstantData = overrideScratch;
+        if (!profileIsMgr && !profileIsBarnyard && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+            effectiveConstantData = overrideScratch.data();
         }
 
         bool constantsChanged = false;
@@ -4374,9 +4295,7 @@ public:
             }
             memcpy(state->constants[reg], effectiveConstantData + i * 4, sizeof(state->constants[reg]));
             state->valid[reg] = true;
-            if (g_config.autoDetectMatrices) {
-                UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
-            }
+            UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
 
             GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
             memcpy(globalState.value, effectiveConstantData + i * 4, sizeof(globalState.value));
@@ -4558,8 +4477,7 @@ public:
                                  "MetalGearRising profile world (c16-c19)");
             }
 
-            shaderStateLock.unlock();
-        return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
         if (profileIsBarnyard) {
@@ -4640,8 +4558,7 @@ public:
             }
 
             g_profileDisableStructuralDetection = true;
-            shaderStateLock.unlock();
-        return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
         const bool profileIsDmc4 = g_activeGameProfile == GameProfile_DevilMayCry4;
@@ -4708,8 +4625,7 @@ public:
             }
 
             g_profileDisableStructuralDetection = true;
-            shaderStateLock.unlock();
-        return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
         auto tryExplicitRegisterOverride = [&](MatrixSlot slot, int configuredRegister) {
@@ -5045,43 +4961,26 @@ public:
             }
         }
 
-        shaderStateLock.unlock();
         return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
     }
 
-
-    void ReleasePreResetResources() {
-        if (g_imguiInitialized) {
-            ImGui_ImplDX9_InvalidateDeviceObjects();
-        }
-        if (m_tbnGeneratedStream) {
-            m_tbnGeneratedStream->Release();
-            m_tbnGeneratedStream = nullptr;
-            m_tbnGeneratedStreamCapacity = 0;
-        }
-        for (auto& kv : m_patchedDeclCache) {
-            if (kv.second) kv.second->Release();
-        }
-        m_patchedDeclCache.clear();
-        if (m_currentVertexDecl) { m_currentVertexDecl->Release(); m_currentVertexDecl = nullptr; }
-        if (m_currentIndexBuffer) { m_currentIndexBuffer->Release(); m_currentIndexBuffer = nullptr; }
-        for (UINT s = 0; s < 16; ++s) {
-            if (m_streamBindings[s].vb) { m_streamBindings[s].vb->Release(); m_streamBindings[s].vb = nullptr; }
-            m_streamBindings[s] = {};
-            m_streamFreq[s] = 0;
-        }
-        m_currentFVF = 0;
-    }
-
-    void OnBeforePresent() {
+    // Present - good place to do per-frame logging throttle
+    HRESULT STDMETHODCALLTYPE Present(const RECT* pSourceRect, const RECT* pDestRect,
+                                       HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override {
         g_frameCount++;
+
+        // Reset per-frame source locks. Locks set during SetVertexShaderConstantF calls
+        // this frame will be validated against these — after Present they reset for the
+        // next frame. This ensures correct behavior regardless of BeginScene call count.
         if (g_activeGameProfile == GameProfile_None) {
             m_viewLockedShader = 0;
             m_viewLockedRegister = -1;
             m_projLockedShader = 0;
             m_projLockedRegister = -1;
         }
+
         UpdateFrameTimeStats();
+        // Throttle constant logging to every 60 frames
         if (g_config.logAllConstants) {
             m_constantLogThrottle = (m_constantLogThrottle + 1) % 60;
         }
@@ -5094,9 +4993,12 @@ public:
                 g_memoryScannerLastTick = nowTick;
             }
         }
+
+        // Log periodic status
         if (g_frameCount % 300 == 0) {
-            LogMsg("Frame %u - hasView: %d, hasProj: %d", g_frameCount, m_hasView, m_hasProj);
+            LogMsg("Frame %d - hasView: %d, hasProj: %d", g_frameCount, m_hasView, m_hasProj);
         }
+
         if (!g_imguiInitialized) {
             InitializeImGui(m_real, m_hwnd);
         }
@@ -5122,12 +5024,7 @@ public:
                          "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
             }
         }
-    }
 
-    // Present - good place to do per-frame logging throttle
-    HRESULT STDMETHODCALLTYPE Present(const RECT* pSourceRect, const RECT* pDestRect,
-                                       HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override {
-        OnBeforePresent();
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     }
 
@@ -5146,7 +5043,10 @@ public:
     HRESULT STDMETHODCALLTYPE GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) override { return m_real->GetSwapChain(iSwapChain, pSwapChain); }
     UINT STDMETHODCALLTYPE GetNumberOfSwapChains() override { return m_real->GetNumberOfSwapChains(); }
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
-        ReleasePreResetResources();
+        if (g_imguiInitialized) {
+            ImGui_ImplDX9_InvalidateDeviceObjects();
+            // Do NOT call ImGui_ImplWin32_Shutdown here.
+        }
         HRESULT hr = m_real->Reset(pPresentationParameters);
         if (SUCCEEDED(hr) && g_imguiInitialized) {
             ImGui_ImplDX9_CreateDeviceObjects();
@@ -5351,9 +5251,7 @@ public:
         LayoutSemanticsState layout = {};
         if (InspectLayoutSemantics(&layout)) {
             if (!layout.hasNormal) g_tbnDiagnostics.drawsMissingNormals++;
-            if (!layout.hasTangent) g_tbnDiagnostics.drawsMissingTangents++;
-            if (!layout.hasBinormal) g_tbnDiagnostics.drawsMissingBinormals++;
-            if (!layout.hasNormal || !layout.hasTangent || !layout.hasBinormal) g_tbnDiagnostics.drawsMissingAnyTbn++;
+            if (!layout.hasNormal || !layout.hasTangent || !layout.hasBinormal) g_tbnDiagnostics.drawsMissingFullTBN++;
         }
         return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
@@ -5411,7 +5309,6 @@ public:
             realShader = wrapped->GetReal();
             uint32_t shaderHash = ComputeShaderBytecodeHash(realShader);
             if (shaderHash != 0) {
-                std::lock_guard<std::mutex> lock(g_shaderStateMutex);
                 g_shaderBytecodeHashes[g_activeShaderKey] = shaderHash;
             }
         }
@@ -5462,8 +5359,7 @@ public:
     }
     HRESULT STDMETHODCALLTYPE PresentEx(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride,
                                         CONST RGNDATA* pDirtyRegion, DWORD dwFlags) override {
-        OnBeforePresent();
-        return m_realEx ? m_realEx->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags) : m_real->Present(pSourceRect,pDestRect,hDestWindowOverride,pDirtyRegion);
+        return m_realEx ? m_realEx->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags) : Present(pSourceRect,pDestRect,hDestWindowOverride,pDirtyRegion);
     }
     HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT* pPriority) override { return m_realEx ? m_realEx->GetGPUThreadPriority(pPriority) : D3DERR_INVALIDCALL; }
     HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT Priority) override { return m_realEx ? m_realEx->SetGPUThreadPriority(Priority) : D3DERR_INVALIDCALL; }
@@ -5487,11 +5383,7 @@ public:
         return m_realEx ? m_realEx->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
     }
     HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) override {
-        if (!m_realEx) return Reset(pPresentationParameters);
-        ReleasePreResetResources();
-        HRESULT hr = m_realEx->ResetEx(pPresentationParameters, pFullscreenDisplayMode);
-        if (SUCCEEDED(hr) && g_imguiInitialized) ImGui_ImplDX9_CreateDeviceObjects();
-        return hr;
+        return m_realEx ? m_realEx->ResetEx(pPresentationParameters, pFullscreenDisplayMode) : Reset(pPresentationParameters);
     }
     HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override {
         return m_realEx ? m_realEx->GetDisplayModeEx(iSwapChain, pMode, pRotation) : D3DERR_INVALIDCALL;
@@ -5510,37 +5402,27 @@ public:
 class WrappedD3D9 : public IDirect3D9 {
 private:
     IDirect3D9* m_real;
-    LONG m_refCount = 1;
 
 public:
     WrappedD3D9(IDirect3D9* real) : m_real(real) {
-        if (m_real) m_real->AddRef();
         LogMsg("WrappedD3D9 created, wrapping IDirect3D9 at %p", real);
     }
 
     ~WrappedD3D9() {
-        if (m_real) { m_real->Release(); m_real = nullptr; }
         LogMsg("WrappedD3D9 destroyed");
     }
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
-        if (!ppvObj) return E_POINTER;
-        if (riid == IID_IUnknown || riid == __uuidof(IDirect3D9)) {
-            *ppvObj = static_cast<IDirect3D9*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppvObj = nullptr;
-        return E_NOINTERFACE;
+        return m_real->QueryInterface(riid, ppvObj);
     }
 
     ULONG STDMETHODCALLTYPE AddRef() override {
-        return static_cast<ULONG>(InterlockedIncrement(&m_refCount));
+        return m_real->AddRef();
     }
 
     ULONG STDMETHODCALLTYPE Release() override {
-        ULONG count = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
+        ULONG count = m_real->Release();
         if (count == 0) {
             delete this;
         }
@@ -5633,33 +5515,23 @@ public:
 class WrappedD3D9Ex : public IDirect3D9Ex {
 private:
     IDirect3D9Ex* m_real;
-    LONG m_refCount = 1;
 
 public:
     WrappedD3D9Ex(IDirect3D9Ex* real) : m_real(real) {
-        if (m_real) m_real->AddRef();
         LogMsg("WrappedD3D9Ex created, wrapping IDirect3D9Ex at %p", real);
     }
 
     ~WrappedD3D9Ex() {
-        if (m_real) { m_real->Release(); m_real = nullptr; }
         LogMsg("WrappedD3D9Ex destroyed");
     }
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
-        if (!ppvObj) return E_POINTER;
-        if (riid == IID_IUnknown || riid == __uuidof(IDirect3D9) || riid == __uuidof(IDirect3D9Ex)) {
-            *ppvObj = static_cast<IDirect3D9Ex*>(this);
-            AddRef();
-            return S_OK;
-        }
-        *ppvObj = nullptr;
-        return E_NOINTERFACE;
+        return m_real->QueryInterface(riid, ppvObj);
     }
-    ULONG STDMETHODCALLTYPE AddRef() override { return static_cast<ULONG>(InterlockedIncrement(&m_refCount)); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
     ULONG STDMETHODCALLTYPE Release() override {
-        ULONG count = static_cast<ULONG>(InterlockedDecrement(&m_refCount));
+        ULONG count = m_real->Release();
         if (count == 0) delete this;
         return count;
     }
@@ -5686,13 +5558,7 @@ public:
         IDirect3DDevice9* realDevice = nullptr;
         HRESULT hr = m_real->CreateDevice(Adapter, DeviceType, hFocusWindow, BehaviorFlags, pPresentationParameters, &realDevice);
         if (SUCCEEDED(hr) && realDevice) {
-            IDirect3DDevice9Ex* realDeviceEx = nullptr;
-            if (SUCCEEDED(realDevice->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&realDeviceEx))) && realDeviceEx) {
-                realDevice->Release();
-                *ppReturnedDeviceInterface = new WrappedD3D9DeviceEx(realDeviceEx);
-            } else {
-                *ppReturnedDeviceInterface = new WrappedD3D9Device(realDevice);
-            }
+            *ppReturnedDeviceInterface = new WrappedD3D9Device(realDevice);
         } else {
             *ppReturnedDeviceInterface = nullptr;
         }
@@ -5885,16 +5751,14 @@ static void EnsureProxyInitialized() {
 
 // DLL entry point
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         g_moduleInstance = hinstDLL;
         DisableThreadLibraryCalls(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
-        g_memoryScannerRunning.store(false);
-        if (lpvReserved == nullptr) {
-            g_moduleInstance = nullptr;
-            if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
-            if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
-        }
+        g_moduleInstance = nullptr;
+        if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+        if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
     }
     return TRUE;
 }
@@ -5904,9 +5768,11 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 // The .def file maps these to the real export names
 
 extern "C" {
-    __declspec(dllexport) CameraMatrices WINAPI Proxy_GetCameraMatrices() {
+    __declspec(dllexport) const CameraMatrices* WINAPI Proxy_GetCameraMatrices() {
+        static CameraMatrices snapshot = {};
         std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
-        return g_cameraMatrices;
+        snapshot = g_cameraMatrices;
+        return &snapshot;
     }
 
     IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT SDKVersion) {
