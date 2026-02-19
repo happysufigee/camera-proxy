@@ -3664,7 +3664,9 @@ public:
         if (!g_config.emitFixedFunctionTransforms) {
             return;
         }
-        if (g_config.setTransformBypassProxyWhenGameProvides && g_gameSetTransformAnySeen) {
+        // Keep strict game profiles deterministic even if generic SetTransform compatibility is enabled.
+        if (g_activeGameProfile == GameProfile_None &&
+            g_config.setTransformBypassProxyWhenGameProvides && g_gameSetTransformAnySeen) {
             return;
         }
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
@@ -4705,7 +4707,8 @@ public:
             g_gameSetTransformSeen[transformIdx] = true;
             g_gameSetTransformAnySeen = true;
 
-            if (g_config.setTransformBypassProxyWhenGameProvides) {
+            const bool allowGenericSetTransformCompatibility = (g_activeGameProfile == GameProfile_None);
+            if (allowGenericSetTransformCompatibility && g_config.setTransformBypassProxyWhenGameProvides) {
                 if (State == D3DTS_WORLD) {
                     m_currentWorld = *pMatrix;
                     m_hasWorld = true;
@@ -4728,7 +4731,7 @@ public:
                 return m_real->SetTransform(State, pMatrix);
             }
 
-            if (g_config.setTransformRoundTripCompatibilityMode) {
+            if (allowGenericSetTransformCompatibility && g_config.setTransformRoundTripCompatibilityMode) {
                 const HRESULT setHr = m_real->SetTransform(State, pMatrix);
                 if (FAILED(setHr)) {
                     return setHr;
