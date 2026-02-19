@@ -3738,7 +3738,9 @@ public:
         }
 
         bool shouldApplyCustomProjection = false;
-        if (g_config.experimentalCustomProjectionEnabled) {
+        const bool strictMgrProfileActive = (g_activeGameProfile == GameProfile_MetalGearRising);
+
+        if (g_config.experimentalCustomProjectionEnabled && !strictMgrProfileActive) {
             const bool projectionMissing = !m_hasProj;
             const bool projectionOverrideAllowed = g_config.experimentalCustomProjectionOverrideDetectedProjection;
             bool hasMvp = false;
@@ -3807,7 +3809,7 @@ public:
         g_lastInverseViewAsWorldEligible = false;
         g_lastInverseViewAsWorldApplied = false;
         g_lastInverseViewAsWorldUsedFast = false;
-        if (g_config.experimentalInverseViewAsWorld && m_hasView) {
+        if (g_config.experimentalInverseViewAsWorld && m_hasView && !strictMgrProfileActive) {
             const bool viewLooksValid = LooksLikeViewStrict(emitView);
             g_lastInverseViewAsWorldEligible = viewLooksValid;
             if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
