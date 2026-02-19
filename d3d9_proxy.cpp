@@ -4047,6 +4047,7 @@ public:
                     D3DMATRIX projectionInv = {};
                     if (InvertMatrix4x4Deterministic(resolvedProjection, &projectionInv, nullptr)) {
                         D3DMATRIX derivedView = MultiplyMatrix(projectionInv, mat);
+                        OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
                         m_hasView = true;
                 m_viewLastFrame = g_frameCount;
