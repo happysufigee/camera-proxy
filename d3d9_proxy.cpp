@@ -414,17 +414,165 @@ static bool ExtractConstRegister(const std::string& operand, int* outReg) {
     return true;
 }
 
-static std::string BuildPseudoHlslFromIr(const std::vector<ShaderIrInstruction>& ir) {
-    std::ostringstream out;
-    out << "// pseudo-HLSL (deterministic IR view)\n";
-    out << "void main() {\n";
-    for (const ShaderIrInstruction& inst : ir) {
-        out << "  " << inst.opcode;
-        if (!inst.dst.empty()) out << " " << inst.dst;
-        for (size_t i = 0; i < inst.src.size(); ++i) {
-            out << (i == 0 && inst.dst.empty() ? " " : ", ") << inst.src[i];
+struct ParsedAsmInstruction {
+    std::string raw;
+    std::string opcode;
+    std::vector<std::string> operands;
+    bool isInstruction = false;
+};
+
+static std::vector<std::string> SplitAsmOperands(const std::string& text) {
+    std::vector<std::string> out;
+    std::string current;
+    int depth = 0;
+    for (char ch : text) {
+        if (ch == '[') ++depth;
+        if (ch == ']') depth = std::max(0, depth - 1);
+        if (ch == ',' && depth == 0) {
+            std::string token = TrimCopy(current);
+            if (!token.empty()) out.push_back(token);
+            current.clear();
+            continue;
         }
-        out << ";\n";
+        current.push_back(ch);
+    }
+    std::string token = TrimCopy(current);
+    if (!token.empty()) out.push_back(token);
+    return out;
+}
+
+static bool IsOpcodeModifierChar(char c) {
+    return c == '_' || c == 'x' || c == 'y' || c == 'z' || c == 'w' || c == 'p' || c == 's' || c == 't';
+}
+
+static std::string NormalizeOpcodeRoot(const std::string& opcode) {
+    size_t p = opcode.find('_');
+    if (p == std::string::npos) return opcode;
+    if (p + 1 < opcode.size() && std::isdigit(static_cast<unsigned char>(opcode[p + 1]))) {
+        return opcode;
+    }
+    size_t i = p + 1;
+    while (i < opcode.size() && IsOpcodeModifierChar(opcode[i])) ++i;
+    if (i < opcode.size() && opcode[i] == '_') return opcode.substr(0, i);
+    return opcode.substr(0, p);
+}
+
+static ParsedAsmInstruction ParseAsmInstructionLine(const std::string& line) {
+    ParsedAsmInstruction parsed = {};
+    parsed.raw = line;
+    std::string t = TrimCopy(line);
+    if (t.empty() || t[0] == '/' || t[0] == ';') {
+        return parsed;
+    }
+    if (t.size() > 4 && t[0] == '0' && t[1] == 'x') {
+        return parsed;
+    }
+    if ((t.rfind("vs_", 0) == 0 || t.rfind("ps_", 0) == 0) && t.find(' ') == std::string::npos) {
+        return parsed;
+    }
+    size_t sp = t.find(' ');
+    parsed.opcode = NormalizeOpcodeRoot(TrimCopy(sp == std::string::npos ? t : t.substr(0, sp)));
+    std::string rest = sp == std::string::npos ? "" : TrimCopy(t.substr(sp + 1));
+    if (!rest.empty()) {
+        parsed.operands = SplitAsmOperands(rest);
+    }
+    parsed.isInstruction = !parsed.opcode.empty();
+    return parsed;
+}
+
+static std::string JoinAsmSlice(const std::vector<std::string>& ops, size_t startIdx) {
+    std::string out;
+    for (size_t i = startIdx; i < ops.size(); ++i) {
+        if (!out.empty()) out += ", ";
+        out += ops[i];
+    }
+    return out;
+}
+
+static std::string BuildPseudoForInstruction(const ParsedAsmInstruction& inst, ShaderStageType stage) {
+    const std::vector<std::string>& o = inst.operands;
+    const std::string& op = inst.opcode;
+    if (op == "mov" && o.size() >= 2) return o[0] + " = " + o[1];
+    if (op == "add" && o.size() >= 3) return o[0] + " = " + o[1] + " + " + o[2];
+    if (op == "sub" && o.size() >= 3) return o[0] + " = " + o[1] + " - " + o[2];
+    if (op == "mul" && o.size() >= 3) return o[0] + " = " + o[1] + " * " + o[2];
+    if (op == "mad" && o.size() >= 4) return o[0] + " = (" + o[1] + " * " + o[2] + ") + " + o[3];
+    if (op == "dp3" && o.size() >= 3) return o[0] + " = dot3(" + o[1] + ", " + o[2] + ")";
+    if (op == "dp4" && o.size() >= 3) return o[0] + " = dot4(" + o[1] + ", " + o[2] + ")";
+    if (op == "max" && o.size() >= 3) return o[0] + " = max(" + o[1] + ", " + o[2] + ")";
+    if (op == "min" && o.size() >= 3) return o[0] + " = min(" + o[1] + ", " + o[2] + ")";
+    if (op == "slt" && o.size() >= 3) return o[0] + " = (" + o[1] + " < " + o[2] + ") ? 1 : 0";
+    if (op == "sge" && o.size() >= 3) return o[0] + " = (" + o[1] + " >= " + o[2] + ") ? 1 : 0";
+    if (op == "abs" && o.size() >= 2) return o[0] + " = abs(" + o[1] + ")";
+    if (op == "frc" && o.size() >= 2) return o[0] + " = frac(" + o[1] + ")";
+    if (op == "rcp" && o.size() >= 2) return o[0] + " = 1.0 / " + o[1];
+    if (op == "rsq" && o.size() >= 2) return o[0] + " = rsqrt(" + o[1] + ")";
+    if (op == "pow" && o.size() >= 3) return o[0] + " = pow(" + o[1] + ", " + o[2] + ")";
+    if (op == "lrp" && o.size() >= 4) return o[0] + " = lerp(" + o[3] + ", " + o[2] + ", " + o[1] + ")";
+    if (op == "m3x3" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float3x3)" + o[2] + ")";
+    if (op == "m3x4" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float3x4)" + o[2] + ")";
+    if (op == "m4x3" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float4x3)" + o[2] + ")";
+    if (op == "m4x4" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float4x4)" + o[2] + ")";
+    if ((op == "texld" || op == "texldb" || op == "texldp" || op == "tex") && o.size() >= 2) {
+        std::string sampler = o.size() >= 3 ? o[2] : o[1];
+        std::string coord = o[1];
+        return o[0] + " = sample(" + sampler + ", " + coord + ")";
+    }
+    if (op == "if" || op == "ifc") return "if (" + JoinAsmSlice(o, 0) + ")";
+    if (op == "else") return "else";
+    if (op == "endif") return "end if";
+    if (op == "loop" || op == "rep") return op + " (" + JoinAsmSlice(o, 0) + ")";
+    if (op == "endloop" || op == "endrep") return "end " + op.substr(3);
+    if (op == "break" || op == "breakc" || op == "call" || op == "callnz" || op == "ret") {
+        return op + (o.empty() ? "" : (" " + JoinAsmSlice(o, 0)));
+    }
+    if (op.rfind("dcl", 0) == 0) {
+        if (stage == ShaderStage_Vertex && o.size() >= 2) return "input " + o.back() + " // " + JoinAsmSlice(o, 0);
+        if (stage == ShaderStage_Pixel && !o.empty()) return "declare " + JoinAsmSlice(o, 0);
+        return "declare";
+    }
+    if ((op == "def" || op == "defi" || op == "defb") && o.size() >= 2) {
+        return "const " + o[0] + " = { " + JoinAsmSlice(o, 1) + " }";
+    }
+    if (o.empty()) return op;
+    if (o.size() == 1) return op + "(" + o[0] + ")";
+    return o[0] + " = " + op + "(" + JoinAsmSlice(o, 1) + ")";
+}
+
+static std::string BuildPseudoHlslFromIr(const std::vector<ShaderIrInstruction>& ir,
+                                         const std::string& disasm,
+                                         ShaderStageType stage,
+                                         const std::string& shaderModel) {
+    std::ostringstream out;
+    out << "// pseudo-HLSL (assembly-linked view)\n";
+    out << "// profile: " << shaderModel << "\n";
+    out << "// supported interpretation focus: vs/ps_1_0, 1_1, 2_0 (2_a/2_b via 2_x opcodes), 3_0\n";
+    out << "// every line maps back to the corresponding asm instruction index.\n";
+    out << "void main() {\n";
+
+    std::istringstream in(disasm);
+    std::string line;
+    int asmLine = 0;
+    while (std::getline(in, line)) {
+        ParsedAsmInstruction inst = ParseAsmInstructionLine(line);
+        if (!inst.isInstruction) {
+            continue;
+        }
+        std::string pseudo = BuildPseudoForInstruction(inst, stage);
+        out << "  // asm[" << asmLine << "] " << TrimCopy(inst.raw) << "\n";
+        out << "  " << pseudo << ";\n";
+        ++asmLine;
+    }
+
+    if (asmLine == 0) {
+        for (const ShaderIrInstruction& inst : ir) {
+            out << "  " << inst.opcode;
+            if (!inst.dst.empty()) out << " " << inst.dst;
+            for (size_t i = 0; i < inst.src.size(); ++i) {
+                out << (i == 0 && inst.dst.empty() ? " " : ", ") << inst.src[i];
+            }
+            out << ";\n";
+        }
     }
     out << "}\n";
     return out.str();
@@ -1489,8 +1637,22 @@ static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, c
     snprintf(profile, sizeof(profile), "%s_%u_%u", stage == ShaderStage_Vertex ? "vs" : "ps", major, minor);
     rec.shaderModel = profile;
     rec.cachedDisassembly = BuildD3DDisassembly(tokens);
+    {
+        std::istringstream disIn(rec.cachedDisassembly);
+        std::string disLine;
+        while (std::getline(disIn, disLine)) {
+            std::string trimmed = TrimCopy(disLine);
+            if (trimmed.empty() || trimmed[0] == '/' || trimmed[0] == ';') {
+                continue;
+            }
+            if (trimmed.rfind("vs_", 0) == 0 || trimmed.rfind("ps_", 0) == 0) {
+                rec.shaderModel = trimmed;
+            }
+            break;
+        }
+    }
     rec.ir = BuildIrFromDisassembly(rec.cachedDisassembly);
-    rec.cachedPseudoHlsl = BuildPseudoHlslFromIr(rec.ir);
+    rec.cachedPseudoHlsl = BuildPseudoHlslFromIr(rec.ir, rec.cachedDisassembly, stage, rec.shaderModel);
     ClassifyShaderRecord(&rec);
     g_shaderBytecodeHashes[shaderKey] = rec.hash;
     g_shaderHashToKey[rec.hash] = shaderKey;
