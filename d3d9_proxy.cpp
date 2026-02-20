@@ -32,6 +32,7 @@
 #include <fstream>
 #include <filesystem>
 #include <cctype>
+#include <cstdint>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -312,6 +313,7 @@ static float g_psConstants[kMaxConstantRegisters][4] = {};
 static int g_selectedRegister = -1;
 static uintptr_t g_activeShaderKey = 0;
 static uintptr_t g_selectedShaderKey = 0;
+static uint64_t g_selectedShaderHash = 0;
 
 enum OverrideScopeMode {
     Override_Sticky = 0,
@@ -372,6 +374,12 @@ struct ShaderRecord {
 
 static std::unordered_map<uintptr_t, ShaderRecord> g_shaderRecords = {};
 static std::unordered_map<uint32_t, uintptr_t> g_shaderHashToKey = {};
+static std::vector<ShaderRecord*> g_stableShaderList = {};
+enum ShaderListOrderMode {
+    ShaderListOrder_Insertion = 0,
+    ShaderListOrder_HashAsc = 1
+};
+static int g_shaderListOrderMode = ShaderListOrder_Insertion;
 static uintptr_t g_activeVertexShaderKey = 0;
 static uintptr_t g_activePixelShaderKey = 0;
 static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
@@ -1613,7 +1621,12 @@ static void OnVertexShaderReleased(uintptr_t shaderKey) {
         g_shaderOrder.erase(it);
     }
     auto recIt = g_shaderRecords.find(shaderKey);
+    ShaderRecord* removedRecordPtr = nullptr;
     if (recIt != g_shaderRecords.end()) {
+        removedRecordPtr = &recIt->second;
+        if (g_selectedShaderHash == static_cast<uint64_t>(recIt->second.hash)) {
+            g_selectedShaderHash = 0;
+        }
         if (recIt->second.replacementShader) {
             recIt->second.replacementShader->Release();
             recIt->second.replacementShader = nullptr;
@@ -1621,10 +1634,24 @@ static void OnVertexShaderReleased(uintptr_t shaderKey) {
         g_shaderHashToKey.erase(recIt->second.hash);
         g_shaderRecords.erase(recIt);
     }
+    auto listIt = std::find(g_stableShaderList.begin(), g_stableShaderList.end(), removedRecordPtr);
+    if (listIt != g_stableShaderList.end()) {
+        g_stableShaderList.erase(listIt);
+    }
 }
 
 static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, const std::vector<uint32_t>& tokens) {
     if (shaderKey == 0 || tokens.empty()) return;
+    if (g_shaderRecords.empty()) {
+        g_shaderRecords.reserve(1024);
+        g_shaderHashToKey.reserve(1024);
+        g_shaderBytecodeHashes.reserve(1024);
+        g_stableShaderList.reserve(1024);
+    }
+    auto existing = g_shaderRecords.find(shaderKey);
+    if (existing != g_shaderRecords.end()) {
+        return;
+    }
     ShaderRecord rec = {};
     rec.shaderKey = shaderKey;
     rec.stage = stage;
@@ -1656,7 +1683,11 @@ static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, c
     ClassifyShaderRecord(&rec);
     g_shaderBytecodeHashes[shaderKey] = rec.hash;
     g_shaderHashToKey[rec.hash] = shaderKey;
-    g_shaderRecords[shaderKey] = rec;
+    auto inserted = g_shaderRecords.emplace(shaderKey, std::move(rec));
+    g_stableShaderList.push_back(&inserted.first->second);
+    if (g_selectedShaderHash == 0) {
+        g_selectedShaderHash = static_cast<uint64_t>(inserted.first->second.hash);
+    }
 }
 
 static uint32_t ComputeShaderBytecodeHash(IDirect3DVertexShader9* shader) {
@@ -2759,24 +2790,64 @@ static void RenderImGuiOverlay() {
 
         if (ImGui::BeginTabItem("Shader")) {
             static char shaderFilter[64] = "";
+            static const char* kShaderListOrderModes[] = {"Insertion order", "Hash (ascending)"};
             ImGui::InputText("Filter", shaderFilter, sizeof(shaderFilter));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::Combo("Order", &g_shaderListOrderMode, kShaderListOrderModes, IM_ARRAYSIZE(kShaderListOrderModes));
+
+            std::vector<ShaderRecord*> shaderSnapshot = g_stableShaderList;
+            if (g_shaderListOrderMode == ShaderListOrder_HashAsc) {
+                std::sort(shaderSnapshot.begin(), shaderSnapshot.end(), [](const ShaderRecord* a, const ShaderRecord* b) {
+                    if (!a || !b) {
+                        return a < b;
+                    }
+                    if (a->hash != b->hash) {
+                        return a->hash < b->hash;
+                    }
+                    return a->shaderKey < b->shaderKey;
+                });
+            }
+
+            auto selectedByKeyIt = g_shaderRecords.find(g_selectedShaderKey);
+            if (selectedByKeyIt != g_shaderRecords.end()) {
+                g_selectedShaderHash = static_cast<uint64_t>(selectedByKeyIt->second.hash);
+            } else if (g_selectedShaderHash != 0) {
+                auto selectedIt = g_shaderHashToKey.find(static_cast<uint32_t>(g_selectedShaderHash));
+                if (selectedIt != g_shaderHashToKey.end()) {
+                    g_selectedShaderKey = selectedIt->second;
+                }
+            }
+            if (g_selectedShaderHash == 0 && !shaderSnapshot.empty() && shaderSnapshot.front()) {
+                g_selectedShaderHash = static_cast<uint64_t>(shaderSnapshot.front()->hash);
+                g_selectedShaderKey = shaderSnapshot.front()->shaderKey;
+            }
+
             ImGui::Columns(3, "ShaderCols", true);
             ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
-            for (auto& entry : g_shaderRecords) {
-                ShaderRecord& rec = entry.second;
+            for (ShaderRecord* recPtr : shaderSnapshot) {
+                if (!recPtr) {
+                    continue;
+                }
+                ShaderRecord& rec = *recPtr;
+                const uintptr_t shaderKey = rec.shaderKey;
                 char label[256];
                 snprintf(label, sizeof(label), "0x%08X %s %s inst:%d use:%llu%s", rec.hash,
                          rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
                          static_cast<int>(rec.ir.size()), rec.usageCount,
-                         (entry.first == g_activeVertexShaderKey || entry.first == g_activePixelShaderKey) ? " *" : "");
+                         (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
                 if (shaderFilter[0] && strstr(label, shaderFilter) == nullptr) continue;
-                if (ImGui::Selectable(label, g_selectedShaderKey == entry.first)) g_selectedShaderKey = entry.first;
+                bool selected = (static_cast<uint64_t>(rec.hash) == g_selectedShaderHash);
+                if (ImGui::Selectable(label, selected)) {
+                    g_selectedShaderHash = static_cast<uint64_t>(rec.hash);
+                    g_selectedShaderKey = shaderKey;
+                }
             }
             ImGui::EndChild();
             ImGui::NextColumn();
             ImGui::BeginChild("ShaderInspect", ImVec2(0, 420), true);
             auto it = g_shaderRecords.find(g_selectedShaderKey);
-            if (it != g_shaderRecords.end()) {
+            if (it != g_shaderRecords.end() && static_cast<uint64_t>(it->second.hash) == g_selectedShaderHash) {
                 ShaderRecord& rec = it->second;
                 ImGui::Text("Hash: 0x%08X", rec.hash);
                 ImGui::Text("Type: %s", rec.stage == ShaderStage_Vertex ? "VS" : "PS");
@@ -2814,7 +2885,7 @@ static void RenderImGuiOverlay() {
             ImGui::NextColumn();
             ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true);
             auto ai = g_shaderRecords.find(g_selectedShaderKey);
-            if (ai != g_shaderRecords.end()) {
+            if (ai != g_shaderRecords.end() && static_cast<uint64_t>(ai->second.hash) == g_selectedShaderHash) {
                 ShaderRecord& rec = ai->second;
                 ImGui::Text("Transform: %s", rec.isFFPTransform ? "Yes" : "No");
                 ImGui::Text("Transform base: c%d", rec.transformConstantBase);
