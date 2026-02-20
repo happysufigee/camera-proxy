@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <d3d9.h>
 #include <d3dcommon.h>
+#include <d3dcompiler.h>
 #include <winver.h>
 #include <cstdio>
 #include <cmath>
@@ -33,6 +34,7 @@
 #include <filesystem>
 #include <cctype>
 #include <cstdint>
+#include <cstring>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -368,8 +370,8 @@ struct ShaderRecord {
     IUnknown* replacementShader = nullptr;
     bool replacementEnabled = false;
     std::string cachedDisassembly = {};
-    std::string cachedPseudoHlsl = {};
-    std::string inlineHlsl = {};
+    std::string editableAssembly = {};
+    std::string replacementStatus = {};
 };
 
 static std::unordered_map<uintptr_t, ShaderRecord> g_shaderRecords = {};
@@ -385,6 +387,9 @@ static uintptr_t g_activePixelShaderKey = 0;
 static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
 static bool g_forceFfpTransform = false;
 static int g_manualTransformBaseOverride = -1;
+static int g_manualLightingBaseOverride = -1;
+static uintptr_t g_shaderEditorKey = 0;
+static std::vector<char> g_shaderEditorBuffer(65536, 0);
 
 static std::string TrimCopy(const std::string& s) {
     size_t b = 0;
@@ -488,108 +493,105 @@ static ParsedAsmInstruction ParseAsmInstructionLine(const std::string& line) {
     return parsed;
 }
 
-static std::string JoinAsmSlice(const std::vector<std::string>& ops, size_t startIdx) {
-    std::string out;
-    for (size_t i = startIdx; i < ops.size(); ++i) {
-        if (!out.empty()) out += ", ";
-        out += ops[i];
-    }
-    return out;
+static HMODULE LoadD3DCompilerModule() {
+    HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+    if (!compiler) compiler = LoadLibraryA("d3dcompiler_43.dll");
+    return compiler;
 }
 
-static std::string BuildPseudoForInstruction(const ParsedAsmInstruction& inst, ShaderStageType stage) {
-    const std::vector<std::string>& o = inst.operands;
-    const std::string& op = inst.opcode;
-    if (op == "mov" && o.size() >= 2) return o[0] + " = " + o[1];
-    if (op == "add" && o.size() >= 3) return o[0] + " = " + o[1] + " + " + o[2];
-    if (op == "sub" && o.size() >= 3) return o[0] + " = " + o[1] + " - " + o[2];
-    if (op == "mul" && o.size() >= 3) return o[0] + " = " + o[1] + " * " + o[2];
-    if (op == "mad" && o.size() >= 4) return o[0] + " = (" + o[1] + " * " + o[2] + ") + " + o[3];
-    if (op == "dp3" && o.size() >= 3) return o[0] + " = dot3(" + o[1] + ", " + o[2] + ")";
-    if (op == "dp4" && o.size() >= 3) return o[0] + " = dot4(" + o[1] + ", " + o[2] + ")";
-    if (op == "max" && o.size() >= 3) return o[0] + " = max(" + o[1] + ", " + o[2] + ")";
-    if (op == "min" && o.size() >= 3) return o[0] + " = min(" + o[1] + ", " + o[2] + ")";
-    if (op == "slt" && o.size() >= 3) return o[0] + " = (" + o[1] + " < " + o[2] + ") ? 1 : 0";
-    if (op == "sge" && o.size() >= 3) return o[0] + " = (" + o[1] + " >= " + o[2] + ") ? 1 : 0";
-    if (op == "abs" && o.size() >= 2) return o[0] + " = abs(" + o[1] + ")";
-    if (op == "frc" && o.size() >= 2) return o[0] + " = frac(" + o[1] + ")";
-    if (op == "rcp" && o.size() >= 2) return o[0] + " = 1.0 / " + o[1];
-    if (op == "rsq" && o.size() >= 2) return o[0] + " = rsqrt(" + o[1] + ")";
-    if (op == "pow" && o.size() >= 3) return o[0] + " = pow(" + o[1] + ", " + o[2] + ")";
-    if (op == "lrp" && o.size() >= 4) return o[0] + " = lerp(" + o[3] + ", " + o[2] + ", " + o[1] + ")";
-    if (op == "m3x3" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float3x3)" + o[2] + ")";
-    if (op == "m3x4" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float3x4)" + o[2] + ")";
-    if (op == "m4x3" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float4x3)" + o[2] + ")";
-    if (op == "m4x4" && o.size() >= 3) return o[0] + " = mul(" + o[1] + ", (float4x4)" + o[2] + ")";
-    if ((op == "texld" || op == "texldb" || op == "texldp" || op == "tex") && o.size() >= 2) {
-        std::string sampler = o.size() >= 3 ? o[2] : o[1];
-        std::string coord = o[1];
-        return o[0] + " = sample(" + sampler + ", " + coord + ")";
+static bool BuildShaderReplacementFromAssembly(IDirect3DDevice9* device,
+                                               ShaderRecord* rec,
+                                               std::string* outError) {
+    if (!device || !rec) {
+        if (outError) *outError = "Invalid device or shader record.";
+        return false;
     }
-    if (op == "if" || op == "ifc") return "if (" + JoinAsmSlice(o, 0) + ")";
-    if (op == "else") return "else";
-    if (op == "endif") return "end if";
-    if (op == "loop" || op == "rep") return op + " (" + JoinAsmSlice(o, 0) + ")";
-    if (op == "endloop" || op == "endrep") return "end " + op.substr(3);
-    if (op == "break" || op == "breakc" || op == "call" || op == "callnz" || op == "ret") {
-        return op + (o.empty() ? "" : (" " + JoinAsmSlice(o, 0)));
-    }
-    if (op.rfind("dcl", 0) == 0) {
-        if (stage == ShaderStage_Vertex && o.size() >= 2) return "input " + o.back() + " // " + JoinAsmSlice(o, 0);
-        if (stage == ShaderStage_Pixel && !o.empty()) return "declare " + JoinAsmSlice(o, 0);
-        return "declare";
-    }
-    if ((op == "def" || op == "defi" || op == "defb") && o.size() >= 2) {
-        return "const " + o[0] + " = { " + JoinAsmSlice(o, 1) + " }";
-    }
-    if (o.empty()) return op;
-    if (o.size() == 1) return op + "(" + o[0] + ")";
-    return o[0] + " = " + op + "(" + JoinAsmSlice(o, 1) + ")";
-}
-
-static std::string BuildPseudoHlslFromIr(const std::vector<ShaderIrInstruction>& ir,
-                                         const std::string& disasm,
-                                         ShaderStageType stage,
-                                         const std::string& shaderModel) {
-    std::ostringstream out;
-    out << "// pseudo-HLSL (assembly-linked view)\n";
-    out << "// profile: " << shaderModel << "\n";
-    out << "// supported interpretation focus: vs/ps_1_0, 1_1, 2_0 (2_a/2_b via 2_x opcodes), 3_0\n";
-    out << "// every line maps back to the corresponding asm instruction index.\n";
-    out << "void main() {\n";
-
-    std::istringstream in(disasm);
-    std::string line;
-    int asmLine = 0;
-    while (std::getline(in, line)) {
-        ParsedAsmInstruction inst = ParseAsmInstructionLine(line);
-        if (!inst.isInstruction) {
-            continue;
-        }
-        std::string pseudo = BuildPseudoForInstruction(inst, stage);
-        out << "  // asm[" << asmLine << "] " << TrimCopy(inst.raw) << "\n";
-        out << "  " << pseudo << ";\n";
-        ++asmLine;
+    if (rec->editableAssembly.empty()) {
+        if (outError) *outError = "Assembly editor is empty.";
+        return false;
     }
 
-    if (asmLine == 0) {
-        for (const ShaderIrInstruction& inst : ir) {
-            out << "  " << inst.opcode;
-            if (!inst.dst.empty()) out << " " << inst.dst;
-            for (size_t i = 0; i < inst.src.size(); ++i) {
-                out << (i == 0 && inst.dst.empty() ? " " : ", ") << inst.src[i];
+    HMODULE compiler = LoadD3DCompilerModule();
+    if (!compiler) {
+        if (outError) *outError = "d3dcompiler_47.dll / d3dcompiler_43.dll not available.";
+        return false;
+    }
+
+    typedef HRESULT(WINAPI* D3DAssembleFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, UINT, ID3DBlob**, ID3DBlob**);
+    D3DAssembleFn assembleFn = reinterpret_cast<D3DAssembleFn>(GetProcAddress(compiler, "D3DAssemble"));
+    if (!assembleFn) {
+        if (outError) *outError = "D3DAssemble is unavailable in loaded d3dcompiler.";
+        return false;
+    }
+
+    ID3DBlob* assembled = nullptr;
+    ID3DBlob* errors = nullptr;
+    HRESULT asmHr = assembleFn(rec->editableAssembly.c_str(),
+                               rec->editableAssembly.size(),
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               0,
+                               &assembled,
+                               &errors);
+    if (FAILED(asmHr) || !assembled) {
+        if (outError) {
+            if (errors && errors->GetBufferPointer()) {
+                *outError = static_cast<const char*>(errors->GetBufferPointer());
+            } else {
+                char msg[128] = {};
+                snprintf(msg, sizeof(msg), "Assembly failed: HRESULT=0x%08X", static_cast<unsigned int>(asmHr));
+                *outError = msg;
             }
-            out << ";\n";
         }
+        if (errors) errors->Release();
+        if (assembled) assembled->Release();
+        return false;
     }
-    out << "}\n";
-    return out.str();
+
+    IUnknown* replacement = nullptr;
+    HRESULT createHr = D3DERR_INVALIDCALL;
+    if (rec->stage == ShaderStage_Vertex) {
+        IDirect3DVertexShader9* shader = nullptr;
+        createHr = device->CreateVertexShader(reinterpret_cast<const DWORD*>(assembled->GetBufferPointer()), &shader);
+        replacement = shader;
+    } else {
+        IDirect3DPixelShader9* shader = nullptr;
+        createHr = device->CreatePixelShader(reinterpret_cast<const DWORD*>(assembled->GetBufferPointer()), &shader);
+        replacement = shader;
+    }
+
+    if (FAILED(createHr) || !replacement) {
+        if (outError) {
+            char msg[128] = {};
+            snprintf(msg, sizeof(msg), "Device shader creation failed: HRESULT=0x%08X", static_cast<unsigned int>(createHr));
+            *outError = msg;
+        }
+        if (errors) errors->Release();
+        assembled->Release();
+        return false;
+    }
+
+    if (rec->replacementShader) {
+        rec->replacementShader->Release();
+        rec->replacementShader = nullptr;
+    }
+    rec->replacementShader = replacement;
+    rec->replacementEnabled = true;
+
+    const size_t dwordCount = assembled->GetBufferSize() / sizeof(uint32_t);
+    rec->modifiedBytecode.assign(reinterpret_cast<const uint32_t*>(assembled->GetBufferPointer()),
+                                 reinterpret_cast<const uint32_t*>(assembled->GetBufferPointer()) + dwordCount);
+
+    if (outError) outError->clear();
+    if (errors) errors->Release();
+    assembled->Release();
+    return true;
 }
 
 static std::string BuildD3DDisassembly(const std::vector<uint32_t>& bytecode) {
     if (bytecode.empty()) return "";
-    HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
-    if (!compiler) compiler = LoadLibraryA("d3dcompiler_43.dll");
+    HMODULE compiler = LoadD3DCompilerModule();
     if (!compiler) return "<d3dcompiler not available>";
     typedef HRESULT (WINAPI *D3DDisassembleFn)(LPCVOID, SIZE_T, UINT, LPCSTR, ID3DBlob**);
     D3DDisassembleFn fn = reinterpret_cast<D3DDisassembleFn>(GetProcAddress(compiler, "D3DDisassemble"));
@@ -642,6 +644,8 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
     rec->usesSkinning = false;
     rec->usesFlowControl = false;
     rec->transformConstantBase = -1;
+    rec->lightingConstantBase = -1;
+    int minConstReg = kMaxConstantRegisters;
 
     for (size_t i = 0; i < rec->ir.size(); ++i) {
         const ShaderIrInstruction& inst = rec->ir[i];
@@ -653,7 +657,7 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
         }
         for (const std::string& src : inst.src) {
             int c = -1;
-            if (ExtractConstRegister(src, &c) && c >= 0 && c < kMaxConstantRegisters) rec->constantUsage[c] = true;
+            if (ExtractConstRegister(src, &c) && c >= 0 && c < kMaxConstantRegisters) { rec->constantUsage[c] = true; if (c < minConstReg) minConstReg = c; }
             if (src.find("a0") != std::string::npos || src.find("[a0") != std::string::npos) rec->usesSkinning = true;
         }
     }
@@ -686,6 +690,9 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
         sawMul |= (inst.opcode == "mul");
     }
     rec->isFFPLighting = sawDot && sawMaxZero && sawMul;
+    if (rec->isFFPLighting && minConstReg < kMaxConstantRegisters) {
+        rec->lightingConstantBase = minConstReg;
+    }
     rec->isRemixSafe = !rec->usesFlowControl;
 }
 
@@ -1178,6 +1185,10 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     style.Colors[ImGuiCol_TabActive] = ImVec4(0.48f, 0.18f, 0.18f, 1.00f);
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.18f, 0.10f, 0.10f, 0.97f);
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.33f, 0.14f, 0.14f, 1.00f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.07f, 0.07f, 0.95f);
+    style.Colors[ImGuiCol_Border] = ImVec4(0.56f, 0.22f, 0.22f, 0.68f);
+    style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.75f, 0.25f, 0.25f, 0.45f);
     style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
     style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
     style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
@@ -1679,7 +1690,7 @@ static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, c
         }
     }
     rec.ir = BuildIrFromDisassembly(rec.cachedDisassembly);
-    rec.cachedPseudoHlsl = BuildPseudoHlslFromIr(rec.ir, rec.cachedDisassembly, stage, rec.shaderModel);
+    rec.editableAssembly = rec.cachedDisassembly;
     ClassifyShaderRecord(&rec);
     g_shaderBytecodeHashes[shaderKey] = rec.hash;
     g_shaderHashToKey[rec.hash] = shaderKey;
@@ -2402,7 +2413,7 @@ static void UpdateFrameTimeStats() {
     g_frameTimeSamples++;
 }
 
-static void RenderImGuiOverlay() {
+static void RenderImGuiOverlay(IDirect3DDevice9* device) {
     EnsureWndProcHookInstalled();
 
     if (!g_imguiInitialized || !g_showImGui) {
@@ -2799,12 +2810,8 @@ static void RenderImGuiOverlay() {
             std::vector<ShaderRecord*> shaderSnapshot = g_stableShaderList;
             if (g_shaderListOrderMode == ShaderListOrder_HashAsc) {
                 std::sort(shaderSnapshot.begin(), shaderSnapshot.end(), [](const ShaderRecord* a, const ShaderRecord* b) {
-                    if (!a || !b) {
-                        return a < b;
-                    }
-                    if (a->hash != b->hash) {
-                        return a->hash < b->hash;
-                    }
+                    if (!a || !b) return a < b;
+                    if (a->hash != b->hash) return a->hash < b->hash;
                     return a->shaderKey < b->shaderKey;
                 });
             }
@@ -2814,9 +2821,7 @@ static void RenderImGuiOverlay() {
                 g_selectedShaderHash = static_cast<uint64_t>(selectedByKeyIt->second.hash);
             } else if (g_selectedShaderHash != 0) {
                 auto selectedIt = g_shaderHashToKey.find(static_cast<uint32_t>(g_selectedShaderHash));
-                if (selectedIt != g_shaderHashToKey.end()) {
-                    g_selectedShaderKey = selectedIt->second;
-                }
+                if (selectedIt != g_shaderHashToKey.end()) g_selectedShaderKey = selectedIt->second;
             }
             if (g_selectedShaderHash == 0 && !shaderSnapshot.empty() && shaderSnapshot.front()) {
                 g_selectedShaderHash = static_cast<uint64_t>(shaderSnapshot.front()->hash);
@@ -2826,9 +2831,7 @@ static void RenderImGuiOverlay() {
             ImGui::Columns(3, "ShaderCols", true);
             ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
             for (ShaderRecord* recPtr : shaderSnapshot) {
-                if (!recPtr) {
-                    continue;
-                }
+                if (!recPtr) continue;
                 ShaderRecord& rec = *recPtr;
                 const uintptr_t shaderKey = rec.shaderKey;
                 char label[256];
@@ -2837,13 +2840,17 @@ static void RenderImGuiOverlay() {
                          static_cast<int>(rec.ir.size()), rec.usageCount,
                          (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
                 if (shaderFilter[0] && strstr(label, shaderFilter) == nullptr) continue;
-                bool selected = (static_cast<uint64_t>(rec.hash) == g_selectedShaderHash);
-                if (ImGui::Selectable(label, selected)) {
+                bool selected = (shaderKey == g_selectedShaderKey);
+                ImGui::PushID(reinterpret_cast<void*>(shaderKey));
+                if (ImGui::Selectable((std::string(label) + "##shader_row").c_str(), selected)) {
                     g_selectedShaderHash = static_cast<uint64_t>(rec.hash);
                     g_selectedShaderKey = shaderKey;
+                    g_selectedRegister = -1;
                 }
+                ImGui::PopID();
             }
             ImGui::EndChild();
+
             ImGui::NextColumn();
             ImGui::BeginChild("ShaderInspect", ImVec2(0, 420), true);
             auto it = g_shaderRecords.find(g_selectedShaderKey);
@@ -2852,57 +2859,123 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("Hash: 0x%08X", rec.hash);
                 ImGui::Text("Type: %s", rec.stage == ShaderStage_Vertex ? "VS" : "PS");
                 ImGui::Text("Model: %s", rec.shaderModel.c_str());
-                ImGui::Checkbox("Enable replacement", &rec.replacementEnabled);
+
+                bool replacementEnabled = rec.replacementEnabled && rec.replacementShader != nullptr;
+                if (ImGui::Checkbox("Enable replacement", &replacementEnabled)) {
+                    rec.replacementEnabled = replacementEnabled && rec.replacementShader != nullptr;
+                    if (replacementEnabled && !rec.replacementShader) {
+                        rec.replacementStatus = "No replacement object yet. Use Replace shader first.";
+                    }
+                }
+
                 if (ImGui::Button("Dump assembly")) {
                     std::filesystem::create_directories("Shader_dump");
                     char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", rec.hash);
-                    std::ofstream(path) << rec.cachedDisassembly;
-                }
-                ImGui::SameLine();
-                if (ImGui::Button("Dump pseudo-HLSL")) {
-                    std::filesystem::create_directories("Shader_dump");
-                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.pseudo.hlsl", rec.hash);
-                    std::ofstream(path) << rec.cachedPseudoHlsl;
+                    std::ofstream(path) << rec.editableAssembly;
                 }
                 ImGui::SameLine();
                 if (ImGui::Button("Dump bytecode")) {
                     std::filesystem::create_directories("Shader_dump");
                     char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", rec.hash);
                     std::ofstream f(path, std::ios::binary);
-                    f.write(reinterpret_cast<const char*>(rec.originalBytecode.data()), rec.originalBytecode.size() * sizeof(uint32_t));
+                    const std::vector<uint32_t>& data = rec.replacementEnabled && !rec.modifiedBytecode.empty()
+                                                         ? rec.modifiedBytecode : rec.originalBytecode;
+                    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint32_t));
                 }
+
                 ImGui::Separator();
-                ImGui::Text("Assembly");
-                ImGui::BeginChild("AsmView", ImVec2(-1, 120), true);
-                ImGui::TextUnformatted(rec.cachedDisassembly.c_str());
-                ImGui::EndChild();
-                ImGui::Text("Pseudo-HLSL");
-                ImGui::BeginChild("PseudoView", ImVec2(-1, 120), true);
-                ImGui::TextUnformatted(rec.cachedPseudoHlsl.c_str());
-                ImGui::EndChild();
+                ImGui::Text("Assembly editor");
+                if (g_shaderEditorKey != rec.shaderKey) {
+                    g_shaderEditorKey = rec.shaderKey;
+                    memset(g_shaderEditorBuffer.data(), 0, g_shaderEditorBuffer.size());
+                    strncpy_s(g_shaderEditorBuffer.data(), g_shaderEditorBuffer.size(), rec.editableAssembly.c_str(), _TRUNCATE);
+                }
+                ImGuiInputTextFlags flags = ImGuiInputTextFlags_AllowTabInput;
+                if (ImGui::InputTextMultiline("##ShaderAssemblyEditor", g_shaderEditorBuffer.data(), g_shaderEditorBuffer.size(), ImVec2(-1, 180), flags)) {
+                    rec.editableAssembly = g_shaderEditorBuffer.data();
+                }
+                if (ImGui::Button("Replace shader")) {
+                    rec.editableAssembly = g_shaderEditorBuffer.data();
+                    std::string err;
+                    if (BuildShaderReplacementFromAssembly(device, &rec, &err)) {
+                        rec.replacementEnabled = true;
+                        rec.replacementStatus = "Replacement shader created and active for runtime binding.";
+                    } else {
+                        rec.replacementStatus = err.empty() ? "Failed to build replacement shader." : err;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset assembly")) {
+                    rec.editableAssembly = rec.cachedDisassembly;
+                    g_shaderEditorKey = 0;
+                    rec.modifiedBytecode.clear();
+                    rec.replacementEnabled = false;
+                    if (rec.replacementShader) {
+                        rec.replacementShader->Release();
+                        rec.replacementShader = nullptr;
+                    }
+                    rec.replacementStatus = "Assembly reset to original and replacement shader released.";
+                }
+                if (!rec.replacementStatus.empty()) {
+                    ImGui::TextWrapped("%s", rec.replacementStatus.c_str());
+                }
             }
             ImGui::EndChild();
+
             ImGui::NextColumn();
             ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true);
             auto ai = g_shaderRecords.find(g_selectedShaderKey);
             if (ai != g_shaderRecords.end() && static_cast<uint64_t>(ai->second.hash) == g_selectedShaderHash) {
                 ShaderRecord& rec = ai->second;
+                int usedMin = -1;
+                int usedMax = -1;
+                for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
+                    if (!rec.constantUsage[reg]) continue;
+                    if (usedMin < 0) usedMin = reg;
+                    usedMax = reg;
+                }
+
+                const int effectiveTransformBase = g_manualTransformBaseOverride >= 0 ? g_manualTransformBaseOverride : rec.transformConstantBase;
+                const int effectiveLightingBase = g_manualLightingBaseOverride >= 0 ? g_manualLightingBaseOverride : rec.lightingConstantBase;
                 ImGui::Text("Transform: %s", rec.isFFPTransform ? "Yes" : "No");
-                ImGui::Text("Transform base: c%d", rec.transformConstantBase);
+                ImGui::Text("Transform base: c%d", effectiveTransformBase);
                 ImGui::Text("Lighting: %s", rec.isFFPLighting ? "Yes" : "No");
-                ImGui::Text("Skinning: %s", rec.usesSkinning ? "Yes" : "No");
-                ImGui::Text("Flow control: %s", rec.usesFlowControl ? "Yes" : "No");
-                ImGui::Text("Remix safe: %s", rec.isRemixSafe ? "Yes" : "No");
-                ImGui::Separator();
-                ImGui::Text("Vertex input");
-                ImGui::Text("POSITION: %s", g_activeVertexDeclInfo.hasPosition ? "Yes" : "No");
-                ImGui::Text("NORMAL: %s", g_activeVertexDeclInfo.hasNormal ? "Yes" : "No");
-                ImGui::Text("TEXCOORDs: %d", g_activeVertexDeclInfo.texcoordCount);
-                ImGui::Text("TANGENT: %s", g_activeVertexDeclInfo.hasTangent ? "Yes" : "No");
-                ImGui::Text("BINORMAL: %s", g_activeVertexDeclInfo.hasBinormal ? "Yes" : "No");
+                ImGui::Text("Lighting base: c%d", effectiveLightingBase);
+                ImGui::Text("Used const range: %s", usedMin >= 0 ? "captured" : "none");
+                if (usedMin >= 0) {
+                    ImGui::SameLine();
+                    ImGui::Text("(c%d-c%d)", usedMin, usedMax);
+                }
+                if (ImGui::Button("Jump to transform register") && effectiveTransformBase >= 0) {
+                    g_selectedRegister = effectiveTransformBase;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Jump to lighting register") && effectiveLightingBase >= 0) {
+                    g_selectedRegister = effectiveLightingBase;
+                }
                 ImGui::Separator();
                 ImGui::Checkbox("Force FFP transform emission", &g_forceFfpTransform);
                 ImGui::InputInt("Manual transform base", &g_manualTransformBaseOverride);
+                ImGui::InputInt("Manual lighting base", &g_manualLightingBaseOverride);
+
+                ImGui::Separator();
+                ImGui::Text("Constant monitor (selected shader)");
+                ImGui::BeginChild("ShaderConstRange", ImVec2(-1, 145), true);
+                for (int reg = usedMin; reg >= 0 && reg <= usedMax; ++reg) {
+                    if (!rec.constantUsage[reg]) continue;
+                    bool isTransformReg = effectiveTransformBase >= 0 && reg >= effectiveTransformBase && reg < (effectiveTransformBase + 4);
+                    bool isLightingReg = (reg == effectiveLightingBase && effectiveLightingBase >= 0);
+                    if (isTransformReg) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.40f, 0.40f, 1.00f));
+                    } else if (isLightingReg) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.72f, 0.42f, 1.00f));
+                    }
+                    if (ImGui::Selectable((std::string("c") + std::to_string(reg)).c_str(), g_selectedRegister == reg)) {
+                        g_selectedRegister = reg;
+                    }
+                    if (isTransformReg || isLightingReg) ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
             }
             ImGui::EndChild();
             ImGui::Columns(1);
@@ -5229,7 +5302,7 @@ public:
         }
         g_imguiMgrrUseAutoProjection = m_mgrrUseAutoProjection;
         g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
-        RenderImGuiOverlay();
+        RenderImGuiOverlay(m_real);
         m_mgrrUseAutoProjection = g_imguiMgrrUseAutoProjection;
         g_config.barnyardUseGameSetTransformsForViewProjection = g_imguiBarnyardUseGameSetTransformsForViewProjection;
         if (g_requestManualEmit) {
