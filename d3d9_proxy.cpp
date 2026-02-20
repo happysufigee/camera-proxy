@@ -27,6 +27,10 @@
 #include <limits>
 #include <mutex>
 #include <cassert>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <cctype>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -302,6 +306,8 @@ static int g_iniWorldMatrixRegister = -1;
 static char g_iniPath[MAX_PATH] = {};
 
 static constexpr int kMaxConstantRegisters = 256;
+static float g_vsConstants[kMaxConstantRegisters][4] = {};
+static float g_psConstants[kMaxConstantRegisters][4] = {};
 static int g_selectedRegister = -1;
 static uintptr_t g_activeShaderKey = 0;
 static uintptr_t g_selectedShaderKey = 0;
@@ -318,6 +324,213 @@ static bool g_probeInverseView = true;
 static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
 static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
+
+enum ShaderStageType {
+    ShaderStage_Vertex = 0,
+    ShaderStage_Pixel = 1
+};
+
+struct VertexDeclSemanticInfo {
+    bool hasPosition = false;
+    bool hasNormal = false;
+    bool hasTangent = false;
+    bool hasBinormal = false;
+    int texcoordCount = 0;
+};
+
+struct ShaderIrInstruction {
+    std::string opcode;
+    std::string dst;
+    std::vector<std::string> src;
+    int dstWriteMask = 0;
+};
+
+struct ShaderRecord {
+    uintptr_t shaderKey = 0;
+    ShaderStageType stage = ShaderStage_Vertex;
+    std::vector<uint32_t> originalBytecode = {};
+    std::vector<uint32_t> modifiedBytecode = {};
+    uint32_t hash = 0;
+    std::string shaderModel = "unknown";
+    std::vector<ShaderIrInstruction> ir = {};
+    bool isFFPTransform = false;
+    bool isFFPLighting = false;
+    bool usesSkinning = false;
+    bool usesFlowControl = false;
+    bool isRemixSafe = false;
+    int transformConstantBase = -1;
+    int lightingConstantBase = -1;
+    bool constantUsage[kMaxConstantRegisters] = {};
+    unsigned long long usageCount = 0;
+    IUnknown* replacementShader = nullptr;
+    bool replacementEnabled = false;
+    std::string cachedDisassembly = {};
+    std::string cachedPseudoHlsl = {};
+    std::string inlineHlsl = {};
+};
+
+static std::unordered_map<uintptr_t, ShaderRecord> g_shaderRecords = {};
+static std::unordered_map<uint32_t, uintptr_t> g_shaderHashToKey = {};
+static uintptr_t g_activeVertexShaderKey = 0;
+static uintptr_t g_activePixelShaderKey = 0;
+static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
+static bool g_forceFfpTransform = false;
+static int g_manualTransformBaseOverride = -1;
+
+static std::string TrimCopy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+static int ParseWriteMaskBits(const std::string& reg) {
+    size_t dot = reg.find('.');
+    if (dot == std::string::npos || dot + 1 >= reg.size()) return 0xF;
+    int mask = 0;
+    for (size_t i = dot + 1; i < reg.size(); ++i) {
+        if (reg[i] == 'x') mask |= 1;
+        if (reg[i] == 'y') mask |= 2;
+        if (reg[i] == 'z') mask |= 4;
+        if (reg[i] == 'w') mask |= 8;
+    }
+    return mask == 0 ? 0xF : mask;
+}
+
+static bool ExtractConstRegister(const std::string& operand, int* outReg) {
+    if (!outReg) return false;
+    size_t cpos = operand.find('c');
+    if (cpos == std::string::npos || cpos + 1 >= operand.size()) return false;
+    if (!std::isdigit(static_cast<unsigned char>(operand[cpos + 1]))) return false;
+    int v = 0;
+    size_t i = cpos + 1;
+    while (i < operand.size() && std::isdigit(static_cast<unsigned char>(operand[i]))) {
+        v = (v * 10) + (operand[i] - '0');
+        ++i;
+    }
+    *outReg = v;
+    return true;
+}
+
+static std::string BuildPseudoHlslFromIr(const std::vector<ShaderIrInstruction>& ir) {
+    std::ostringstream out;
+    out << "// pseudo-HLSL (deterministic IR view)\n";
+    out << "void main() {\n";
+    for (const ShaderIrInstruction& inst : ir) {
+        out << "  " << inst.opcode;
+        if (!inst.dst.empty()) out << " " << inst.dst;
+        for (size_t i = 0; i < inst.src.size(); ++i) {
+            out << (i == 0 && inst.dst.empty() ? " " : ", ") << inst.src[i];
+        }
+        out << ";\n";
+    }
+    out << "}\n";
+    return out.str();
+}
+
+static std::string BuildD3DDisassembly(const std::vector<uint32_t>& bytecode) {
+    if (bytecode.empty()) return "";
+    HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+    if (!compiler) compiler = LoadLibraryA("d3dcompiler_43.dll");
+    if (!compiler) return "<d3dcompiler not available>";
+    typedef HRESULT (WINAPI *D3DDisassembleFn)(LPCVOID, SIZE_T, UINT, LPCSTR, ID3DBlob**);
+    D3DDisassembleFn fn = reinterpret_cast<D3DDisassembleFn>(GetProcAddress(compiler, "D3DDisassemble"));
+    if (!fn) return "<D3DDisassemble missing>";
+    ID3DBlob* blob = nullptr;
+    HRESULT hr = fn(bytecode.data(), bytecode.size() * sizeof(uint32_t), 0, nullptr, &blob);
+    if (FAILED(hr) || !blob) return "<D3DDisassemble failed>";
+    std::string text(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
+    blob->Release();
+    return text;
+}
+
+static std::vector<ShaderIrInstruction> BuildIrFromDisassembly(const std::string& disasm) {
+    std::vector<ShaderIrInstruction> ir;
+    std::istringstream in(disasm);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string t = TrimCopy(line);
+        if (t.empty() || t[0] == '/' || t[0] == ';') continue;
+        size_t sp = t.find(' ');
+        ShaderIrInstruction inst;
+        inst.opcode = TrimCopy(sp == std::string::npos ? t : t.substr(0, sp));
+        if (inst.opcode.empty()) continue;
+        std::string rest = sp == std::string::npos ? "" : TrimCopy(t.substr(sp + 1));
+        if (!rest.empty()) {
+            std::vector<std::string> ops;
+            size_t start = 0;
+            while (start < rest.size()) {
+                size_t comma = rest.find(',', start);
+                std::string token = TrimCopy(rest.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+                if (!token.empty()) ops.push_back(token);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            if (!ops.empty()) {
+                inst.dst = ops[0];
+                inst.dstWriteMask = ParseWriteMaskBits(inst.dst);
+                for (size_t i = 1; i < ops.size(); ++i) inst.src.push_back(ops[i]);
+            }
+        }
+        ir.push_back(inst);
+    }
+    return ir;
+}
+
+static void ClassifyShaderRecord(ShaderRecord* rec) {
+    if (!rec) return;
+    rec->isFFPTransform = false;
+    rec->isFFPLighting = false;
+    rec->usesSkinning = false;
+    rec->usesFlowControl = false;
+    rec->transformConstantBase = -1;
+
+    for (size_t i = 0; i < rec->ir.size(); ++i) {
+        const ShaderIrInstruction& inst = rec->ir[i];
+        if (inst.opcode == "if" || inst.opcode == "loop" || inst.opcode == "rep" || inst.opcode == "call" || inst.opcode == "callnz") {
+            rec->usesFlowControl = true;
+        }
+        if (inst.dst.find("a0") != std::string::npos || (inst.dst.find('[') != std::string::npos && inst.dst.find('c') != std::string::npos)) {
+            rec->usesSkinning = true;
+        }
+        for (const std::string& src : inst.src) {
+            int c = -1;
+            if (ExtractConstRegister(src, &c) && c >= 0 && c < kMaxConstantRegisters) rec->constantUsage[c] = true;
+            if (src.find("a0") != std::string::npos || src.find("[a0") != std::string::npos) rec->usesSkinning = true;
+        }
+    }
+
+    for (size_t i = 0; i + 3 < rec->ir.size(); ++i) {
+        const ShaderIrInstruction& a = rec->ir[i + 0];
+        const ShaderIrInstruction& b = rec->ir[i + 1];
+        const ShaderIrInstruction& c = rec->ir[i + 2];
+        const ShaderIrInstruction& d = rec->ir[i + 3];
+        if (a.opcode == "dp4" && b.opcode == "dp4" && c.opcode == "dp4" && d.opcode == "dp4" &&
+            a.dst.find("oPos") != std::string::npos && b.dst.find("oPos") != std::string::npos &&
+            c.dst.find("oPos") != std::string::npos && d.dst.find("oPos") != std::string::npos &&
+            a.src.size() >= 2 && b.src.size() >= 2 && c.src.size() >= 2 && d.src.size() >= 2 &&
+            a.src[0] == b.src[0] && b.src[0] == c.src[0] && c.src[0] == d.src[0]) {
+            int c0 = -1, c1 = -1, c2 = -1, c3 = -1;
+            if (ExtractConstRegister(a.src[1], &c0) && ExtractConstRegister(b.src[1], &c1) &&
+                ExtractConstRegister(c.src[1], &c2) && ExtractConstRegister(d.src[1], &c3) &&
+                c1 == c0 + 1 && c2 == c0 + 2 && c3 == c0 + 3) {
+                rec->isFFPTransform = true;
+                rec->transformConstantBase = c0;
+                break;
+            }
+        }
+    }
+
+    bool sawDot = false, sawMaxZero = false, sawMul = false;
+    for (const ShaderIrInstruction& inst : rec->ir) {
+        sawDot |= (inst.opcode == "dp3" || inst.opcode == "dp4");
+        if (inst.opcode == "max" && inst.src.size() >= 2 && (inst.src[1] == "c0.x" || inst.src[1] == "0")) sawMaxZero = true;
+        sawMul |= (inst.opcode == "mul");
+    }
+    rec->isFFPLighting = sawDot && sawMaxZero && sawMul;
+    rec->isRemixSafe = !rec->usesFlowControl;
+}
 
 static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
     if (!outHash || shaderKey == 0) {
@@ -1250,6 +1463,37 @@ static void OnVertexShaderReleased(uintptr_t shaderKey) {
     if (it != g_shaderOrder.end()) {
         g_shaderOrder.erase(it);
     }
+    auto recIt = g_shaderRecords.find(shaderKey);
+    if (recIt != g_shaderRecords.end()) {
+        if (recIt->second.replacementShader) {
+            recIt->second.replacementShader->Release();
+            recIt->second.replacementShader = nullptr;
+        }
+        g_shaderHashToKey.erase(recIt->second.hash);
+        g_shaderRecords.erase(recIt);
+    }
+}
+
+static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, const std::vector<uint32_t>& tokens) {
+    if (shaderKey == 0 || tokens.empty()) return;
+    ShaderRecord rec = {};
+    rec.shaderKey = shaderKey;
+    rec.stage = stage;
+    rec.originalBytecode = tokens;
+    rec.hash = HashBytesFNV1a(reinterpret_cast<const uint8_t*>(tokens.data()), tokens.size() * sizeof(uint32_t));
+    uint32_t version = tokens[0];
+    char profile[32] = {};
+    const UINT major = (version >> 8) & 0xFF;
+    const UINT minor = version & 0xFF;
+    snprintf(profile, sizeof(profile), "%s_%u_%u", stage == ShaderStage_Vertex ? "vs" : "ps", major, minor);
+    rec.shaderModel = profile;
+    rec.cachedDisassembly = BuildD3DDisassembly(tokens);
+    rec.ir = BuildIrFromDisassembly(rec.cachedDisassembly);
+    rec.cachedPseudoHlsl = BuildPseudoHlslFromIr(rec.ir);
+    ClassifyShaderRecord(&rec);
+    g_shaderBytecodeHashes[shaderKey] = rec.hash;
+    g_shaderHashToKey[rec.hash] = shaderKey;
+    g_shaderRecords[shaderKey] = rec;
 }
 
 static uint32_t ComputeShaderBytecodeHash(IDirect3DVertexShader9* shader) {
@@ -2347,6 +2591,87 @@ static void RenderImGuiOverlay() {
             if (g_matrixAssignStatus[0] != '\0') {
                 ImGui::TextWrapped("%s", g_matrixAssignStatus);
             }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Shader")) {
+            static char shaderFilter[64] = "";
+            ImGui::InputText("Filter", shaderFilter, sizeof(shaderFilter));
+            ImGui::Columns(3, "ShaderCols", true);
+            ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
+            for (auto& entry : g_shaderRecords) {
+                ShaderRecord& rec = entry.second;
+                char label[256];
+                snprintf(label, sizeof(label), "0x%08X %s %s inst:%d use:%llu%s", rec.hash,
+                         rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
+                         static_cast<int>(rec.ir.size()), rec.usageCount,
+                         (entry.first == g_activeVertexShaderKey || entry.first == g_activePixelShaderKey) ? " *" : "");
+                if (shaderFilter[0] && strstr(label, shaderFilter) == nullptr) continue;
+                if (ImGui::Selectable(label, g_selectedShaderKey == entry.first)) g_selectedShaderKey = entry.first;
+            }
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ShaderInspect", ImVec2(0, 420), true);
+            auto it = g_shaderRecords.find(g_selectedShaderKey);
+            if (it != g_shaderRecords.end()) {
+                ShaderRecord& rec = it->second;
+                ImGui::Text("Hash: 0x%08X", rec.hash);
+                ImGui::Text("Type: %s", rec.stage == ShaderStage_Vertex ? "VS" : "PS");
+                ImGui::Text("Model: %s", rec.shaderModel.c_str());
+                ImGui::Checkbox("Enable replacement", &rec.replacementEnabled);
+                if (ImGui::Button("Dump assembly")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", rec.hash);
+                    std::ofstream(path) << rec.cachedDisassembly;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Dump pseudo-HLSL")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.pseudo.hlsl", rec.hash);
+                    std::ofstream(path) << rec.cachedPseudoHlsl;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Dump bytecode")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", rec.hash);
+                    std::ofstream f(path, std::ios::binary);
+                    f.write(reinterpret_cast<const char*>(rec.originalBytecode.data()), rec.originalBytecode.size() * sizeof(uint32_t));
+                }
+                ImGui::Separator();
+                ImGui::Text("Assembly");
+                ImGui::BeginChild("AsmView", ImVec2(-1, 120), true);
+                ImGui::TextUnformatted(rec.cachedDisassembly.c_str());
+                ImGui::EndChild();
+                ImGui::Text("Pseudo-HLSL");
+                ImGui::BeginChild("PseudoView", ImVec2(-1, 120), true);
+                ImGui::TextUnformatted(rec.cachedPseudoHlsl.c_str());
+                ImGui::EndChild();
+            }
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true);
+            auto ai = g_shaderRecords.find(g_selectedShaderKey);
+            if (ai != g_shaderRecords.end()) {
+                ShaderRecord& rec = ai->second;
+                ImGui::Text("Transform: %s", rec.isFFPTransform ? "Yes" : "No");
+                ImGui::Text("Transform base: c%d", rec.transformConstantBase);
+                ImGui::Text("Lighting: %s", rec.isFFPLighting ? "Yes" : "No");
+                ImGui::Text("Skinning: %s", rec.usesSkinning ? "Yes" : "No");
+                ImGui::Text("Flow control: %s", rec.usesFlowControl ? "Yes" : "No");
+                ImGui::Text("Remix safe: %s", rec.isRemixSafe ? "Yes" : "No");
+                ImGui::Separator();
+                ImGui::Text("Vertex input");
+                ImGui::Text("POSITION: %s", g_activeVertexDeclInfo.hasPosition ? "Yes" : "No");
+                ImGui::Text("NORMAL: %s", g_activeVertexDeclInfo.hasNormal ? "Yes" : "No");
+                ImGui::Text("TEXCOORDs: %d", g_activeVertexDeclInfo.texcoordCount);
+                ImGui::Text("TANGENT: %s", g_activeVertexDeclInfo.hasTangent ? "Yes" : "No");
+                ImGui::Text("BINORMAL: %s", g_activeVertexDeclInfo.hasBinormal ? "Yes" : "No");
+                ImGui::Separator();
+                ImGui::Checkbox("Force FFP transform emission", &g_forceFfpTransform);
+                ImGui::InputInt("Manual transform base", &g_manualTransformBaseOverride);
+            }
+            ImGui::EndChild();
+            ImGui::Columns(1);
             ImGui::EndTabItem();
         }
 
@@ -3592,6 +3917,31 @@ bool LooksLikeView(const D3DMATRIX& m) {
 class WrappedD3D9Device;
 class WrappedD3D9;
 
+class WrappedPixelShader9 : public IDirect3DPixelShader9 {
+private:
+    IDirect3DPixelShader9* m_real;
+    uintptr_t m_key;
+public:
+    explicit WrappedPixelShader9(IDirect3DPixelShader9* real)
+        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {}
+
+    IDirect3DPixelShader9* GetReal() const { return m_real; }
+    uintptr_t GetKey() const { return m_key; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override { return m_real->QueryInterface(riid, ppv); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = m_real->Release();
+        if (count == 0) {
+            OnVertexShaderReleased(m_key);
+            delete this;
+        }
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9** ppDevice) override { return m_real->GetDevice(ppDevice); }
+    HRESULT STDMETHODCALLTYPE GetFunction(void* pData, UINT* pSizeOfData) override { return m_real->GetFunction(pData, pSizeOfData); }
+};
+
 class WrappedVertexShader9 : public IDirect3DVertexShader9 {
 private:
     IDirect3DVertexShader9* m_real;
@@ -3675,6 +4025,19 @@ public:
     void EmitFixedFunctionTransforms() {
         if (!g_config.emitFixedFunctionTransforms) {
             return;
+        }
+        if (g_forceFfpTransform) {
+            uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
+            auto it = g_shaderRecords.find(shaderKey);
+            if (it != g_shaderRecords.end() && it->second.isFFPTransform) {
+                const int base = g_manualTransformBaseOverride >= 0 ? g_manualTransformBaseOverride : it->second.transformConstantBase;
+                ShaderConstantState* state = GetShaderState(shaderKey, false);
+                D3DMATRIX m = {};
+                if (state && TryBuildMatrixSnapshot(*state, base, 4, false, &m)) {
+                    m_currentWorld = m;
+                    m_hasWorld = true;
+                }
+            }
         }
         // Keep strict game profiles deterministic even if generic SetTransform compatibility is enabled.
         if (g_activeGameProfile == GameProfile_None &&
@@ -3884,6 +4247,14 @@ public:
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
         if (g_constantUploadRecordingEnabled) {
             RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
+        }
+        auto recIt = g_shaderRecords.find(shaderKey);
+        if (recIt != g_shaderRecords.end()) {
+            for (UINT i = 0; i < Vector4fCount; ++i) {
+                UINT reg = StartRegister + i;
+                if (reg >= kMaxConstantRegisters) break;
+                recIt->second.constantUsage[reg] = true;
+            }
         }
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
@@ -4864,6 +5235,8 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
+        if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
         return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override {
@@ -4871,6 +5244,8 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
+        if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
         return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
     }
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
@@ -4889,7 +5264,25 @@ public:
     }
     HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) override { return m_real->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags); }
     HRESULT STDMETHODCALLTYPE CreateVertexDeclaration(const D3DVERTEXELEMENT9* pVertexElements, IDirect3DVertexDeclaration9** ppDecl) override { return m_real->CreateVertexDeclaration(pVertexElements, ppDecl); }
-    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override { return m_real->SetVertexDeclaration(pDecl); }
+    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override {
+        g_activeVertexDeclInfo = {};
+        if (pDecl) {
+            D3DVERTEXELEMENT9 elems[MAX_FVF_DECL_SIZE] = {};
+            UINT num = MAX_FVF_DECL_SIZE;
+            if (SUCCEEDED(pDecl->GetDeclaration(elems, &num))) {
+                for (UINT i = 0; i < num; ++i) {
+                    const D3DVERTEXELEMENT9& e = elems[i];
+                    if (e.Stream == 0xFF && e.Type == D3DDECLTYPE_UNUSED) break;
+                    if (e.Usage == D3DDECLUSAGE_POSITION) g_activeVertexDeclInfo.hasPosition = true;
+                    if (e.Usage == D3DDECLUSAGE_NORMAL) g_activeVertexDeclInfo.hasNormal = true;
+                    if (e.Usage == D3DDECLUSAGE_TANGENT) g_activeVertexDeclInfo.hasTangent = true;
+                    if (e.Usage == D3DDECLUSAGE_BINORMAL) g_activeVertexDeclInfo.hasBinormal = true;
+                    if (e.Usage == D3DDECLUSAGE_TEXCOORD) g_activeVertexDeclInfo.texcoordCount = (std::max)(g_activeVertexDeclInfo.texcoordCount, static_cast<int>(e.UsageIndex) + 1);
+                }
+            }
+        }
+        return m_real->SetVertexDeclaration(pDecl);
+    }
     HRESULT STDMETHODCALLTYPE GetVertexDeclaration(IDirect3DVertexDeclaration9** ppDecl) override { return m_real->GetVertexDeclaration(ppDecl); }
     HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { return m_real->SetFVF(FVF); }
     HRESULT STDMETHODCALLTYPE GetFVF(DWORD* pFVF) override { return m_real->GetFVF(pFVF); }
@@ -4904,11 +5297,20 @@ public:
             return hr;
         }
         *ppShader = new WrappedVertexShader9(realShader);
+        std::vector<uint32_t> data;
+        if (pFunction) {
+            for (size_t i = 0; i < 16384; ++i) {
+                data.push_back(static_cast<uint32_t>(pFunction[i]));
+                if ((pFunction[i] & D3DSI_OPCODE_MASK) == D3DSIO_END) break;
+            }
+        }
+        RegisterShaderBytecode(reinterpret_cast<WrappedVertexShader9*>(*ppShader)->GetKey(), ShaderStage_Vertex, data);
         return hr;
     }
     HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* pShader) override {
         m_currentVertexShader = pShader;
         g_activeShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        g_activeVertexShaderKey = g_activeShaderKey;
         GetShaderState(g_activeShaderKey, true);
 
         IDirect3DVertexShader9* realShader = nullptr;
@@ -4921,6 +5323,9 @@ public:
             }
         }
 
+        if (pShader && g_shaderRecords.count(g_activeShaderKey) && g_shaderRecords[g_activeShaderKey].replacementEnabled && g_shaderRecords[g_activeShaderKey].replacementShader) {
+            realShader = reinterpret_cast<IDirect3DVertexShader9*>(g_shaderRecords[g_activeShaderKey].replacementShader);
+        }
         return m_real->SetVertexShader(realShader);
     }
     HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** ppShader) override { return m_real->GetVertexShader(ppShader); }
@@ -4935,10 +5340,36 @@ public:
     HRESULT STDMETHODCALLTYPE GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting) override { return m_real->GetStreamSourceFreq(StreamNumber, pSetting); }
     HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* pIndexData) override { return m_real->SetIndices(pIndexData); }
     HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** ppIndexData) override { return m_real->GetIndices(ppIndexData); }
-    HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override { return m_real->CreatePixelShader(pFunction, ppShader); }
+    HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override {
+        if (!ppShader) return D3DERR_INVALIDCALL;
+        IDirect3DPixelShader9* realShader = nullptr;
+        HRESULT hr = m_real->CreatePixelShader(pFunction, &realShader);
+        if (FAILED(hr) || !realShader) {
+            *ppShader = nullptr;
+            return hr;
+        }
+        *ppShader = new WrappedPixelShader9(realShader);
+        std::vector<uint32_t> data;
+        if (pFunction) {
+            for (size_t i = 0; i < 16384; ++i) {
+                data.push_back(static_cast<uint32_t>(pFunction[i]));
+                if ((pFunction[i] & D3DSI_OPCODE_MASK) == D3DSIO_END) break;
+            }
+        }
+        RegisterShaderBytecode(reinterpret_cast<WrappedPixelShader9*>(*ppShader)->GetKey(), ShaderStage_Pixel, data);
+        return hr;
+    }
     HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override {
         m_currentPixelShader = pShader;
-        return m_real->SetPixelShader(pShader);
+        g_activePixelShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        IDirect3DPixelShader9* realShader = nullptr;
+        if (pShader) {
+            realShader = static_cast<WrappedPixelShader9*>(pShader)->GetReal();
+            if (g_shaderRecords.count(g_activePixelShaderKey) && g_shaderRecords[g_activePixelShaderKey].replacementEnabled && g_shaderRecords[g_activePixelShaderKey].replacementShader) {
+                realShader = reinterpret_cast<IDirect3DPixelShader9*>(g_shaderRecords[g_activePixelShaderKey].replacementShader);
+            }
+        }
+        return m_real->SetPixelShader(realShader);
     }
     HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** ppShader) override { return m_real->GetPixelShader(ppShader); }
     HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override {
