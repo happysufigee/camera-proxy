@@ -5256,7 +5256,7 @@ public:
         D3DMATRIX generatedProjection = {};
         bool hasGeneratedProjection = false;
         if (g_config.allowGeneratedProjectionForVPDecomposition) {
-            hasGeneratedProjection = ResolveCustomProjectionMatrix(m_real, m_hwnd, &generatedProjection, nullptr, nullptr, nullptr, nullptr);
+            hasGeneratedProjection = BuildExperimentalCustomProjectionMatrix(m_real, m_hwnd, &generatedProjection, nullptr, nullptr, nullptr, nullptr);
         }
 
         TryDecomposeCombinedMatricesDeterministic(&m_currentWorld, &m_hasWorld,
