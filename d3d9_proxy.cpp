@@ -4118,6 +4118,40 @@ static bool TrySolveFromInverseLeftMultiply(const D3DMATRIX& known,
     return true;
 }
 
+static bool TrySolveFromInverseRightMultiply(const D3DMATRIX& combined,
+                                             const D3DMATRIX& knownRight,
+                                             D3DMATRIX* out) {
+    if (!out) return false;
+    D3DMATRIX inv = {};
+    if (!InvertMatrix4x4Deterministic(knownRight, &inv, nullptr)) {
+        return false;
+    }
+    *out = MultiplyMatrix(combined, inv);
+    return true;
+}
+
+static bool IsFiniteMatrix(const D3DMATRIX& m) {
+    const float* v = reinterpret_cast<const float*>(&m);
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(v[i])) return false;
+    }
+    return true;
+}
+
+static bool IsWorldCandidateForDecomposition(const D3DMATRIX& m) {
+    if (!IsFiniteMatrix(m) || !IsAffineMatrixNoPerspective(m)) return false;
+    const float det = Determinant3x3(m);
+    return std::isfinite(det) && fabsf(det) > 0.0001f;
+}
+
+static bool IsViewCandidateForDecomposition(const D3DMATRIX& m) {
+    return IsFiniteMatrix(m) && LooksLikeViewStrict(m);
+}
+
+static bool IsProjectionCandidateForDecomposition(const D3DMATRIX& m) {
+    return IsFiniteMatrix(m) && LooksLikeProjectionStrict(m);
+}
+
 static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
                                                       bool* hasWorld,
                                                       D3DMATRIX* view,
@@ -4141,80 +4175,133 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
     }
 
     bool changed = true;
-    for (int pass = 0; pass < 3 && changed; ++pass) {
+    D3DMATRIX knownMvp = {};
+    D3DMATRIX knownMv = {};
+    D3DMATRIX knownVp = {};
+    bool knownHasMvp = hasMvp;
+    bool knownHasMv = hasMv;
+    bool knownHasVp = hasVp;
+    if (knownHasMvp && mvp) knownMvp = *mvp;
+    if (knownHasMv && mv) knownMv = *mv;
+    if (knownHasVp && vp) knownVp = *vp;
+
+    auto solveWorld = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasWorld || !IsWorldCandidateForDecomposition(candidate)) return false;
+        *world = candidate;
+        *hasWorld = true;
+        g_combinedDecompDebug.solvedWorld = true;
+        snprintf(g_combinedDecompDebug.worldFormula, sizeof(g_combinedDecompDebug.worldFormula), "%s", formula);
+        return true;
+    };
+
+    auto solveView = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasView || !IsViewCandidateForDecomposition(candidate)) return false;
+        *view = candidate;
+        *hasView = true;
+        g_combinedDecompDebug.solvedView = true;
+        snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula), "%s", formula);
+        return true;
+    };
+
+    auto solveProjection = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasProjection || !IsProjectionCandidateForDecomposition(candidate)) return false;
+        *projection = candidate;
+        *hasProjection = true;
+        g_combinedDecompDebug.solvedProjection = true;
+        snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula), "%s", formula);
+        return true;
+    };
+
+    for (int pass = 0; pass < 8 && changed; ++pass) {
         changed = false;
 
-        if (hasMv && !*hasWorld && *hasView) {
-            D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*view, *mv, &solved)) {
-                *world = solved;
-                *hasWorld = true;
-                g_combinedDecompDebug.solvedWorld = true;
-                snprintf(g_combinedDecompDebug.worldFormula, sizeof(g_combinedDecompDebug.worldFormula),
-                         "World = inv(View) * MV");
+        if (!knownHasMv && *hasView && *hasWorld) {
+            knownMv = MultiplyMatrix(*view, *world);
+            knownHasMv = true;
+            changed = true;
+        }
+        if (!knownHasVp && *hasView && *hasProjection) {
+            knownVp = MultiplyMatrix(*view, *projection);
+            knownHasVp = true;
+            changed = true;
+        }
+        if (!knownHasMvp && knownHasMv && *hasProjection) {
+            knownMvp = MultiplyMatrix(knownMv, *projection);
+            knownHasMvp = true;
+            changed = true;
+        }
+        if (!knownHasMvp && knownHasVp && *hasWorld) {
+            knownMvp = MultiplyMatrix(knownVp, *world);
+            knownHasMvp = true;
+            changed = true;
+        }
+
+        if (knownHasMvp && *hasWorld && !knownHasVp) {
+            D3DMATRIX solvedVp = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, *world, &solvedVp)) {
+                knownVp = solvedVp;
+                knownHasVp = true;
                 changed = true;
             }
         }
-        if (hasMv && !*hasView && *hasWorld) {
-            D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*world, *mv, &solved)) {
-                *view = solved;
-                *hasView = true;
-                g_combinedDecompDebug.solvedView = true;
-                snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula),
-                         "View = inv(World) * MV");
+        if (knownHasMvp && *hasProjection && !knownHasMv) {
+            D3DMATRIX solvedMv = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, *projection, &solvedMv)) {
+                knownMv = solvedMv;
+                knownHasMv = true;
                 changed = true;
             }
         }
 
-        if (hasVp && !*hasView && *hasProjection) {
+        if (knownHasMv && !*hasWorld && *hasView) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*projection, *vp, &solved)) {
-                *view = solved;
-                *hasView = true;
-                g_combinedDecompDebug.solvedView = true;
-                snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula),
-                         "View = inv(Projection) * VP");
+            if (TrySolveFromInverseLeftMultiply(*view, knownMv, &solved) &&
+                solveWorld(solved, "World = inv(View) * MV")) {
                 changed = true;
             }
         }
-        if (hasVp && !*hasProjection && *hasView) {
+        if (knownHasMv && !*hasView && *hasWorld) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*view, *vp, &solved)) {
-                *projection = solved;
-                *hasProjection = true;
-                g_combinedDecompDebug.solvedProjection = true;
-                snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula),
-                         "Projection = inv(View) * VP");
+            if (TrySolveFromInverseLeftMultiply(*world, knownMv, &solved) &&
+                solveView(solved, "View = inv(World) * MV")) {
                 changed = true;
             }
         }
 
-        if (hasMvp && hasVp && !*hasWorld) {
+        if (knownHasVp && !*hasView && *hasProjection) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*vp, *mvp, &solved)) {
-                *world = solved;
-                *hasWorld = true;
-                g_combinedDecompDebug.solvedWorld = true;
-                snprintf(g_combinedDecompDebug.worldFormula, sizeof(g_combinedDecompDebug.worldFormula),
-                         "World = inv(VP) * MVP");
+            if (TrySolveFromInverseLeftMultiply(*projection, knownVp, &solved) &&
+                solveView(solved, "View = inv(Projection) * VP")) {
                 changed = true;
             }
         }
-        if (hasMvp && hasMv && !*hasProjection) {
+        if (knownHasVp && !*hasProjection && *hasView) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*mv, *mvp, &solved)) {
-                *projection = solved;
-                *hasProjection = true;
-                g_combinedDecompDebug.solvedProjection = true;
-                snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula),
-                         "Projection = inv(MV) * MVP");
+            if (TrySolveFromInverseLeftMultiply(*view, knownVp, &solved) &&
+                solveProjection(solved, "Projection = inv(View) * VP")) {
                 changed = true;
             }
         }
-        if (hasVp && !*hasProjection && !*hasView && hasGeneratedProjection && g_config.allowGeneratedProjectionForVPDecomposition) {
+
+        if (knownHasMvp && knownHasVp && !*hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(knownVp, knownMvp, &solved) &&
+                solveWorld(solved, "World = inv(VP) * MVP")) {
+                changed = true;
+            }
+        }
+        if (knownHasMvp && knownHasMv && !*hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(knownMv, knownMvp, &solved) &&
+                solveProjection(solved, "Projection = inv(MV) * MVP")) {
+                changed = true;
+            }
+        }
+        if (knownHasVp && !*hasProjection && !*hasView && hasGeneratedProjection && g_config.allowGeneratedProjectionForVPDecomposition) {
             D3DMATRIX solvedView = {};
-            if (TrySolveFromInverseLeftMultiply(*generatedProjection, *vp, &solvedView)) {
+            if (TrySolveFromInverseLeftMultiply(*generatedProjection, knownVp, &solvedView) &&
+                IsProjectionCandidateForDecomposition(*generatedProjection) &&
+                IsViewCandidateForDecomposition(solvedView)) {
                 *projection = *generatedProjection;
                 *hasProjection = true;
                 *view = solvedView;
