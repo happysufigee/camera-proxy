@@ -15,6 +15,8 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <d3dcommon.h>
+#include <d3dcompiler.h>
 #include <winver.h>
 #include <cstdio>
 #include <cmath>
@@ -27,6 +29,12 @@
 #include <limits>
 #include <mutex>
 #include <cassert>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <cctype>
+#include <cstdint>
+#include <cstring>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -83,6 +91,9 @@ struct ProxyConfig {
     int viewMatrixRegister = -1;
     int projMatrixRegister = -1;
     int worldMatrixRegister = -1;
+    int mvpMatrixRegister = -1;
+    int mvMatrixRegister = -1;
+    int vpMatrixRegister = -1;
     bool enableLogging = true;
     float minFOV = 0.1f;
     float maxFOV = 2.5f;
@@ -104,11 +115,9 @@ struct ProxyConfig {
     int hotkeyEmitMatricesVk = VK_F8;
     int hotkeyResetMatrixOverridesVk = VK_F7;
 
-    bool enableCombinedMVP = false;
-    bool combinedMVPRequireWorld = false;
-    bool combinedMVPAssumeIdentityWorld = true;
-    bool combinedMVPForceDecomposition = false;
-    bool combinedMVPLogDecomposition = false;
+    bool enableCombinedDecomposition = true;
+    bool combinedDecompositionLog = false;
+    bool allowGeneratedProjectionForVPDecomposition = false;
 
     bool experimentalCustomProjectionEnabled = false;
     CustomProjectionMode experimentalCustomProjectionMode = CustomProjectionMode_Auto;
@@ -130,24 +139,14 @@ struct ProxyConfig {
     bool experimentalInverseViewAsWorldFast = false;
 };
 
-enum CombinedMVPStrategy {
-    CombinedMVPStrategy_None = 0,
-    CombinedMVPStrategy_WorldAndMVP,
-    CombinedMVPStrategy_MVPOnly,
-    CombinedMVPStrategy_WorldRequiredNoWorld,
-    CombinedMVPStrategy_Disabled,
-    CombinedMVPStrategy_SkippedFullWVP,
-    CombinedMVPStrategy_Failed
-};
-
-static const char* CombinedMVPStrategyLabel(CombinedMVPStrategy strategy);
-
-struct CombinedMVPDebugState {
-    int registerBase = -1;
-    CombinedMVPStrategy strategy = CombinedMVPStrategy_None;
-    bool succeeded = false;
-    float fovRadians = 0.0f;
-    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
+struct CombinedDecompositionDebugState {
+    bool attempted = false;
+    bool solvedWorld = false;
+    bool solvedView = false;
+    bool solvedProjection = false;
+    char worldFormula[160] = {};
+    char viewFormula[160] = {};
+    char projectionFormula[160] = {};
 };
 
 enum GameProfileKind {
@@ -274,7 +273,7 @@ static bool g_projectionDetectedByNumericStructure = false;
 static float g_projectionDetectedFovRadians = 0.0f;
 static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
-static CombinedMVPDebugState g_combinedMvpDebug = {};
+static CombinedDecompositionDebugState g_combinedDecompDebug = {};
 static char g_customProjectionStatus[256] = "";
 static bool g_lastInverseViewAsWorldEligible = false;
 static bool g_lastInverseViewAsWorldApplied = false;
@@ -299,12 +298,18 @@ static bool g_hotkeyWasDown[HotkeyAction_Count] = {};
 static int g_iniViewMatrixRegister = -1;
 static int g_iniProjMatrixRegister = -1;
 static int g_iniWorldMatrixRegister = -1;
+static int g_iniMvpMatrixRegister = -1;
+static int g_iniMvMatrixRegister = -1;
+static int g_iniVpMatrixRegister = -1;
 static char g_iniPath[MAX_PATH] = {};
 
 static constexpr int kMaxConstantRegisters = 256;
+static float g_vsConstants[kMaxConstantRegisters][4] = {};
+static float g_psConstants[kMaxConstantRegisters][4] = {};
 static int g_selectedRegister = -1;
 static uintptr_t g_activeShaderKey = 0;
 static uintptr_t g_selectedShaderKey = 0;
+static uint64_t g_selectedShaderHash = 0;
 
 enum OverrideScopeMode {
     Override_Sticky = 0,
@@ -318,6 +323,372 @@ static bool g_probeInverseView = true;
 static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
 static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
+
+enum ShaderStageType {
+    ShaderStage_Vertex = 0,
+    ShaderStage_Pixel = 1
+};
+
+struct VertexDeclSemanticInfo {
+    bool hasPosition = false;
+    bool hasNormal = false;
+    bool hasTangent = false;
+    bool hasBinormal = false;
+    int texcoordCount = 0;
+};
+
+struct ShaderIrInstruction {
+    std::string opcode;
+    std::string dst;
+    std::vector<std::string> src;
+    int dstWriteMask = 0;
+};
+
+struct ShaderRecord {
+    uintptr_t shaderKey = 0;
+    ShaderStageType stage = ShaderStage_Vertex;
+    std::vector<uint32_t> originalBytecode = {};
+    std::vector<uint32_t> modifiedBytecode = {};
+    uint32_t hash = 0;
+    std::string shaderModel = "unknown";
+    std::vector<ShaderIrInstruction> ir = {};
+    bool isFFPTransform = false;
+    bool isFFPLighting = false;
+    bool usesSkinning = false;
+    bool usesFlowControl = false;
+    bool isRemixSafe = false;
+    int transformConstantBase = -1;
+    int lightingConstantBase = -1;
+    bool constantUsage[kMaxConstantRegisters] = {};
+    unsigned long long usageCount = 0;
+    IUnknown* replacementShader = nullptr;
+    bool replacementEnabled = false;
+    std::string cachedDisassembly = {};
+    std::string editableAssembly = {};
+    std::string replacementStatus = {};
+};
+
+static std::unordered_map<uintptr_t, ShaderRecord> g_shaderRecords = {};
+static std::unordered_map<uint32_t, uintptr_t> g_shaderHashToKey = {};
+static std::vector<ShaderRecord*> g_stableShaderList = {};
+enum ShaderListOrderMode {
+    ShaderListOrder_Insertion = 0,
+    ShaderListOrder_HashAsc = 1
+};
+static int g_shaderListOrderMode = ShaderListOrder_Insertion;
+static uintptr_t g_activeVertexShaderKey = 0;
+static uintptr_t g_activePixelShaderKey = 0;
+static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
+static bool g_forceFfpTransform = false;
+static int g_manualTransformBaseOverride = -1;
+static int g_manualLightingBaseOverride = -1;
+static uintptr_t g_shaderEditorKey = 0;
+static std::vector<char> g_shaderEditorBuffer(65536, 0);
+
+static std::string TrimCopy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+static int ParseWriteMaskBits(const std::string& reg) {
+    size_t dot = reg.find('.');
+    if (dot == std::string::npos || dot + 1 >= reg.size()) return 0xF;
+    int mask = 0;
+    for (size_t i = dot + 1; i < reg.size(); ++i) {
+        if (reg[i] == 'x') mask |= 1;
+        if (reg[i] == 'y') mask |= 2;
+        if (reg[i] == 'z') mask |= 4;
+        if (reg[i] == 'w') mask |= 8;
+    }
+    return mask == 0 ? 0xF : mask;
+}
+
+static bool ExtractConstRegister(const std::string& operand, int* outReg) {
+    if (!outReg) return false;
+    size_t cpos = operand.find('c');
+    if (cpos == std::string::npos || cpos + 1 >= operand.size()) return false;
+    if (!std::isdigit(static_cast<unsigned char>(operand[cpos + 1]))) return false;
+    int v = 0;
+    size_t i = cpos + 1;
+    while (i < operand.size() && std::isdigit(static_cast<unsigned char>(operand[i]))) {
+        v = (v * 10) + (operand[i] - '0');
+        ++i;
+    }
+    *outReg = v;
+    return true;
+}
+
+struct ParsedAsmInstruction {
+    std::string raw;
+    std::string opcode;
+    std::vector<std::string> operands;
+    bool isInstruction = false;
+};
+
+static std::vector<std::string> SplitAsmOperands(const std::string& text) {
+    std::vector<std::string> out;
+    std::string current;
+    int depth = 0;
+    for (char ch : text) {
+        if (ch == '[') ++depth;
+        if (ch == ']') depth = (depth > 0) ? (depth - 1) : 0;
+        if (ch == ',' && depth == 0) {
+            std::string token = TrimCopy(current);
+            if (!token.empty()) out.push_back(token);
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    std::string token = TrimCopy(current);
+    if (!token.empty()) out.push_back(token);
+    return out;
+}
+
+static bool IsOpcodeModifierChar(char c) {
+    return c == '_' || c == 'x' || c == 'y' || c == 'z' || c == 'w' || c == 'p' || c == 's' || c == 't';
+}
+
+static std::string NormalizeOpcodeRoot(const std::string& opcode) {
+    size_t p = opcode.find('_');
+    if (p == std::string::npos) return opcode;
+    if (p + 1 < opcode.size() && std::isdigit(static_cast<unsigned char>(opcode[p + 1]))) {
+        return opcode;
+    }
+    size_t i = p + 1;
+    while (i < opcode.size() && IsOpcodeModifierChar(opcode[i])) ++i;
+    if (i < opcode.size() && opcode[i] == '_') return opcode.substr(0, i);
+    return opcode.substr(0, p);
+}
+
+static ParsedAsmInstruction ParseAsmInstructionLine(const std::string& line) {
+    ParsedAsmInstruction parsed = {};
+    parsed.raw = line;
+    std::string t = TrimCopy(line);
+    if (t.empty() || t[0] == '/' || t[0] == ';') {
+        return parsed;
+    }
+    if (t.size() > 4 && t[0] == '0' && t[1] == 'x') {
+        return parsed;
+    }
+    if ((t.rfind("vs_", 0) == 0 || t.rfind("ps_", 0) == 0) && t.find(' ') == std::string::npos) {
+        return parsed;
+    }
+    size_t sp = t.find(' ');
+    parsed.opcode = NormalizeOpcodeRoot(TrimCopy(sp == std::string::npos ? t : t.substr(0, sp)));
+    std::string rest = sp == std::string::npos ? "" : TrimCopy(t.substr(sp + 1));
+    if (!rest.empty()) {
+        parsed.operands = SplitAsmOperands(rest);
+    }
+    parsed.isInstruction = !parsed.opcode.empty();
+    return parsed;
+}
+
+static HMODULE LoadD3DCompilerModule() {
+    HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+    if (!compiler) compiler = LoadLibraryA("d3dcompiler_43.dll");
+    return compiler;
+}
+
+static bool BuildShaderReplacementFromAssembly(IDirect3DDevice9* device,
+                                               ShaderRecord* rec,
+                                               std::string* outError) {
+    if (!device || !rec) {
+        if (outError) *outError = "Invalid device or shader record.";
+        return false;
+    }
+    if (rec->editableAssembly.empty()) {
+        if (outError) *outError = "Assembly editor is empty.";
+        return false;
+    }
+
+    HMODULE compiler = LoadD3DCompilerModule();
+    if (!compiler) {
+        if (outError) *outError = "d3dcompiler_47.dll / d3dcompiler_43.dll not available.";
+        return false;
+    }
+
+    typedef HRESULT(WINAPI* D3DAssembleFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, UINT, ID3DBlob**, ID3DBlob**);
+    D3DAssembleFn assembleFn = reinterpret_cast<D3DAssembleFn>(GetProcAddress(compiler, "D3DAssemble"));
+    if (!assembleFn) {
+        if (outError) *outError = "D3DAssemble is unavailable in loaded d3dcompiler.";
+        return false;
+    }
+
+    ID3DBlob* assembled = nullptr;
+    ID3DBlob* errors = nullptr;
+    HRESULT asmHr = assembleFn(rec->editableAssembly.c_str(),
+                               rec->editableAssembly.size(),
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               0,
+                               &assembled,
+                               &errors);
+    if (FAILED(asmHr) || !assembled) {
+        if (outError) {
+            if (errors && errors->GetBufferPointer()) {
+                *outError = static_cast<const char*>(errors->GetBufferPointer());
+            } else {
+                char msg[128] = {};
+                snprintf(msg, sizeof(msg), "Assembly failed: HRESULT=0x%08X", static_cast<unsigned int>(asmHr));
+                *outError = msg;
+            }
+        }
+        if (errors) errors->Release();
+        if (assembled) assembled->Release();
+        return false;
+    }
+
+    IUnknown* replacement = nullptr;
+    HRESULT createHr = D3DERR_INVALIDCALL;
+    if (rec->stage == ShaderStage_Vertex) {
+        IDirect3DVertexShader9* shader = nullptr;
+        createHr = device->CreateVertexShader(reinterpret_cast<const DWORD*>(assembled->GetBufferPointer()), &shader);
+        replacement = shader;
+    } else {
+        IDirect3DPixelShader9* shader = nullptr;
+        createHr = device->CreatePixelShader(reinterpret_cast<const DWORD*>(assembled->GetBufferPointer()), &shader);
+        replacement = shader;
+    }
+
+    if (FAILED(createHr) || !replacement) {
+        if (outError) {
+            char msg[128] = {};
+            snprintf(msg, sizeof(msg), "Device shader creation failed: HRESULT=0x%08X", static_cast<unsigned int>(createHr));
+            *outError = msg;
+        }
+        if (errors) errors->Release();
+        assembled->Release();
+        return false;
+    }
+
+    if (rec->replacementShader) {
+        rec->replacementShader->Release();
+        rec->replacementShader = nullptr;
+    }
+    rec->replacementShader = replacement;
+    rec->replacementEnabled = true;
+
+    const size_t dwordCount = assembled->GetBufferSize() / sizeof(uint32_t);
+    rec->modifiedBytecode.assign(reinterpret_cast<const uint32_t*>(assembled->GetBufferPointer()),
+                                 reinterpret_cast<const uint32_t*>(assembled->GetBufferPointer()) + dwordCount);
+
+    if (outError) outError->clear();
+    if (errors) errors->Release();
+    assembled->Release();
+    return true;
+}
+
+static std::string BuildD3DDisassembly(const std::vector<uint32_t>& bytecode) {
+    if (bytecode.empty()) return "";
+    HMODULE compiler = LoadD3DCompilerModule();
+    if (!compiler) return "<d3dcompiler not available>";
+    typedef HRESULT (WINAPI *D3DDisassembleFn)(LPCVOID, SIZE_T, UINT, LPCSTR, ID3DBlob**);
+    D3DDisassembleFn fn = reinterpret_cast<D3DDisassembleFn>(GetProcAddress(compiler, "D3DDisassemble"));
+    if (!fn) return "<D3DDisassemble missing>";
+    ID3DBlob* blob = nullptr;
+    HRESULT hr = fn(bytecode.data(), bytecode.size() * sizeof(uint32_t), 0, nullptr, &blob);
+    if (FAILED(hr) || !blob) return "<D3DDisassemble failed>";
+    std::string text(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
+    blob->Release();
+    return text;
+}
+
+static std::vector<ShaderIrInstruction> BuildIrFromDisassembly(const std::string& disasm) {
+    std::vector<ShaderIrInstruction> ir;
+    std::istringstream in(disasm);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string t = TrimCopy(line);
+        if (t.empty() || t[0] == '/' || t[0] == ';') continue;
+        size_t sp = t.find(' ');
+        ShaderIrInstruction inst;
+        inst.opcode = TrimCopy(sp == std::string::npos ? t : t.substr(0, sp));
+        if (inst.opcode.empty()) continue;
+        std::string rest = sp == std::string::npos ? "" : TrimCopy(t.substr(sp + 1));
+        if (!rest.empty()) {
+            std::vector<std::string> ops;
+            size_t start = 0;
+            while (start < rest.size()) {
+                size_t comma = rest.find(',', start);
+                std::string token = TrimCopy(rest.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+                if (!token.empty()) ops.push_back(token);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            if (!ops.empty()) {
+                inst.dst = ops[0];
+                inst.dstWriteMask = ParseWriteMaskBits(inst.dst);
+                for (size_t i = 1; i < ops.size(); ++i) inst.src.push_back(ops[i]);
+            }
+        }
+        ir.push_back(inst);
+    }
+    return ir;
+}
+
+static void ClassifyShaderRecord(ShaderRecord* rec) {
+    if (!rec) return;
+    rec->isFFPTransform = false;
+    rec->isFFPLighting = false;
+    rec->usesSkinning = false;
+    rec->usesFlowControl = false;
+    rec->transformConstantBase = -1;
+    rec->lightingConstantBase = -1;
+    int minConstReg = kMaxConstantRegisters;
+
+    for (size_t i = 0; i < rec->ir.size(); ++i) {
+        const ShaderIrInstruction& inst = rec->ir[i];
+        if (inst.opcode == "if" || inst.opcode == "loop" || inst.opcode == "rep" || inst.opcode == "call" || inst.opcode == "callnz") {
+            rec->usesFlowControl = true;
+        }
+        if (inst.dst.find("a0") != std::string::npos || (inst.dst.find('[') != std::string::npos && inst.dst.find('c') != std::string::npos)) {
+            rec->usesSkinning = true;
+        }
+        for (const std::string& src : inst.src) {
+            int c = -1;
+            if (ExtractConstRegister(src, &c) && c >= 0 && c < kMaxConstantRegisters) { rec->constantUsage[c] = true; if (c < minConstReg) minConstReg = c; }
+            if (src.find("a0") != std::string::npos || src.find("[a0") != std::string::npos) rec->usesSkinning = true;
+        }
+    }
+
+    for (size_t i = 0; i + 3 < rec->ir.size(); ++i) {
+        const ShaderIrInstruction& a = rec->ir[i + 0];
+        const ShaderIrInstruction& b = rec->ir[i + 1];
+        const ShaderIrInstruction& c = rec->ir[i + 2];
+        const ShaderIrInstruction& d = rec->ir[i + 3];
+        if (a.opcode == "dp4" && b.opcode == "dp4" && c.opcode == "dp4" && d.opcode == "dp4" &&
+            a.dst.find("oPos") != std::string::npos && b.dst.find("oPos") != std::string::npos &&
+            c.dst.find("oPos") != std::string::npos && d.dst.find("oPos") != std::string::npos &&
+            a.src.size() >= 2 && b.src.size() >= 2 && c.src.size() >= 2 && d.src.size() >= 2 &&
+            a.src[0] == b.src[0] && b.src[0] == c.src[0] && c.src[0] == d.src[0]) {
+            int c0 = -1, c1 = -1, c2 = -1, c3 = -1;
+            if (ExtractConstRegister(a.src[1], &c0) && ExtractConstRegister(b.src[1], &c1) &&
+                ExtractConstRegister(c.src[1], &c2) && ExtractConstRegister(d.src[1], &c3) &&
+                c1 == c0 + 1 && c2 == c0 + 2 && c3 == c0 + 3) {
+                rec->isFFPTransform = true;
+                rec->transformConstantBase = c0;
+                break;
+            }
+        }
+    }
+
+    bool sawDot = false, sawMaxZero = false, sawMul = false;
+    for (const ShaderIrInstruction& inst : rec->ir) {
+        sawDot |= (inst.opcode == "dp3" || inst.opcode == "dp4");
+        if (inst.opcode == "max" && inst.src.size() >= 2 && (inst.src[1] == "c0.x" || inst.src[1] == "0")) sawMaxZero = true;
+        sawMul |= (inst.opcode == "mul");
+    }
+    rec->isFFPLighting = sawDot && sawMaxZero && sawMul;
+    if (rec->isFFPLighting && minConstReg < kMaxConstantRegisters) {
+        rec->lightingConstantBase = minConstReg;
+    }
+    rec->isRemixSafe = !rec->usesFlowControl;
+}
 
 static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
     if (!outHash || shaderKey == 0) {
@@ -808,6 +1179,10 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     style.Colors[ImGuiCol_TabActive] = ImVec4(0.48f, 0.18f, 0.18f, 1.00f);
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.18f, 0.10f, 0.10f, 0.97f);
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.33f, 0.14f, 0.14f, 1.00f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.07f, 0.07f, 0.95f);
+    style.Colors[ImGuiCol_Border] = ImVec4(0.56f, 0.22f, 0.22f, 0.68f);
+    style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.75f, 0.25f, 0.25f, 0.45f);
     style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
     style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
     style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
@@ -1054,6 +1429,21 @@ static bool CanAssignManualMatrix(MatrixSlot slot, char* reason, size_t reasonSi
                  "Manual WORLD assignment blocked: WorldMatrixRegister is configured in camera_proxy.ini.");
         return false;
     }
+    if (slot == MatrixSlot_MVP && g_iniMvpMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual MVP assignment blocked: MVPMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    if (slot == MatrixSlot_WV && g_iniMvMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual MV assignment blocked: MVMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    if (slot == MatrixSlot_VP && g_iniVpMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual VP assignment blocked: VPMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
     return true;
 }
 
@@ -1064,7 +1454,7 @@ static const char* MatrixSlotLabel(MatrixSlot slot) {
         case MatrixSlot_Projection: return "PROJECTION";
         case MatrixSlot_MVP: return "MVP";
         case MatrixSlot_VP: return "VP";
-        case MatrixSlot_WV: return "WV";
+        case MatrixSlot_WV: return "MV";
         default: return "UNKNOWN";
     }
 }
@@ -1101,12 +1491,18 @@ static void ResetMatrixRegisterOverridesToAuto() {
     g_config.worldMatrixRegister = -1;
     g_config.viewMatrixRegister = -1;
     g_config.projMatrixRegister = -1;
+    g_config.mvpMatrixRegister = -1;
+    g_config.mvMatrixRegister = -1;
+    g_config.vpMatrixRegister = -1;
     memset(g_manualBindings, 0, sizeof(g_manualBindings));
 
     bool savedWorld = SaveConfigRegisterValue("WorldMatrixRegister", -1);
     bool savedView = SaveConfigRegisterValue("ViewMatrixRegister", -1);
     bool savedProj = SaveConfigRegisterValue("ProjMatrixRegister", -1);
-    bool savedAll = savedWorld && savedView && savedProj;
+    bool savedMvp = SaveConfigRegisterValue("MVPMatrixRegister", -1);
+    bool savedMv = SaveConfigRegisterValue("MVMatrixRegister", -1);
+    bool savedVp = SaveConfigRegisterValue("VPMatrixRegister", -1);
+    bool savedAll = savedWorld && savedView && savedProj && savedMvp && savedMv && savedVp;
     if (g_config.autoDetectMatrices) {
         snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                  "Cleared matrix register overrides. Falling back to deterministic auto-detect (AutoDetectMatrices=1).%s",
@@ -1142,6 +1538,15 @@ static void PinRegisterFromSource(MatrixSlot slot) {
     } else if (slot == MatrixSlot_World) {
         key = "WorldMatrixRegister";
         target = &g_config.worldMatrixRegister;
+    } else if (slot == MatrixSlot_MVP) {
+        key = "MVPMatrixRegister";
+        target = &g_config.mvpMatrixRegister;
+    } else if (slot == MatrixSlot_WV) {
+        key = "MVMatrixRegister";
+        target = &g_config.mvMatrixRegister;
+    } else if (slot == MatrixSlot_VP) {
+        key = "VPMatrixRegister";
+        target = &g_config.vpMatrixRegister;
     }
 
     if (!key || !target) {
@@ -1249,6 +1654,74 @@ static void OnVertexShaderReleased(uintptr_t shaderKey) {
     auto it = std::find(g_shaderOrder.begin(), g_shaderOrder.end(), shaderKey);
     if (it != g_shaderOrder.end()) {
         g_shaderOrder.erase(it);
+    }
+    auto recIt = g_shaderRecords.find(shaderKey);
+    ShaderRecord* removedRecordPtr = nullptr;
+    if (recIt != g_shaderRecords.end()) {
+        removedRecordPtr = &recIt->second;
+        if (g_selectedShaderHash == static_cast<uint64_t>(recIt->second.hash)) {
+            g_selectedShaderHash = 0;
+        }
+        if (recIt->second.replacementShader) {
+            recIt->second.replacementShader->Release();
+            recIt->second.replacementShader = nullptr;
+        }
+        g_shaderHashToKey.erase(recIt->second.hash);
+        g_shaderRecords.erase(recIt);
+    }
+    auto listIt = std::find(g_stableShaderList.begin(), g_stableShaderList.end(), removedRecordPtr);
+    if (listIt != g_stableShaderList.end()) {
+        g_stableShaderList.erase(listIt);
+    }
+}
+
+static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, const std::vector<uint32_t>& tokens) {
+    if (shaderKey == 0 || tokens.empty()) return;
+    if (g_shaderRecords.empty()) {
+        g_shaderRecords.reserve(1024);
+        g_shaderHashToKey.reserve(1024);
+        g_shaderBytecodeHashes.reserve(1024);
+        g_stableShaderList.reserve(1024);
+    }
+    auto existing = g_shaderRecords.find(shaderKey);
+    if (existing != g_shaderRecords.end()) {
+        return;
+    }
+    ShaderRecord rec = {};
+    rec.shaderKey = shaderKey;
+    rec.stage = stage;
+    rec.originalBytecode = tokens;
+    rec.hash = HashBytesFNV1a(reinterpret_cast<const uint8_t*>(tokens.data()), tokens.size() * sizeof(uint32_t));
+    uint32_t version = tokens[0];
+    char profile[32] = {};
+    const UINT major = (version >> 8) & 0xFF;
+    const UINT minor = version & 0xFF;
+    snprintf(profile, sizeof(profile), "%s_%u_%u", stage == ShaderStage_Vertex ? "vs" : "ps", major, minor);
+    rec.shaderModel = profile;
+    rec.cachedDisassembly = BuildD3DDisassembly(tokens);
+    {
+        std::istringstream disIn(rec.cachedDisassembly);
+        std::string disLine;
+        while (std::getline(disIn, disLine)) {
+            std::string trimmed = TrimCopy(disLine);
+            if (trimmed.empty() || trimmed[0] == '/' || trimmed[0] == ';') {
+                continue;
+            }
+            if (trimmed.rfind("vs_", 0) == 0 || trimmed.rfind("ps_", 0) == 0) {
+                rec.shaderModel = trimmed;
+            }
+            break;
+        }
+    }
+    rec.ir = BuildIrFromDisassembly(rec.cachedDisassembly);
+    rec.editableAssembly = rec.cachedDisassembly;
+    ClassifyShaderRecord(&rec);
+    g_shaderBytecodeHashes[shaderKey] = rec.hash;
+    g_shaderHashToKey[rec.hash] = shaderKey;
+    auto inserted = g_shaderRecords.emplace(shaderKey, std::move(rec));
+    g_stableShaderList.push_back(&inserted.first->second);
+    if (g_selectedShaderHash == 0) {
+        g_selectedShaderHash = static_cast<uint64_t>(inserted.first->second.hash);
     }
 }
 
@@ -1964,7 +2437,7 @@ static void UpdateFrameTimeStats() {
     g_frameTimeSamples++;
 }
 
-static void RenderImGuiOverlay() {
+static void RenderImGuiOverlay(IDirect3DDevice9* device) {
     EnsureWndProcHookInstalled();
 
     if (!g_imguiInitialized || !g_showImGui) {
@@ -2290,37 +2763,28 @@ static void RenderImGuiOverlay() {
             DrawMatrixWithTranspose("VP", camSnapshot.vp, camSnapshot.hasVP,
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_VP, camSnapshot.hasVP);
-            DrawMatrixWithTranspose("WV", camSnapshot.wv, camSnapshot.hasWV,
+            DrawMatrixWithTranspose("MV", camSnapshot.wv, camSnapshot.hasWV,
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_WV, camSnapshot.hasWV);
 
-            if (ImGui::CollapsingHeader("Combined MVP handling", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::Checkbox("Enable Combined MVP", &g_config.enableCombinedMVP)) {
-                    SaveConfigBoolValue("EnableCombinedMVP", g_config.enableCombinedMVP);
+            if (ImGui::CollapsingHeader("Combined matrix decomposition", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::Checkbox("Enable deterministic decomposition", &g_config.enableCombinedDecomposition)) {
+                    SaveConfigBoolValue("EnableCombinedDecomposition", g_config.enableCombinedDecomposition);
                 }
-                if (ImGui::Checkbox("Require World", &g_config.combinedMVPRequireWorld)) {
-                    SaveConfigBoolValue("CombinedMVPRequireWorld", g_config.combinedMVPRequireWorld);
+                if (ImGui::Checkbox("Log decomposition", &g_config.combinedDecompositionLog)) {
+                    SaveConfigBoolValue("CombinedDecompositionLog", g_config.combinedDecompositionLog);
                 }
-                if (ImGui::Checkbox("Assume Identity World", &g_config.combinedMVPAssumeIdentityWorld)) {
-                    SaveConfigBoolValue("CombinedMVPAssumeIdentityWorld", g_config.combinedMVPAssumeIdentityWorld);
+                if (ImGui::Checkbox("Allow generated/manual projection for VP decomposition", &g_config.allowGeneratedProjectionForVPDecomposition)) {
+                    SaveConfigBoolValue("AllowGeneratedProjectionForVPDecomposition", g_config.allowGeneratedProjectionForVPDecomposition);
                 }
-                if (ImGui::Checkbox("Force Decomposition", &g_config.combinedMVPForceDecomposition)) {
-                    SaveConfigBoolValue("CombinedMVPForceDecomposition", g_config.combinedMVPForceDecomposition);
-                }
-                if (ImGui::Checkbox("Log Decomposition", &g_config.combinedMVPLogDecomposition)) {
-                    SaveConfigBoolValue("CombinedMVPLogDecomposition", g_config.combinedMVPLogDecomposition);
-                }
-
-                ImGui::Separator();
-                ImGui::Text("Current MVP register: %s", g_combinedMvpDebug.registerBase >= 0 ? "captured" : "n/a");
-                if (g_combinedMvpDebug.registerBase >= 0) {
-                    ImGui::SameLine();
-                    ImGui::Text("(c%d)", g_combinedMvpDebug.registerBase);
-                }
-                ImGui::Text("Strategy selected: %s", CombinedMVPStrategyLabel(g_combinedMvpDebug.strategy));
-                ImGui::Text("Decomposition succeeded: %s", g_combinedMvpDebug.succeeded ? "yes" : "no");
-                ImGui::Text("Extracted FOV: %.2f deg", g_combinedMvpDebug.fovRadians * 180.0f / 3.14159265f);
-                ImGui::Text("Handedness: %s", ProjectionHandednessLabel(g_combinedMvpDebug.handedness));
+                ImGui::TextWrapped("Formulas: inv(View)*MV=World, inv(World)*MV=View, inv(Projection)*VP=View, inv(View)*VP=Projection, inv(VP)*MVP=World, inv(MV)*MVP=Projection.");
+                ImGui::Text("Decomposition attempted: %s", g_combinedDecompDebug.attempted ? "yes" : "no");
+                ImGui::Text("Solved World: %s", g_combinedDecompDebug.solvedWorld ? "yes" : "no");
+                if (g_combinedDecompDebug.worldFormula[0] != '\0') ImGui::TextWrapped("  %s", g_combinedDecompDebug.worldFormula);
+                ImGui::Text("Solved View: %s", g_combinedDecompDebug.solvedView ? "yes" : "no");
+                if (g_combinedDecompDebug.viewFormula[0] != '\0') ImGui::TextWrapped("  %s", g_combinedDecompDebug.viewFormula);
+                ImGui::Text("Solved Projection: %s", g_combinedDecompDebug.solvedProjection ? "yes" : "no");
+                if (g_combinedDecompDebug.projectionFormula[0] != '\0') ImGui::TextWrapped("  %s", g_combinedDecompDebug.projectionFormula);
             }
 
             ImGui::Separator();
@@ -2337,16 +2801,224 @@ static void RenderImGuiOverlay() {
             if (ImGui::Button("Pin Projection register")) {
                 PinRegisterFromSource(MatrixSlot_Projection);
             }
+            if (ImGui::Button("Pin MVP register")) {
+                PinRegisterFromSource(MatrixSlot_MVP);
+            }
             ImGui::SameLine();
+            if (ImGui::Button("Pin MV register")) {
+                PinRegisterFromSource(MatrixSlot_WV);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pin VP register")) {
+                PinRegisterFromSource(MatrixSlot_VP);
+            }
             if (ImGui::Button("Reset register overrides to auto")) {
                 ResetMatrixRegisterOverridesToAuto();
             }
-            ImGui::Text("Pinned registers: World=c%d View=c%d Projection=c%d",
+            ImGui::Text("Pinned registers: World=c%d View=c%d Projection=c%d MVP=c%d MV=c%d VP=c%d",
                         g_config.worldMatrixRegister, g_config.viewMatrixRegister,
-                        g_config.projMatrixRegister);
+                        g_config.projMatrixRegister, g_config.mvpMatrixRegister,
+                        g_config.mvMatrixRegister, g_config.vpMatrixRegister);
             if (g_matrixAssignStatus[0] != '\0') {
                 ImGui::TextWrapped("%s", g_matrixAssignStatus);
             }
+            ImGui::EndTabItem();
+        }
+
+        if (ImGui::BeginTabItem("Shader")) {
+            static char shaderFilter[64] = "";
+            static const char* kShaderListOrderModes[] = {"Insertion order", "Hash (ascending)"};
+            ImGui::InputText("Filter", shaderFilter, sizeof(shaderFilter));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::Combo("Order", &g_shaderListOrderMode, kShaderListOrderModes, IM_ARRAYSIZE(kShaderListOrderModes));
+
+            std::vector<ShaderRecord*> shaderSnapshot = g_stableShaderList;
+            if (g_shaderListOrderMode == ShaderListOrder_HashAsc) {
+                std::sort(shaderSnapshot.begin(), shaderSnapshot.end(), [](const ShaderRecord* a, const ShaderRecord* b) {
+                    if (!a || !b) return a < b;
+                    if (a->hash != b->hash) return a->hash < b->hash;
+                    return a->shaderKey < b->shaderKey;
+                });
+            }
+
+            auto selectedByKeyIt = g_shaderRecords.find(g_selectedShaderKey);
+            if (selectedByKeyIt != g_shaderRecords.end()) {
+                g_selectedShaderHash = static_cast<uint64_t>(selectedByKeyIt->second.hash);
+            } else if (g_selectedShaderHash != 0) {
+                auto selectedIt = g_shaderHashToKey.find(static_cast<uint32_t>(g_selectedShaderHash));
+                if (selectedIt != g_shaderHashToKey.end()) g_selectedShaderKey = selectedIt->second;
+            }
+            if (g_selectedShaderHash == 0 && !shaderSnapshot.empty() && shaderSnapshot.front()) {
+                g_selectedShaderHash = static_cast<uint64_t>(shaderSnapshot.front()->hash);
+                g_selectedShaderKey = shaderSnapshot.front()->shaderKey;
+            }
+
+            ImGui::Columns(3, "ShaderCols", true);
+            ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
+            for (ShaderRecord* recPtr : shaderSnapshot) {
+                if (!recPtr) continue;
+                ShaderRecord& rec = *recPtr;
+                const uintptr_t shaderKey = rec.shaderKey;
+                char visibleLabel[256];
+                snprintf(visibleLabel, sizeof(visibleLabel), "0x%08X %s %s inst:%d use:%llu%s", rec.hash,
+                         rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
+                         static_cast<int>(rec.ir.size()), rec.usageCount,
+                         (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
+                if (shaderFilter[0] && strstr(visibleLabel, shaderFilter) == nullptr) continue;
+                bool selected = (shaderKey == g_selectedShaderKey);
+                char selectableLabel[320];
+                snprintf(selectableLabel, sizeof(selectableLabel), "%s###shader_row_%p", visibleLabel,
+                         reinterpret_cast<void*>(shaderKey));
+                if (ImGui::Selectable(selectableLabel, selected)) {
+                    g_selectedShaderHash = static_cast<uint64_t>(rec.hash);
+                    g_selectedShaderKey = shaderKey;
+                    g_selectedRegister = -1;
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::NextColumn();
+            ImGui::BeginChild("ShaderInspect", ImVec2(0, 420), true);
+            auto it = g_shaderRecords.find(g_selectedShaderKey);
+            if (it != g_shaderRecords.end() && static_cast<uint64_t>(it->second.hash) == g_selectedShaderHash) {
+                ShaderRecord& rec = it->second;
+                ImGui::Text("Hash: 0x%08X", rec.hash);
+                ImGui::Text("Type: %s", rec.stage == ShaderStage_Vertex ? "VS" : "PS");
+                ImGui::Text("Model: %s", rec.shaderModel.c_str());
+
+                bool replacementEnabled = rec.replacementEnabled && rec.replacementShader != nullptr;
+                if (ImGui::Checkbox("Enable replacement", &replacementEnabled)) {
+                    rec.replacementEnabled = replacementEnabled && rec.replacementShader != nullptr;
+                    if (replacementEnabled && !rec.replacementShader) {
+                        rec.replacementStatus = "No replacement object yet. Use Replace shader first.";
+                    }
+                }
+
+                if (ImGui::Button("Dump assembly")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", rec.hash);
+                    std::ofstream(path) << rec.editableAssembly;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Dump bytecode")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", rec.hash);
+                    std::ofstream f(path, std::ios::binary);
+                    const std::vector<uint32_t>& data = rec.replacementEnabled && !rec.modifiedBytecode.empty()
+                                                         ? rec.modifiedBytecode : rec.originalBytecode;
+                    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint32_t));
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Assembly editor");
+                if (g_shaderEditorKey != rec.shaderKey) {
+                    g_shaderEditorKey = rec.shaderKey;
+                    memset(g_shaderEditorBuffer.data(), 0, g_shaderEditorBuffer.size());
+                    strncpy_s(g_shaderEditorBuffer.data(), g_shaderEditorBuffer.size(), rec.editableAssembly.c_str(), _TRUNCATE);
+                }
+                ImGuiInputTextFlags flags = ImGuiInputTextFlags_AllowTabInput;
+                if (ImGui::InputTextMultiline("##ShaderAssemblyEditor", g_shaderEditorBuffer.data(), g_shaderEditorBuffer.size(), ImVec2(-1, 180), flags)) {
+                    rec.editableAssembly = g_shaderEditorBuffer.data();
+                }
+                if (ImGui::Button("Replace shader")) {
+                    rec.editableAssembly = g_shaderEditorBuffer.data();
+                    std::string err;
+                    if (BuildShaderReplacementFromAssembly(device, &rec, &err)) {
+                        rec.replacementEnabled = true;
+                        rec.replacementStatus = "Replacement shader created and active for runtime binding.";
+                    } else {
+                        rec.replacementStatus = err.empty() ? "Failed to build replacement shader." : err;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset assembly")) {
+                    rec.editableAssembly = rec.cachedDisassembly;
+                    g_shaderEditorKey = 0;
+                    rec.modifiedBytecode.clear();
+                    rec.replacementEnabled = false;
+                    if (rec.replacementShader) {
+                        rec.replacementShader->Release();
+                        rec.replacementShader = nullptr;
+                    }
+                    rec.replacementStatus = "Assembly reset to original and replacement shader released.";
+                }
+                if (!rec.replacementStatus.empty()) {
+                    ImGui::TextWrapped("%s", rec.replacementStatus.c_str());
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::NextColumn();
+            ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            auto ai = g_shaderRecords.find(g_selectedShaderKey);
+            if (ai != g_shaderRecords.end() && static_cast<uint64_t>(ai->second.hash) == g_selectedShaderHash) {
+                ShaderRecord& rec = ai->second;
+                int usedMin = -1;
+                int usedMax = -1;
+                for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
+                    if (!rec.constantUsage[reg]) continue;
+                    if (usedMin < 0) usedMin = reg;
+                    usedMax = reg;
+                }
+
+                const int effectiveTransformBase = g_manualTransformBaseOverride >= 0 ? g_manualTransformBaseOverride : rec.transformConstantBase;
+                const int effectiveLightingBase = g_manualLightingBaseOverride >= 0 ? g_manualLightingBaseOverride : rec.lightingConstantBase;
+                ImGui::Text("Transform: %s", rec.isFFPTransform ? "Yes" : "No");
+                ImGui::Text("Transform base: c%d", effectiveTransformBase);
+                ImGui::Text("Lighting: %s", rec.isFFPLighting ? "Yes" : "No");
+                ImGui::Text("Skinning: %s", rec.usesSkinning ? "Yes" : "No");
+                ImGui::Text("Flow control: %s", rec.usesFlowControl ? "Yes" : "No");
+                ImGui::Text("Remix safe: %s", rec.isRemixSafe ? "Yes" : "No");
+                ImGui::Text("Lighting base: c%d", effectiveLightingBase);
+
+                ImGui::Separator();
+                ImGui::Text("Vertex input");
+                ImGui::Text("POSITION: %s", g_activeVertexDeclInfo.hasPosition ? "Yes" : "No");
+                ImGui::Text("NORMAL: %s", g_activeVertexDeclInfo.hasNormal ? "Yes" : "No");
+                ImGui::Text("TEXCOORDS: %d", g_activeVertexDeclInfo.texcoordCount);
+                ImGui::Text("TANGENT: %s", g_activeVertexDeclInfo.hasTangent ? "Yes" : "No");
+                ImGui::Text("BINORMAL: %s", g_activeVertexDeclInfo.hasBinormal ? "Yes" : "No");
+
+                ImGui::Separator();
+                ImGui::Text("Used const range: %s", usedMin >= 0 ? "captured" : "none");
+                if (usedMin >= 0) {
+                    ImGui::SameLine();
+                    ImGui::Text("(c%d-c%d)", usedMin, usedMax);
+                }
+                if (ImGui::Button("Jump to transform register") && effectiveTransformBase >= 0) {
+                    g_selectedRegister = effectiveTransformBase;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Jump to lighting register") && effectiveLightingBase >= 0) {
+                    g_selectedRegister = effectiveLightingBase;
+                }
+                ImGui::Separator();
+                ImGui::Checkbox("Force FFP transform emission", &g_forceFfpTransform);
+                ImGui::InputInt("Manual transform base", &g_manualTransformBaseOverride);
+                ImGui::InputInt("Manual lighting base", &g_manualLightingBaseOverride);
+
+                ImGui::Separator();
+                ImGui::Text("Constant monitor (selected shader)");
+                ImGui::BeginChild("ShaderConstRange", ImVec2(-1, 145), true);
+                for (int reg = usedMin; reg >= 0 && reg <= usedMax; ++reg) {
+                    if (!rec.constantUsage[reg]) continue;
+                    bool isTransformReg = effectiveTransformBase >= 0 && reg >= effectiveTransformBase && reg < (effectiveTransformBase + 4);
+                    bool isLightingReg = (reg == effectiveLightingBase && effectiveLightingBase >= 0);
+                    if (isTransformReg) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.40f, 0.40f, 1.00f));
+                    } else if (isLightingReg) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.72f, 0.42f, 1.00f));
+                    }
+                    if (ImGui::Selectable((std::string("c") + std::to_string(reg)).c_str(), g_selectedRegister == reg)) {
+                        g_selectedRegister = reg;
+                    }
+                    if (isTransformReg || isLightingReg) ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndChild();
+            ImGui::Columns(1);
             ImGui::EndTabItem();
         }
 
@@ -2966,20 +3638,6 @@ static const char* ProjectionHandednessLabel(ProjectionHandedness handedness) {
     }
 }
 
-static const char* CombinedMVPStrategyLabel(CombinedMVPStrategy strategy) {
-    switch (strategy) {
-        case CombinedMVPStrategy_WorldAndMVP: return "Strategy 1 (World + MVP)";
-        case CombinedMVPStrategy_MVPOnly: return "Strategy 2 (MVP only)";
-        case CombinedMVPStrategy_WorldRequiredNoWorld: return "Strategy 3 (world required, missing)";
-        case CombinedMVPStrategy_Disabled: return "Disabled";
-        case CombinedMVPStrategy_SkippedFullWVP: return "Skipped (full W/V/P already present)";
-        case CombinedMVPStrategy_Failed: return "Failed";
-        case CombinedMVPStrategy_None:
-        default:
-            return "None";
-    }
-}
-
 static bool HasPerspectiveComponent(const D3DMATRIX& m) {
     return fabsf(m._34) > 0.5f && fabsf(m._44) < 0.5f;
 }
@@ -3429,117 +4087,242 @@ static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
     view->_44 = 1.0f;
 }
 
+
 static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
                                              const D3DMATRIX* worldOptional,
                                              bool worldAvailable,
                                              ProjectionAnalysis* outAnalysis,
                                              D3DMATRIX* outProjection,
-                                             bool forceDecomposition) {
-    if (!outProjection) {
-        return false;
-    }
-
-    D3DMATRIX extractionMatrix = combined;
+                                             bool /*forceDecomposition*/) {
+    if (!outProjection) return false;
+    D3DMATRIX candidate = combined;
     if (worldAvailable && worldOptional) {
         D3DMATRIX worldInv = {};
-        if (!InvertMatrix4x4Deterministic(*worldOptional, &worldInv, nullptr)) {
-            return false;
-        }
-        extractionMatrix = MultiplyMatrix(worldInv, combined);
-    } else if (!IsTypicalProjectionMatrix(combined)) {
+        if (!InvertMatrix4x4Deterministic(*worldOptional, &worldInv, nullptr)) return false;
+        candidate = MultiplyMatrix(worldInv, combined);
+    }
+    if (!AnalyzeProjectionMatrixNumeric(candidate, outAnalysis)) return false;
+    *outProjection = candidate;
+    return true;
+}
+
+static bool TrySolveFromInverseLeftMultiply(const D3DMATRIX& known,
+                                          const D3DMATRIX& combined,
+                                          D3DMATRIX* out) {
+    if (!out) return false;
+    D3DMATRIX inv = {};
+    if (!InvertMatrix4x4Deterministic(known, &inv, nullptr)) {
         return false;
     }
+    *out = MultiplyMatrix(inv, combined);
+    return true;
+}
 
-    if (!IsTypicalProjectionMatrix(extractionMatrix)) {
+static bool TrySolveFromInverseRightMultiply(const D3DMATRIX& combined,
+                                             const D3DMATRIX& knownRight,
+                                             D3DMATRIX* out) {
+    if (!out) return false;
+    D3DMATRIX inv = {};
+    if (!InvertMatrix4x4Deterministic(knownRight, &inv, nullptr)) {
         return false;
     }
+    *out = MultiplyMatrix(combined, inv);
+    return true;
+}
 
-    const float sx = sqrtf(Dot3(extractionMatrix._11, extractionMatrix._12, extractionMatrix._13,
-                                extractionMatrix._11, extractionMatrix._12, extractionMatrix._13));
-    const float sy = sqrtf(Dot3(extractionMatrix._21, extractionMatrix._22, extractionMatrix._23,
-                                extractionMatrix._21, extractionMatrix._22, extractionMatrix._23));
-    if (!std::isfinite(sx) || !std::isfinite(sy) || sx < 1e-5f || sy < 1e-5f) {
-        return false;
-    }
-
-    const float fov = 2.0f * atanf(1.0f / sy);
-    const float aspect = sy / sx;
-    if (!forceDecomposition) {
-        if (!std::isfinite(fov) || fov < 0.01f || fov > 3.13f) {
-            return false;
-        }
-    }
-
-    const float det = Determinant3x3(extractionMatrix);
-    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
-    if (std::isfinite(det)) {
-        handedness = (det < 0.0f) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
-    }
-
-    const float nearZ = (std::max)(0.0001f, g_config.experimentalCustomProjectionAutoNearZ);
-    const float farZ = (std::max)(nearZ + 0.001f, g_config.experimentalCustomProjectionAutoFarZ);
-    CreateProjectionMatrixWithHandedness(outProjection,
-                                         fov,
-                                         (std::max)(0.1f, aspect),
-                                         nearZ,
-                                         farZ,
-                                         handedness);
-
-    if (outAnalysis) {
-        outAnalysis->valid = true;
-        outAnalysis->fovRadians = fov;
-        outAnalysis->handedness = handedness;
+static bool IsFiniteMatrix(const D3DMATRIX& m) {
+    const float* v = reinterpret_cast<const float*>(&m);
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(v[i])) return false;
     }
     return true;
 }
 
-static bool TryDecomposeCombinedMVP(const D3DMATRIX& mvp,
-                                    const D3DMATRIX* worldOptional,
-                                    bool worldAvailable,
-                                    D3DMATRIX* outWorld,
-                                    D3DMATRIX* outView,
-                                    D3DMATRIX* outProjection,
-                                    ProjectionAnalysis* outProjectionAnalysis) {
-    if (!outWorld || !outView || !outProjection) {
-        return false;
+static bool IsWorldCandidateForDecomposition(const D3DMATRIX& m) {
+    if (!IsFiniteMatrix(m) || !IsAffineMatrixNoPerspective(m)) return false;
+    const float det = Determinant3x3(m);
+    return std::isfinite(det) && fabsf(det) > 0.0001f;
+}
+
+static bool IsViewCandidateForDecomposition(const D3DMATRIX& m) {
+    return IsFiniteMatrix(m) && LooksLikeViewStrict(m);
+}
+
+static bool IsProjectionCandidateForDecomposition(const D3DMATRIX& m) {
+    return IsFiniteMatrix(m) && LooksLikeProjectionStrict(m);
+}
+
+static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
+                                                      bool* hasWorld,
+                                                      D3DMATRIX* view,
+                                                      bool* hasView,
+                                                      D3DMATRIX* projection,
+                                                      bool* hasProjection,
+                                                      const D3DMATRIX* mvp,
+                                                      bool hasMvp,
+                                                      const D3DMATRIX* mv,
+                                                      bool hasMv,
+                                                      const D3DMATRIX* vp,
+                                                      bool hasVp,
+                                                      const D3DMATRIX* generatedProjection,
+                                                      bool hasGeneratedProjection) {
+    if (!world || !hasWorld || !view || !hasView || !projection || !hasProjection) return;
+
+    g_combinedDecompDebug = {};
+    g_combinedDecompDebug.attempted = hasMvp || hasMv || hasVp;
+    if (!g_config.enableCombinedDecomposition || !g_combinedDecompDebug.attempted) {
+        return;
     }
 
-    D3DMATRIX world = {};
-    D3DMATRIX viewProjection = {};
+    bool changed = true;
+    D3DMATRIX knownMvp = {};
+    D3DMATRIX knownMv = {};
+    D3DMATRIX knownVp = {};
+    bool knownHasMvp = hasMvp;
+    bool knownHasMv = hasMv;
+    bool knownHasVp = hasVp;
+    if (knownHasMvp && mvp) knownMvp = *mvp;
+    if (knownHasMv && mv) knownMv = *mv;
+    if (knownHasVp && vp) knownVp = *vp;
 
-    if (worldAvailable && worldOptional) {
-        world = *worldOptional;
-        D3DMATRIX worldInv = {};
-        if (!InvertMatrix4x4Deterministic(world, &worldInv, nullptr)) {
-            return false;
+    auto solveWorld = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasWorld || !IsWorldCandidateForDecomposition(candidate)) return false;
+        *world = candidate;
+        *hasWorld = true;
+        g_combinedDecompDebug.solvedWorld = true;
+        snprintf(g_combinedDecompDebug.worldFormula, sizeof(g_combinedDecompDebug.worldFormula), "%s", formula);
+        return true;
+    };
+
+    auto solveView = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasView || !IsViewCandidateForDecomposition(candidate)) return false;
+        *view = candidate;
+        *hasView = true;
+        g_combinedDecompDebug.solvedView = true;
+        snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula), "%s", formula);
+        return true;
+    };
+
+    auto solveProjection = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasProjection || !IsProjectionCandidateForDecomposition(candidate)) return false;
+        *projection = candidate;
+        *hasProjection = true;
+        g_combinedDecompDebug.solvedProjection = true;
+        snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula), "%s", formula);
+        return true;
+    };
+
+    for (int pass = 0; pass < 8 && changed; ++pass) {
+        changed = false;
+
+        if (!knownHasMv && *hasView && *hasWorld) {
+            knownMv = MultiplyMatrix(*view, *world);
+            knownHasMv = true;
+            changed = true;
         }
-        viewProjection = MultiplyMatrix(mvp, worldInv);
-    } else {
-        CreateIdentityMatrix(&world);
-        viewProjection = mvp;
+        if (!knownHasVp && *hasView && *hasProjection) {
+            knownVp = MultiplyMatrix(*view, *projection);
+            knownHasVp = true;
+            changed = true;
+        }
+        if (!knownHasMvp && knownHasMv && *hasProjection) {
+            knownMvp = MultiplyMatrix(knownMv, *projection);
+            knownHasMvp = true;
+            changed = true;
+        }
+        if (!knownHasMvp && knownHasVp && *hasWorld) {
+            knownMvp = MultiplyMatrix(knownVp, *world);
+            knownHasMvp = true;
+            changed = true;
+        }
+
+        if (knownHasMvp && *hasWorld && !knownHasVp) {
+            D3DMATRIX solvedVp = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, *world, &solvedVp)) {
+                knownVp = solvedVp;
+                knownHasVp = true;
+                changed = true;
+            }
+        }
+        if (knownHasMvp && *hasProjection && !knownHasMv) {
+            D3DMATRIX solvedMv = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, *projection, &solvedMv)) {
+                knownMv = solvedMv;
+                knownHasMv = true;
+                changed = true;
+            }
+        }
+
+        if (knownHasMv && !*hasWorld && *hasView) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*view, knownMv, &solved) &&
+                solveWorld(solved, "World = inv(View) * MV")) {
+                changed = true;
+            }
+        }
+        if (knownHasMv && !*hasView && *hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*world, knownMv, &solved) &&
+                solveView(solved, "View = inv(World) * MV")) {
+                changed = true;
+            }
+        }
+
+        if (knownHasVp && !*hasView && *hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*projection, knownVp, &solved) &&
+                solveView(solved, "View = inv(Projection) * VP")) {
+                changed = true;
+            }
+        }
+        if (knownHasVp && !*hasProjection && *hasView) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*view, knownVp, &solved) &&
+                solveProjection(solved, "Projection = inv(View) * VP")) {
+                changed = true;
+            }
+        }
+
+        if (knownHasMvp && knownHasVp && !*hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(knownVp, knownMvp, &solved) &&
+                solveWorld(solved, "World = inv(VP) * MVP")) {
+                changed = true;
+            }
+        }
+        if (knownHasMvp && knownHasMv && !*hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(knownMv, knownMvp, &solved) &&
+                solveProjection(solved, "Projection = inv(MV) * MVP")) {
+                changed = true;
+            }
+        }
+        if (knownHasVp && !*hasProjection && !*hasView && hasGeneratedProjection && g_config.allowGeneratedProjectionForVPDecomposition) {
+            D3DMATRIX solvedView = {};
+            if (TrySolveFromInverseLeftMultiply(*generatedProjection, knownVp, &solvedView) &&
+                IsProjectionCandidateForDecomposition(*generatedProjection) &&
+                IsViewCandidateForDecomposition(solvedView)) {
+                *projection = *generatedProjection;
+                *hasProjection = true;
+                *view = solvedView;
+                *hasView = true;
+                g_combinedDecompDebug.solvedProjection = true;
+                g_combinedDecompDebug.solvedView = true;
+                snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula),
+                         "Projection = Generated manual/auto matrix (config-enabled)");
+                snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula),
+                         "View = inv(GeneratedProjection) * VP");
+                changed = true;
+            }
+        }
     }
 
-    ProjectionAnalysis analysis = {};
-    D3DMATRIX projection = {};
-    if (!TryExtractProjectionFromCombined(viewProjection, worldOptional, worldAvailable, &analysis, &projection, g_config.combinedMVPForceDecomposition)) {
-        return false;
+    if (g_config.combinedDecompositionLog && g_combinedDecompDebug.attempted) {
+        LogMsg("Combined decomposition result: world=%s view=%s projection=%s.",
+               *hasWorld ? "yes" : "no",
+               *hasView ? "yes" : "no",
+               *hasProjection ? "yes" : "no");
     }
-
-    D3DMATRIX projectionInv = {};
-    if (!InvertMatrix4x4Deterministic(projection, &projectionInv, nullptr)) {
-        return false;
-    }
-
-    D3DMATRIX view = MultiplyMatrix(projectionInv, viewProjection);
-    OrthonormalizeViewMatrix(&view);
-
-    *outWorld = world;
-    *outView = view;
-    *outProjection = projection;
-    if (outProjectionAnalysis) {
-        *outProjectionAnalysis = analysis;
-    }
-    return true;
 }
 
 // Create an identity matrix
@@ -3591,6 +4374,31 @@ bool LooksLikeView(const D3DMATRIX& m) {
 // Forward declarations
 class WrappedD3D9Device;
 class WrappedD3D9;
+
+class WrappedPixelShader9 : public IDirect3DPixelShader9 {
+private:
+    IDirect3DPixelShader9* m_real;
+    uintptr_t m_key;
+public:
+    explicit WrappedPixelShader9(IDirect3DPixelShader9* real)
+        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {}
+
+    IDirect3DPixelShader9* GetReal() const { return m_real; }
+    uintptr_t GetKey() const { return m_key; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override { return m_real->QueryInterface(riid, ppv); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = m_real->Release();
+        if (count == 0) {
+            OnVertexShaderReleased(m_key);
+            delete this;
+        }
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9** ppDevice) override { return m_real->GetDevice(ppDevice); }
+    HRESULT STDMETHODCALLTYPE GetFunction(void* pData, UINT* pSizeOfData) override { return m_real->GetFunction(pData, pSizeOfData); }
+};
 
 class WrappedVertexShader9 : public IDirect3DVertexShader9 {
 private:
@@ -3675,6 +4483,19 @@ public:
     void EmitFixedFunctionTransforms() {
         if (!g_config.emitFixedFunctionTransforms) {
             return;
+        }
+        if (g_forceFfpTransform) {
+            uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
+            auto it = g_shaderRecords.find(shaderKey);
+            if (it != g_shaderRecords.end() && it->second.isFFPTransform) {
+                const int base = g_manualTransformBaseOverride >= 0 ? g_manualTransformBaseOverride : it->second.transformConstantBase;
+                ShaderConstantState* state = GetShaderState(shaderKey, false);
+                D3DMATRIX m = {};
+                if (state && TryBuildMatrixSnapshot(*state, base, 4, false, &m)) {
+                    m_currentWorld = m;
+                    m_hasWorld = true;
+                }
+            }
         }
         // Keep strict game profiles deterministic even if generic SetTransform compatibility is enabled.
         if (g_activeGameProfile == GameProfile_None &&
@@ -3885,6 +4706,14 @@ public:
         if (g_constantUploadRecordingEnabled) {
             RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
         }
+        auto recIt = g_shaderRecords.find(shaderKey);
+        if (recIt != g_shaderRecords.end()) {
+            for (UINT i = 0; i < Vector4fCount; ++i) {
+                UINT reg = StartRegister + i;
+                if (reg >= kMaxConstantRegisters) break;
+                recIt->second.constantUsage[reg] = true;
+            }
+        }
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
         const bool profileIsBarnyard = g_activeGameProfile == GameProfile_Barnyard;
@@ -4041,7 +4870,7 @@ public:
                                                          false,
                                                          &generatedProjectionInfo,
                                                          &generatedProjection,
-                                                         g_config.combinedMVPForceDecomposition)) {
+                                                         true)) {
                         resolvedProjection = generatedProjection;
                         m_currentProj = generatedProjection;
                         m_hasProj = true;
@@ -4283,6 +5112,15 @@ public:
                     g_projectionDetectedFovRadians = 0.0f;
                     StoreProjectionMatrix(m_currentProj, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                           "explicit register override");
+                } else if (slot == MatrixSlot_MVP) {
+                    StoreMVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                   "explicit register override");
+                } else if (slot == MatrixSlot_VP) {
+                    StoreVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                  "explicit register override");
+                } else if (slot == MatrixSlot_WV) {
+                    StoreWVMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                  "explicit register override");
                 }
                 return;
             }
@@ -4291,100 +5129,9 @@ public:
         tryExplicitRegisterOverride(MatrixSlot_World, g_config.worldMatrixRegister);
         tryExplicitRegisterOverride(MatrixSlot_View, g_config.viewMatrixRegister);
         tryExplicitRegisterOverride(MatrixSlot_Projection, g_config.projMatrixRegister);
-
-        auto tryHandleCombinedMVP = [&](const D3DMATRIX& combinedMvp, UINT baseReg, int rows, bool transposed) {
-            StoreMVPMatrix(combinedMvp, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                           "deterministic structural combined MVP", static_cast<int>(baseReg));
-            g_combinedMvpDebug.registerBase = static_cast<int>(baseReg);
-            g_combinedMvpDebug.succeeded = false;
-            g_combinedMvpDebug.fovRadians = 0.0f;
-            g_combinedMvpDebug.handedness = ProjectionHandedness_Unknown;
-
-            if (!g_config.enableCombinedMVP) {
-                g_combinedMvpDebug.strategy = CombinedMVPStrategy_Disabled;
-                return;
-            }
-            if (m_hasWorld && m_hasView && m_hasProj) {
-                g_combinedMvpDebug.strategy = CombinedMVPStrategy_SkippedFullWVP;
-                return;
-            }
-
-            const bool worldAvailable = m_hasWorld;
-            CombinedMVPStrategy strategy = CombinedMVPStrategy_None;
-            if (worldAvailable) {
-                strategy = CombinedMVPStrategy_WorldAndMVP;
-            } else if (g_config.combinedMVPRequireWorld) {
-                strategy = CombinedMVPStrategy_WorldRequiredNoWorld;
-            } else if (g_config.combinedMVPAssumeIdentityWorld) {
-                strategy = CombinedMVPStrategy_MVPOnly;
-            } else {
-                strategy = CombinedMVPStrategy_Failed;
-            }
-            g_combinedMvpDebug.strategy = strategy;
-
-            if (strategy == CombinedMVPStrategy_WorldRequiredNoWorld) {
-                if (g_config.combinedMVPLogDecomposition) {
-                    LogMsg("Combined MVP ignored at c%d-c%d: world required but missing.",
-                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1);
-                }
-                return;
-            }
-
-            D3DMATRIX decompWorld = {};
-            D3DMATRIX decompView = {};
-            D3DMATRIX decompProj = {};
-            ProjectionAnalysis projectionInfo = {};
-            if (!TryDecomposeCombinedMVP(combinedMvp,
-                                         worldAvailable ? &m_currentWorld : nullptr,
-                                         worldAvailable,
-                                         &decompWorld,
-                                         &decompView,
-                                         &decompProj,
-                                         &projectionInfo)) {
-                g_combinedMvpDebug.strategy = CombinedMVPStrategy_Failed;
-                if (g_config.combinedMVPLogDecomposition) {
-                    LogMsg("Combined MVP decomposition failed at c%d-c%d.",
-                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1);
-                }
-                return;
-            }
-
-            m_currentWorld = decompWorld;
-            m_currentView = decompView;
-            m_currentProj = decompProj;
-            m_hasWorld = true;
-                m_worldLastFrame = g_frameCount;
-            m_hasView = true;
-                m_viewLastFrame = g_frameCount;
-            m_hasProj = true;
-            m_projLastFrame = g_frameCount;
-            m_projDetectedFrame = g_frameCount;
-            slotResolvedStructurally[MatrixSlot_World] = true;
-            slotResolvedStructurally[MatrixSlot_View] = true;
-            slotResolvedStructurally[MatrixSlot_Projection] = true;
-            g_projectionDetectedByNumericStructure = true;
-            g_projectionDetectedFovRadians = projectionInfo.fovRadians;
-            g_projectionDetectedRegister = static_cast<int>(baseReg);
-            g_projectionDetectedHandedness = projectionInfo.handedness;
-
-            StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                             "combined MVP decomposition world", static_cast<int>(baseReg));
-            StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                            "combined MVP decomposition view", static_cast<int>(baseReg));
-            StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                                  "combined MVP decomposition projection", static_cast<int>(baseReg));
-
-            g_combinedMvpDebug.succeeded = true;
-            g_combinedMvpDebug.fovRadians = projectionInfo.fovRadians;
-            g_combinedMvpDebug.handedness = projectionInfo.handedness;
-            if (g_config.combinedMVPLogDecomposition) {
-                LogMsg("Combined MVP decomposition success at c%d-c%d using %s, FOV=%.2f deg, handedness=%s.",
-                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
-                       CombinedMVPStrategyLabel(strategy),
-                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
-                       ProjectionHandednessLabel(projectionInfo.handedness));
-            }
-        };
+        tryExplicitRegisterOverride(MatrixSlot_MVP, g_config.mvpMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_WV, g_config.mvMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_VP, g_config.vpMatrixRegister);
 
         bool suppressViewFromUpload = false;
         bool suppressWorldFromUpload = false;
@@ -4467,7 +5214,7 @@ public:
                        !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedByOverride[MatrixSlot_Projection] &&
                        !slotResolvedStructurally[MatrixSlot_World] && !slotResolvedStructurally[MatrixSlot_View] && !slotResolvedStructurally[MatrixSlot_Projection] &&
                        rows == 4) {
-                tryHandleCombinedMVP(mat, baseReg, rows, transposed);
+                StoreMVPMatrix(mat, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural combined MVP", static_cast<int>(baseReg));
             }
         };
 
@@ -4577,6 +5324,52 @@ public:
             }
         }
 
+        D3DMATRIX combinedMvp = {};
+        D3DMATRIX combinedMv = {};
+        D3DMATRIX combinedVp = {};
+        bool hasMvp = false;
+        bool hasMv = false;
+        bool hasVp = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+            combinedMvp = g_cameraMatrices.mvp;
+            combinedMv = g_cameraMatrices.wv;
+            combinedVp = g_cameraMatrices.vp;
+            hasMvp = g_cameraMatrices.hasMVP;
+            hasMv = g_cameraMatrices.hasWV;
+            hasVp = g_cameraMatrices.hasVP;
+        }
+
+        D3DMATRIX generatedProjection = {};
+        bool hasGeneratedProjection = false;
+        if (g_config.allowGeneratedProjectionForVPDecomposition) {
+            hasGeneratedProjection = BuildExperimentalCustomProjectionMatrix(m_real, m_hwnd, &generatedProjection, nullptr, nullptr, nullptr, nullptr);
+        }
+
+        TryDecomposeCombinedMatricesDeterministic(&m_currentWorld, &m_hasWorld,
+                                                  &m_currentView, &m_hasView,
+                                                  &m_currentProj, &m_hasProj,
+                                                  &combinedMvp, hasMvp,
+                                                  &combinedMv, hasMv,
+                                                  &combinedVp, hasVp,
+                                                  &generatedProjection, hasGeneratedProjection);
+
+        if (g_combinedDecompDebug.solvedWorld) {
+            m_worldLastFrame = g_frameCount;
+            StoreWorldMatrix(m_currentWorld, shaderKey, -1, 4, false, false,
+                             "deterministic combined decomposition");
+        }
+        if (g_combinedDecompDebug.solvedView) {
+            m_viewLastFrame = g_frameCount;
+            StoreViewMatrix(m_currentView, shaderKey, -1, 4, false, false,
+                            "deterministic combined decomposition");
+        }
+        if (g_combinedDecompDebug.solvedProjection) {
+            m_projLastFrame = g_frameCount;
+            StoreProjectionMatrix(m_currentProj, shaderKey, -1, 4, false, false,
+                                  "deterministic combined decomposition");
+        }
+
         return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
     }
 
@@ -4624,7 +5417,7 @@ public:
         }
         g_imguiMgrrUseAutoProjection = m_mgrrUseAutoProjection;
         g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
-        RenderImGuiOverlay();
+        RenderImGuiOverlay(m_real);
         m_mgrrUseAutoProjection = g_imguiMgrrUseAutoProjection;
         g_config.barnyardUseGameSetTransformsForViewProjection = g_imguiBarnyardUseGameSetTransformsForViewProjection;
         if (g_requestManualEmit) {
@@ -4693,7 +5486,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil) override { return m_real->SetDepthStencilSurface(pNewZStencil); }
     HRESULT STDMETHODCALLTYPE GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface) override { return m_real->GetDepthStencilSurface(ppZStencilSurface); }
     HRESULT STDMETHODCALLTYPE BeginScene() override {
-        g_combinedMvpDebug = {};
+        g_combinedDecompDebug = {};
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR frame lifecycle: keep projection/view persistent across draws and frames,
             // but require a fresh world upload for each frame.
@@ -4864,6 +5657,8 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
+        if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
         return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override {
@@ -4871,6 +5666,8 @@ public:
             return D3D_OK;
         }
         EmitFixedFunctionTransforms();
+        if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
+        if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
         return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
     }
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
@@ -4889,7 +5686,25 @@ public:
     }
     HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) override { return m_real->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags); }
     HRESULT STDMETHODCALLTYPE CreateVertexDeclaration(const D3DVERTEXELEMENT9* pVertexElements, IDirect3DVertexDeclaration9** ppDecl) override { return m_real->CreateVertexDeclaration(pVertexElements, ppDecl); }
-    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override { return m_real->SetVertexDeclaration(pDecl); }
+    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override {
+        g_activeVertexDeclInfo = {};
+        if (pDecl) {
+            D3DVERTEXELEMENT9 elems[MAXD3DDECLLENGTH] = {};
+            UINT num = MAXD3DDECLLENGTH;
+            if (SUCCEEDED(pDecl->GetDeclaration(elems, &num))) {
+                for (UINT i = 0; i < num; ++i) {
+                    const D3DVERTEXELEMENT9& e = elems[i];
+                    if (e.Stream == 0xFF && e.Type == D3DDECLTYPE_UNUSED) break;
+                    if (e.Usage == D3DDECLUSAGE_POSITION) g_activeVertexDeclInfo.hasPosition = true;
+                    if (e.Usage == D3DDECLUSAGE_NORMAL) g_activeVertexDeclInfo.hasNormal = true;
+                    if (e.Usage == D3DDECLUSAGE_TANGENT) g_activeVertexDeclInfo.hasTangent = true;
+                    if (e.Usage == D3DDECLUSAGE_BINORMAL) g_activeVertexDeclInfo.hasBinormal = true;
+                    if (e.Usage == D3DDECLUSAGE_TEXCOORD) g_activeVertexDeclInfo.texcoordCount = (std::max)(g_activeVertexDeclInfo.texcoordCount, static_cast<int>(e.UsageIndex) + 1);
+                }
+            }
+        }
+        return m_real->SetVertexDeclaration(pDecl);
+    }
     HRESULT STDMETHODCALLTYPE GetVertexDeclaration(IDirect3DVertexDeclaration9** ppDecl) override { return m_real->GetVertexDeclaration(ppDecl); }
     HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { return m_real->SetFVF(FVF); }
     HRESULT STDMETHODCALLTYPE GetFVF(DWORD* pFVF) override { return m_real->GetFVF(pFVF); }
@@ -4904,11 +5719,20 @@ public:
             return hr;
         }
         *ppShader = new WrappedVertexShader9(realShader);
+        std::vector<uint32_t> data;
+        if (pFunction) {
+            for (size_t i = 0; i < 16384; ++i) {
+                data.push_back(static_cast<uint32_t>(pFunction[i]));
+                if ((pFunction[i] & D3DSI_OPCODE_MASK) == D3DSIO_END) break;
+            }
+        }
+        RegisterShaderBytecode(reinterpret_cast<WrappedVertexShader9*>(*ppShader)->GetKey(), ShaderStage_Vertex, data);
         return hr;
     }
     HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* pShader) override {
         m_currentVertexShader = pShader;
         g_activeShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        g_activeVertexShaderKey = g_activeShaderKey;
         GetShaderState(g_activeShaderKey, true);
 
         IDirect3DVertexShader9* realShader = nullptr;
@@ -4921,6 +5745,9 @@ public:
             }
         }
 
+        if (pShader && g_shaderRecords.count(g_activeShaderKey) && g_shaderRecords[g_activeShaderKey].replacementEnabled && g_shaderRecords[g_activeShaderKey].replacementShader) {
+            realShader = reinterpret_cast<IDirect3DVertexShader9*>(g_shaderRecords[g_activeShaderKey].replacementShader);
+        }
         return m_real->SetVertexShader(realShader);
     }
     HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** ppShader) override { return m_real->GetVertexShader(ppShader); }
@@ -4935,10 +5762,36 @@ public:
     HRESULT STDMETHODCALLTYPE GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting) override { return m_real->GetStreamSourceFreq(StreamNumber, pSetting); }
     HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* pIndexData) override { return m_real->SetIndices(pIndexData); }
     HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** ppIndexData) override { return m_real->GetIndices(ppIndexData); }
-    HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override { return m_real->CreatePixelShader(pFunction, ppShader); }
+    HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override {
+        if (!ppShader) return D3DERR_INVALIDCALL;
+        IDirect3DPixelShader9* realShader = nullptr;
+        HRESULT hr = m_real->CreatePixelShader(pFunction, &realShader);
+        if (FAILED(hr) || !realShader) {
+            *ppShader = nullptr;
+            return hr;
+        }
+        *ppShader = new WrappedPixelShader9(realShader);
+        std::vector<uint32_t> data;
+        if (pFunction) {
+            for (size_t i = 0; i < 16384; ++i) {
+                data.push_back(static_cast<uint32_t>(pFunction[i]));
+                if ((pFunction[i] & D3DSI_OPCODE_MASK) == D3DSIO_END) break;
+            }
+        }
+        RegisterShaderBytecode(reinterpret_cast<WrappedPixelShader9*>(*ppShader)->GetKey(), ShaderStage_Pixel, data);
+        return hr;
+    }
     HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override {
         m_currentPixelShader = pShader;
-        return m_real->SetPixelShader(pShader);
+        g_activePixelShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        IDirect3DPixelShader9* realShader = nullptr;
+        if (pShader) {
+            realShader = static_cast<WrappedPixelShader9*>(pShader)->GetReal();
+            if (g_shaderRecords.count(g_activePixelShaderKey) && g_shaderRecords[g_activePixelShaderKey].replacementEnabled && g_shaderRecords[g_activePixelShaderKey].replacementShader) {
+                realShader = reinterpret_cast<IDirect3DPixelShader9*>(g_shaderRecords[g_activePixelShaderKey].replacementShader);
+            }
+        }
+        return m_real->SetPixelShader(realShader);
     }
     HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** ppShader) override { return m_real->GetPixelShader(ppShader); }
     HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override {
@@ -5220,9 +6073,15 @@ void LoadConfig() {
     g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", -1, path);
     g_config.projMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ProjMatrixRegister", -1, path);
     g_config.worldMatrixRegister = GetPrivateProfileIntA("CameraProxy", "WorldMatrixRegister", -1, path);
+    g_config.mvpMatrixRegister = GetPrivateProfileIntA("CameraProxy", "MVPMatrixRegister", -1, path);
+    g_config.mvMatrixRegister = GetPrivateProfileIntA("CameraProxy", "MVMatrixRegister", -1, path);
+    g_config.vpMatrixRegister = GetPrivateProfileIntA("CameraProxy", "VPMatrixRegister", -1, path);
     g_iniViewMatrixRegister = g_config.viewMatrixRegister;
     g_iniProjMatrixRegister = g_config.projMatrixRegister;
     g_iniWorldMatrixRegister = g_config.worldMatrixRegister;
+    g_iniMvpMatrixRegister = g_config.mvpMatrixRegister;
+    g_iniMvMatrixRegister = g_config.mvMatrixRegister;
+    g_iniVpMatrixRegister = g_config.vpMatrixRegister;
     g_config.enableLogging = GetPrivateProfileIntA("CameraProxy", "EnableLogging", 1, path) != 0;
     g_config.logAllConstants = GetPrivateProfileIntA("CameraProxy", "LogAllConstants", 0, path) != 0;
     g_config.autoDetectMatrices = GetPrivateProfileIntA("CameraProxy", "AutoDetectMatrices", 0, path) != 0;
@@ -5270,11 +6129,10 @@ void LoadConfig() {
     g_config.hotkeyTogglePauseVk = GetPrivateProfileIntA("CameraProxy", "HotkeyTogglePauseVK", VK_F9, path);
     g_config.hotkeyEmitMatricesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyEmitMatricesVK", VK_F8, path);
     g_config.hotkeyResetMatrixOverridesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyResetMatrixOverridesVK", VK_F7, path);
-    g_config.enableCombinedMVP = GetPrivateProfileIntA("CameraProxy", "EnableCombinedMVP", 0, path) != 0;
-    g_config.combinedMVPRequireWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPRequireWorld", 0, path) != 0;
-    g_config.combinedMVPAssumeIdentityWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPAssumeIdentityWorld", 1, path) != 0;
-    g_config.combinedMVPForceDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPForceDecomposition", 0, path) != 0;
-    g_config.combinedMVPLogDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPLogDecomposition", 0, path) != 0;
+    g_config.enableCombinedDecomposition = GetPrivateProfileIntA("CameraProxy", "EnableCombinedDecomposition", 1, path) != 0;
+    g_config.combinedDecompositionLog = GetPrivateProfileIntA("CameraProxy", "CombinedDecompositionLog", 0, path) != 0;
+    g_config.allowGeneratedProjectionForVPDecomposition =
+        GetPrivateProfileIntA("CameraProxy", "AllowGeneratedProjectionForVPDecomposition", 0, path) != 0;
 
     g_config.experimentalCustomProjectionEnabled =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionEnabled", 0, path) != 0;
