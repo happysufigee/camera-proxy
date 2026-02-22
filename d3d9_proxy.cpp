@@ -4516,6 +4516,12 @@ public:
         if (!m_hwnd) {
             m_hwnd = GetForegroundWindow();
         }
+        if (m_hwnd) {
+            g_remixLightingManager.GetInterface().SetHwnd(m_hwnd);
+            LogMsg("WrappedD3D9Device: forwarded hwnd=%p to RemixInterface", m_hwnd);
+        } else {
+            LogMsg("WARNING: WrappedD3D9Device: m_hwnd is null - Remix Startup will fail");
+        }
         LogMsg("WrappedD3D9Device created, wrapping device at %p", real);
     }
 

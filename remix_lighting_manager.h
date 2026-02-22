@@ -79,6 +79,7 @@ public:
     const RemixLightingSettings& Settings() const { return m_settings; }
     const std::unordered_map<uint64_t, ManagedLight>& ActiveLights() const { return m_activeLights; }
     const char* RuntimeStatus() const { return m_remix.LastStatus(); }
+    RemixInterface& GetInterface() { return m_remix; }
 
 private:
     bool InvertMatrix(const D3DMATRIX& m, D3DMATRIX* out) const;

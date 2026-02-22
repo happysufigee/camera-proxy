@@ -29,6 +29,7 @@ class RemixInterface {
 public:
     ~RemixInterface();
     bool Initialize(const char* remixDllName);
+    void SetHwnd(HWND hwnd);
     void BeginFrame();
     void EndFrame();
     void Shutdown();
@@ -52,6 +53,9 @@ private:
 
     bool m_runtimeReady = false;
     bool m_started = false;
+    HWND m_hwnd = nullptr;
+    bool m_usingBridgeMode = false;
+    uint32_t m_lightLogCount = 0;
     RemixLightHandle m_mockHandleCounter = 1;
     char m_lastStatus[256] = "uninitialized";
 
