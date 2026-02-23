@@ -1,5 +1,6 @@
 #include "lights_tab_ui.h"
 
+#include "remix_api.h"
 #include "remix_lighting_manager.h"
 #include "imgui/imgui.h"
 
@@ -45,8 +46,8 @@ void DrawRemixLightsTab(RemixLightingManager& manager) {
     for (const auto& kv : active) {
         const ManagedLight& l = kv.second;
         char label[256];
-        snprintf(label, sizeof(label), "H:%llu %s I:%.2f###sig_%llu",
-                 static_cast<unsigned long long>(l.handle), LightTypeName(l.type), l.intensity,
+        snprintf(label, sizeof(label), "H:%p %s I:%.2f###sig_%llu",
+                 l.handle, LightTypeName(l.type), l.intensity,
                  static_cast<unsigned long long>(l.signatureHash));
         if (ImGui::Selectable(label, selectedSignature == l.signatureHash)) {
             selectedSignature = l.signatureHash;
@@ -60,7 +61,7 @@ void DrawRemixLightsTab(RemixLightingManager& manager) {
     auto it = active.find(selectedSignature);
     if (it != active.end()) {
         const ManagedLight& l = it->second;
-        ImGui::Text("Handle: %llu", static_cast<unsigned long long>(l.handle));
+        ImGui::Text("Handle: %p", l.handle);
         ImGui::Text("Type: %s", LightTypeName(l.type));
         ImGui::Text("Color: %.3f %.3f %.3f", l.color[0], l.color[1], l.color[2]);
         ImGui::Text("World direction: %.3f %.3f %.3f", l.direction[0], l.direction[1], l.direction[2]);
@@ -103,7 +104,7 @@ void DrawRemixLightsTab(RemixLightingManager& manager) {
     if (ImGui::Button("Dump Lights To JSON")) {
         manager.DumpLightsToJson(dumpPath);
     }
-    ImGui::TextWrapped("Runtime: %s", manager.RuntimeStatus());
+    ImGui::TextWrapped("Runtime: %s", remix_api::g_initialized ? "Remix API ready" : "Remix API not initialized");
 
     ImGui::Columns(1);
 }
