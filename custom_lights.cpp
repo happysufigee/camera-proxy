@@ -130,14 +130,66 @@ float CustomLightsManager::ComputeAnimatedScale(const AnimationParams& anim) {
         float t = anim.fadeDuration > 0.0f ? 1.0f - anim.elapsedTime / anim.fadeDuration : 0.0f;
         return t < 0.0f ? 0.0f : (t > 1.0f ? 1.0f : t);
     }
+    case AnimationMode::Flicker: {
+        float t = anim.elapsedTime * anim.speed;
+        float n = sinf(t * 23.4f + 0.8f) * sinf(t * 7.1f + 2.3f) * 0.5f + 0.5f;
+        return anim.minScale + n * (1.0f - anim.minScale);
+    }
+    case AnimationMode::ColorCycle:
+        return 1.0f;
+    case AnimationMode::Breathe: {
+        float phase = fmodf(anim.elapsedTime * anim.speed, 1.0f);
+        float half = phase < 0.5f ? phase * 2.0f : (1.0f - phase) * 2.0f;
+        float smooth = half * half * (3.0f - 2.0f * half);
+        return anim.minScale + smooth * (1.0f - anim.minScale);
+    }
+    case AnimationMode::FireFlicker: {
+        float t = anim.elapsedTime * anim.speed;
+        float n1 = sinf(t * 3.0f * 6.2831853f + 0.0f) * 0.5f + 0.5f;
+        float n2 = sinf(t * 11.0f * 6.2831853f + 1.7f) * 0.5f + 0.5f;
+        float n = n1 * 0.7f + n2 * 0.3f;
+        return anim.minScale + n * (1.0f - anim.minScale);
+    }
+    case AnimationMode::ElectricFlicker: {
+        float t = anim.elapsedTime * anim.speed;
+        float n = sinf(t * 37.0f + 0.5f) * sinf(t * 17.3f + 1.1f);
+        n = n * 0.5f + 0.5f;
+        float threshold = 1.0f - anim.minScale;
+        return (n > threshold) ? 0.0f : 1.0f;
+    }
     }
     return 1.0f;
+}
+
+void CustomLightsManager::ComputeAnimatedColorMultiplier(const AnimationParams& anim,
+                                                         float out[3]) {
+    if (anim.mode == AnimationMode::ColorCycle) {
+        float hue = fmodf(anim.elapsedTime * anim.speed, 1.0f);
+        float s = anim.saturation < 0.0f ? 0.0f : (anim.saturation > 1.0f ? 1.0f : anim.saturation);
+        float h6 = hue * 6.0f;
+        int hi = static_cast<int>(h6) % 6;
+        float f = h6 - static_cast<float>(static_cast<int>(h6));
+        float p = 1.0f - s;
+        float q = 1.0f - s * f;
+        float t2 = 1.0f - s * (1.0f - f);
+        switch (hi) {
+        case 0: out[0]=1.f; out[1]=t2;  out[2]=p;   break;
+        case 1: out[0]=q;   out[1]=1.f; out[2]=p;   break;
+        case 2: out[0]=p;   out[1]=1.f; out[2]=t2;  break;
+        case 3: out[0]=p;   out[1]=q;   out[2]=1.f; break;
+        case 4: out[0]=t2;  out[1]=p;   out[2]=1.f; break;
+        default:out[0]=1.f; out[1]=p;   out[2]=q;   break;
+        }
+    } else {
+        out[0] = out[1] = out[2] = 1.0f;
+    }
 }
 
 // ─── BuildNativeLightInfo ─────────────────────────────────────────────────────
 
 bool CustomLightsManager::BuildNativeLightInfo(const CustomLight& l,
                                                 float animScale,
+                                                const float colorMul[3],
                                                 remixapi_LightInfo*            outInfo,
                                                 remixapi_LightInfoSphereEXT*   outSphere,
                                                 remixapi_LightInfoRectEXT*     outRect,
@@ -149,9 +201,9 @@ bool CustomLightsManager::BuildNativeLightInfo(const CustomLight& l,
     outInfo->sType = REMIXAPI_STRUCT_TYPE_LIGHT_INFO;
     outInfo->pNext = nullptr;
     outInfo->hash  = l.stableHash;
-    outInfo->radiance.x = l.color[0] * l.intensity * animScale;
-    outInfo->radiance.y = l.color[1] * l.intensity * animScale;
-    outInfo->radiance.z = l.color[2] * l.intensity * animScale;
+    outInfo->radiance.x = l.color[0] * colorMul[0] * l.intensity * animScale;
+    outInfo->radiance.y = l.color[1] * colorMul[1] * l.intensity * animScale;
+    outInfo->radiance.z = l.color[2] * colorMul[2] * l.intensity * animScale;
 
     auto fillShaping = [&](remixapi_LightInfoLightShaping& sh) {
         float sd[3] = { l.shaping.direction[0], l.shaping.direction[1], l.shaping.direction[2] };
@@ -276,7 +328,7 @@ bool CustomLightsManager::BuildNativeLightInfo(const CustomLight& l,
 
 // ─── EndFrame ─────────────────────────────────────────────────────────────────
 
-void CustomLightsManager::EndFrame() {
+void CustomLightsManager::EndFrame(const CameraState& cam) {
     for (auto& l : m_lights) {
         if (!l.enabled) {
             if (l.nativeHandle && remix_api::g_initialized) {
@@ -289,6 +341,17 @@ void CustomLightsManager::EndFrame() {
         if (!remix_api::g_initialized) continue;
 
         const float animScale = ComputeAnimatedScale(l.animation);
+        float colorMul[3];
+        ComputeAnimatedColorMultiplier(l.animation, colorMul);
+
+        CustomLight submitLight = l;
+        if (l.followCamera && cam.valid) {
+            const float* o = l.cameraOffset;
+            submitLight.position[0] = o[0]*cam.row0[0] + o[1]*cam.row1[0] + o[2]*cam.row2[0] + cam.position[0];
+            submitLight.position[1] = o[0]*cam.row0[1] + o[1]*cam.row1[1] + o[2]*cam.row2[1] + cam.position[1];
+            submitLight.position[2] = o[0]*cam.row0[2] + o[1]*cam.row1[2] + o[2]*cam.row2[2] + cam.position[2];
+        }
+
         const bool  animated  = (l.animation.mode != AnimationMode::None);
         const bool  needsRecreate = (l.nativeHandle == nullptr) || l.dirty || animated;
 
@@ -302,7 +365,7 @@ void CustomLightsManager::EndFrame() {
             remixapi_LightInfoDomeEXT     dome     = {};
             wchar_t                       domePath[MAX_PATH] = {};
 
-            if (!BuildNativeLightInfo(l, animScale,
+            if (!BuildNativeLightInfo(submitLight, animScale, colorMul,
                                       &info, &sphere, &rect, &disk,
                                       &cylinder, &distant, &dome, domePath))
                 continue;
@@ -342,6 +405,11 @@ static const char* AnimToStr(AnimationMode m) {
     case AnimationMode::Strobe:  return "Strobe";
     case AnimationMode::FadeIn:  return "FadeIn";
     case AnimationMode::FadeOut: return "FadeOut";
+    case AnimationMode::Flicker: return "Flicker";
+    case AnimationMode::ColorCycle: return "ColorCycle";
+    case AnimationMode::Breathe: return "Breathe";
+    case AnimationMode::FireFlicker: return "FireFlicker";
+    case AnimationMode::ElectricFlicker: return "ElectricFlicker";
     }
     return "None";
 }
@@ -362,6 +430,11 @@ static AnimationMode StrToAnim(const char* s) {
     if (strcmp(s,"Strobe")  == 0) return AnimationMode::Strobe;
     if (strcmp(s,"FadeIn")  == 0) return AnimationMode::FadeIn;
     if (strcmp(s,"FadeOut") == 0) return AnimationMode::FadeOut;
+    if (strcmp(s,"Flicker") == 0) return AnimationMode::Flicker;
+    if (strcmp(s,"ColorCycle") == 0) return AnimationMode::ColorCycle;
+    if (strcmp(s,"Breathe") == 0) return AnimationMode::Breathe;
+    if (strcmp(s,"FireFlicker") == 0) return AnimationMode::FireFlicker;
+    if (strcmp(s,"ElectricFlicker") == 0) return AnimationMode::ElectricFlicker;
     return AnimationMode::None;
 }
 
@@ -406,6 +479,10 @@ bool CustomLightsManager::SaveToFile(const char* path) const {
         fprintf(f, "anim_min=%.4f\n",         l.animation.minScale);
         fprintf(f, "anim_strobe_on=%.4f\n",   l.animation.strobeOnFrac);
         fprintf(f, "anim_fade_dur=%.4f\n",    l.animation.fadeDuration);
+        fprintf(f, "anim_saturation=%.4f\n",  l.animation.saturation);
+        fprintf(f, "followCamera=%d\n",       l.followCamera ? 1 : 0);
+        fprintf(f, "cameraOffset=%.4f %.4f %.4f\n",
+                l.cameraOffset[0], l.cameraOffset[1], l.cameraOffset[2]);
         fprintf(f, "\n");
     }
 
@@ -482,6 +559,9 @@ bool CustomLightsManager::LoadFromFile(const char* path) {
         else if (strcmp(key,"anim_min")       == 0) { cur->animation.minScale = (float)atof(val); }
         else if (strcmp(key,"anim_strobe_on") == 0) { cur->animation.strobeOnFrac = (float)atof(val); }
         else if (strcmp(key,"anim_fade_dur")  == 0) { cur->animation.fadeDuration = (float)atof(val); }
+        else if (strcmp(key,"anim_saturation") == 0) { cur->animation.saturation = (float)atof(val); }
+        else if (strcmp(key,"followCamera") == 0) { cur->followCamera = atoi(val) != 0; }
+        else if (strcmp(key,"cameraOffset") == 0) { sscanf(val, "%f %f %f", &cur->cameraOffset[0], &cur->cameraOffset[1], &cur->cameraOffset[2]); }
     }
 
     fclose(f);

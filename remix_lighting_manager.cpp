@@ -286,15 +286,7 @@ void RemixLightingManager::ProcessDrawCall(const ShaderLightingMetadata& meta,
     if (!meta.isFFPLighting || !m_settings.enabled) return;
 
     int base       = meta.lightingConstantBase >= 0 ? meta.lightingConstantBase : 0;
-    int lightCount = 1;
-    if (meta.constantUsage && meta.constantCount > 0) {
-        int run = 0;
-        for (int i = base; i < meta.constantCount; ++i) {
-            if (meta.constantUsage[i]) run++; else if (run > 0) break;
-        }
-        lightCount = (std::max)(1, run / 4);
-        lightCount = (std::min)(lightCount, 8);
-    }
+    int lightCount = (std::min)((std::max)(meta.lightCount, 1), 8);
 
     D3DMATRIX toWorld  = {};
     bool canTransform  = true;
@@ -308,11 +300,33 @@ void RemixLightingManager::ProcessDrawCall(const ShaderLightingMetadata& meta,
     for (int i = 0; i < lightCount; ++i) {
         ManagedLight l = {};
         int reg = base + i * 4;
-        float dir[3]   = { constants[reg][0],     constants[reg][1],     constants[reg][2]     };
-        float color[3] = { constants[reg+1][0],   constants[reg+1][1],   constants[reg+1][2]   };
-        float pos[3]   = { constants[reg+2][0],   constants[reg+2][1],   constants[reg+2][2]   };
-        float atten    = constants[reg+3][0];
-        float cone     = constants[reg+3][1];
+
+        const bool useExplicit = (i == 0);
+        int dirReg = (useExplicit && meta.lightDirectionRegister >= 0) ? meta.lightDirectionRegister : reg;
+        int colReg = (useExplicit && meta.lightColorRegister >= 0) ? meta.lightColorRegister : reg + 1;
+        int posReg = (useExplicit && meta.positionRegister >= 0) ? meta.positionRegister : reg + 2;
+        int atReg = (useExplicit && meta.attenuationRegister >= 0) ? meta.attenuationRegister : reg + 3;
+        int coneReg = (useExplicit && meta.coneAngleRegister >= 0) ? meta.coneAngleRegister : reg + 3;
+
+        const int kMax = kMaxConstantRegisters - 1;
+        dirReg = (std::max)(0, (std::min)(dirReg, kMax));
+        colReg = (std::max)(0, (std::min)(colReg, kMax));
+        posReg = (std::max)(0, (std::min)(posReg, kMax));
+        atReg = (std::max)(0, (std::min)(atReg, kMax));
+        coneReg = (std::max)(0, (std::min)(coneReg, kMax));
+
+        float dir[3] = { constants[dirReg][0], constants[dirReg][1], constants[dirReg][2] };
+        float color[3] = { constants[colReg][0], constants[colReg][1], constants[colReg][2] };
+        float pos[3] = { constants[posReg][0], constants[posReg][1], constants[posReg][2] };
+        float atten = constants[atReg][0];
+        float cone = (coneReg != atReg) ? constants[coneReg][0] : constants[atReg][1];
+
+        if (meta.materialColorRegister >= 0 && meta.materialColorRegister != colReg) {
+            const int matReg = (std::max)(0, (std::min)(meta.materialColorRegister, kMax));
+            color[0] *= constants[matReg][0];
+            color[1] *= constants[matReg][1];
+            color[2] *= constants[matReg][2];
+        }
 
         bool hasDir   = std::fabs(dir[0]) + std::fabs(dir[1]) + std::fabs(dir[2]) > 0.0001f;
         bool hasPos   = std::fabs(pos[0]) + std::fabs(pos[1]) + std::fabs(pos[2]) > 0.0001f;

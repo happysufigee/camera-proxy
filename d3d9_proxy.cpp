@@ -368,7 +368,18 @@ struct ShaderRecord {
     int materialColorRegister = -1;
     int attenuationRegister = -1;
     int positionRegister = -1;
+    int coneAngleRegister = -1;
     LightingSpace lightSpace = LightingSpace::World;
+
+    int coneAngleRegisterOverride = -1;
+    int lightDirectionRegisterOverride = -1;
+    int lightColorRegisterOverride = -1;
+    int materialColorRegisterOverride = -1;
+    int positionRegisterOverride = -1;
+    int attenuationRegisterOverride = -1;
+    int lightCountOverride = -1;
+    LightingSpace lightSpaceOverride = LightingSpace::Auto;
+
     bool constantUsage[kMaxConstantRegisters] = {};
     unsigned long long usageCount = 0;
     IUnknown* replacementShader = nullptr;
@@ -672,6 +683,7 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
     rec->materialColorRegister = -1;
     rec->attenuationRegister = -1;
     rec->positionRegister = -1;
+    rec->coneAngleRegister = -1;
     rec->lightSpace = LightingSpace::World;
     int minConstReg = kMaxConstantRegisters;
 
@@ -724,6 +736,7 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
         rec->lightColorRegister = minConstReg + 1;
         rec->positionRegister = minConstReg + 2;
         rec->attenuationRegister = minConstReg + 3;
+        rec->coneAngleRegister = minConstReg + 3;
         rec->materialColorRegister = minConstReg + 1;
         rec->lightSpace = LightingSpace::View;
     }
@@ -824,8 +837,22 @@ static ShaderLightingMetadata BuildLightingMetadataForShader(uintptr_t shaderKey
     meta.materialColorRegister = rec.materialColorRegister;
     meta.attenuationRegister = rec.attenuationRegister;
     meta.positionRegister = rec.positionRegister;
-    meta.lightingConstantBase = (g_manualLightingBaseOverride >= 0) ? g_manualLightingBaseOverride : rec.lightingConstantBase;
-    meta.lightSpace = rec.lightSpace;
+    meta.lightingConstantBase = (g_manualLightingBaseOverride >= 0)
+                                ? g_manualLightingBaseOverride
+                                : rec.lightingConstantBase;
+    meta.coneAngleRegister = rec.coneAngleRegister;
+
+    if (rec.lightDirectionRegisterOverride >= 0) meta.lightDirectionRegister = rec.lightDirectionRegisterOverride;
+    if (rec.lightColorRegisterOverride >= 0) meta.lightColorRegister = rec.lightColorRegisterOverride;
+    if (rec.materialColorRegisterOverride >= 0) meta.materialColorRegister = rec.materialColorRegisterOverride;
+    if (rec.positionRegisterOverride >= 0) meta.positionRegister = rec.positionRegisterOverride;
+    if (rec.attenuationRegisterOverride >= 0) meta.attenuationRegister = rec.attenuationRegisterOverride;
+    if (rec.coneAngleRegisterOverride >= 0) meta.coneAngleRegister = rec.coneAngleRegisterOverride;
+
+    meta.lightCount = (rec.lightCountOverride >= 1) ? rec.lightCountOverride : 1;
+    meta.lightSpace = (rec.lightSpaceOverride != LightingSpace::Auto)
+                      ? rec.lightSpaceOverride
+                      : rec.lightSpace;
     meta.constantUsage = rec.constantUsage;
     meta.constantCount = kMaxConstantRegisters;
     return meta;
@@ -3085,6 +3112,45 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 ImGui::Checkbox("Force FFP transform emission", &g_forceFfpTransform);
                 ImGui::InputInt("Manual transform base", &g_manualTransformBaseOverride);
                 ImGui::InputInt("Manual lighting base", &g_manualLightingBaseOverride);
+                if (rec.isFFPLighting) {
+                    ImGui::Separator();
+                    ImGui::Text("Lighting register overrides (-1 = use auto-detected)");
+                    ImGui::TextDisabled("Auto: dir=c%d  color=c%d  pos=c%d  atten=c%d  cone=c%d",
+                                        rec.lightDirectionRegister,
+                                        rec.lightColorRegister,
+                                        rec.positionRegister,
+                                        rec.attenuationRegister,
+                                        rec.coneAngleRegister);
+
+                    ImGui::InputInt("Direction register##ldir", &rec.lightDirectionRegisterOverride);
+                    ImGui::InputInt("Color register##lcol", &rec.lightColorRegisterOverride);
+                    ImGui::InputInt("Material color reg##lmat", &rec.materialColorRegisterOverride);
+                    ImGui::InputInt("Position register##lpos", &rec.positionRegisterOverride);
+                    ImGui::InputInt("Attenuation register##latten", &rec.attenuationRegisterOverride);
+                    ImGui::InputInt("Cone angle register##lcone", &rec.coneAngleRegisterOverride);
+                    ImGui::InputInt("Light count override##lcnt", &rec.lightCountOverride);
+                    ImGui::TextDisabled("Light count: -1 = default (1)");
+
+                    ImGui::Text("Light space override:");
+                    const char* spaceLabels[] = { "Auto (use detected)", "World", "View", "Object" };
+                    int spaceIdx = static_cast<int>(rec.lightSpaceOverride) + 1;
+                    if (ImGui::Combo("##lspace", &spaceIdx, spaceLabels, 4)) {
+                        rec.lightSpaceOverride = static_cast<LightingSpace>(spaceIdx - 1);
+                    }
+
+                    if (rec.lightDirectionRegister >= 0) {
+                        int dr = (rec.lightDirectionRegisterOverride >= 0)
+                                     ? rec.lightDirectionRegisterOverride
+                                     : rec.lightDirectionRegister;
+                        int cr = (rec.lightColorRegisterOverride >= 0)
+                                     ? rec.lightColorRegisterOverride
+                                     : rec.lightColorRegister;
+                        ImGui::TextDisabled("Live dir  c%d: [%.3f %.3f %.3f]", dr,
+                                            g_vsConstants[dr][0], g_vsConstants[dr][1], g_vsConstants[dr][2]);
+                        ImGui::TextDisabled("Live color c%d: [%.3f %.3f %.3f]", cr,
+                                            g_vsConstants[cr][0], g_vsConstants[cr][1], g_vsConstants[cr][2]);
+                    }
+                }
 
                 ImGui::Separator();
                 ImGui::Text("Constant monitor (selected shader)");
@@ -5528,7 +5594,20 @@ public:
 
         if (m_remixFrameOpen) {
             g_remixLightingManager.EndFrame();
-			g_customLightsManager.EndFrame();
+            {
+                CameraState cam = {};
+                if (m_everHadView) {
+                    D3DMATRIX vi = InvertSimpleRigidView(m_currentView);
+                    cam.valid = true;
+                    cam.row0[0] = vi._11; cam.row0[1] = vi._12; cam.row0[2] = vi._13;
+                    cam.row1[0] = vi._21; cam.row1[1] = vi._22; cam.row1[2] = vi._23;
+                    cam.row2[0] = vi._31; cam.row2[1] = vi._32; cam.row2[2] = vi._33;
+                    cam.position[0] = vi._41;
+                    cam.position[1] = vi._42;
+                    cam.position[2] = vi._43;
+                }
+                g_customLightsManager.EndFrame(cam);
+            }
             m_remixFrameOpen = false;
         }
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);

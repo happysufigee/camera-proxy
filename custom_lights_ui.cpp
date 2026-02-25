@@ -47,7 +47,10 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
     static float         step        = 1.0f;
 
     static const char* kTypeNames[] = { "Sphere","Rect","Disk","Cylinder","Distant","Dome" };
-    static const char* kAnimNames[] = { "None","Pulse","Strobe","FadeIn","FadeOut" };
+    static const char* kAnimNames[] = {
+        "None", "Pulse", "Strobe", "FadeIn", "FadeOut",
+        "Flicker", "ColorCycle", "Breathe", "FireFlicker", "ElectricFlicker"
+    };
 
     ImGui::Columns(3, "CLCols", true);
 
@@ -165,6 +168,25 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
                 if (ax < 2) ImGui::SameLine(0, 20);
                 ImGui::PopID();
             }
+
+            ImGui::Separator();
+            bool fc = l.followCamera;
+            if (ImGui::Checkbox("Follow camera##fc", &fc)) { l.followCamera = fc; l.dirty = true; }
+            if (l.followCamera) {
+                ImGui::TextDisabled("Camera-space offset (right/up/forward):");
+                ImGui::InputFloat3("##camoffset", l.cameraOffset, "%.3f");
+                if (ImGui::IsItemEdited()) l.dirty = true;
+                const char* axLabels2[3] = { "R", "U", "F" };
+                for (int ax = 0; ax < 3; ax++) {
+                    ImGui::PushID(100 + ax);
+                    ImGui::Text("%s:", axLabels2[ax]); ImGui::SameLine();
+                    if (ImGui::SmallButton("+")) { l.cameraOffset[ax] += step; l.dirty = true; }
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("-")) { l.cameraOffset[ax] -= step; l.dirty = true; }
+                    if (ax < 2) ImGui::SameLine(0, 20);
+                    ImGui::PopID();
+                }
+            }
         }
 
         // ── Type-specific ────────────────────────────────────────────────────
@@ -258,12 +280,13 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
         ImGui::Separator();
         ImGui::Text("Animation");
         int animIdx = static_cast<int>(l.animation.mode);
-        if (ImGui::Combo("Mode##anim", &animIdx, kAnimNames, 5)) {
+        if (ImGui::Combo("Mode##anim", &animIdx, kAnimNames, 10)) {
             l.animation.mode = static_cast<AnimationMode>(animIdx);
             l.dirty = true;
         }
         if (l.animation.mode != AnimationMode::None) {
             ImGui::SliderFloat("Speed (Hz)", &l.animation.speed, 0.01f, 20.0f, "%.2f");
+
             if (l.animation.mode == AnimationMode::Pulse) {
                 ImGui::SliderFloat("Min Scale", &l.animation.minScale, 0.0f, 1.0f, "%.3f");
             }
@@ -274,6 +297,18 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
                 l.animation.mode == AnimationMode::FadeOut) {
                 ImGui::SliderFloat("Duration (s)", &l.animation.fadeDuration, 0.1f, 60.0f, "%.2f");
             }
+            if (l.animation.mode == AnimationMode::Flicker ||
+                l.animation.mode == AnimationMode::Breathe ||
+                l.animation.mode == AnimationMode::FireFlicker ||
+                l.animation.mode == AnimationMode::ElectricFlicker) {
+                ImGui::SliderFloat("Intensity Floor", &l.animation.minScale, 0.0f, 1.0f, "%.3f");
+                ImGui::TextDisabled("0 = full depth,  1 = no effect");
+            }
+            if (l.animation.mode == AnimationMode::ColorCycle) {
+                ImGui::SliderFloat("Saturation", &l.animation.saturation, 0.0f, 1.0f, "%.3f");
+                ImGui::TextDisabled("0 = white,  1 = full colour");
+            }
+
             if (ImGui::Button("Reset Timer")) l.animation.elapsedTime = 0.0f;
             ImGui::SameLine();
             ImGui::Text("t=%.2fs", l.animation.elapsedTime);

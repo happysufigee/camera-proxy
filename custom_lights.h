@@ -9,7 +9,18 @@
 
 // ─── Animation ───────────────────────────────────────────────────────────────
 
-enum class AnimationMode { None, Pulse, Strobe, FadeIn, FadeOut };
+enum class AnimationMode {
+    None,
+    Pulse,
+    Strobe,
+    FadeIn,
+    FadeOut,
+    Flicker,
+    ColorCycle,
+    Breathe,
+    FireFlicker,
+    ElectricFlicker
+};
 
 struct AnimationParams {
     AnimationMode mode         = AnimationMode::None;
@@ -17,6 +28,7 @@ struct AnimationParams {
     float         minScale     = 0.0f;   // Pulse: floor of oscillation [0,1]
     float         strobeOnFrac = 0.5f;   // Strobe: fraction of cycle that is ON
     float         fadeDuration = 1.0f;   // FadeIn / FadeOut total seconds
+    float         saturation   = 1.0f;
     float         elapsedTime  = 0.0f;   // accumulated, reset by user
 };
 
@@ -50,6 +62,8 @@ struct CustomLight {
 
     // ── Position (Sphere / Rect / Disk / Cylinder) ────────────────────────────
     float position[3] = {};
+    bool  followCamera    = false;
+    float cameraOffset[3] = { 0.0f, 0.0f, 0.0f };
 
     // ── Sphere / Cylinder radius ──────────────────────────────────────────────
     float radius = 5.0f;
@@ -88,6 +102,14 @@ struct CustomLight {
     uint64_t             stableHash   = 0; // FNV-1a over id, set once at creation
 };
 
+struct CameraState {
+    bool  valid       = false;
+    float row0[3]     = {};
+    float row1[3]     = {};
+    float row2[3]     = {};
+    float position[3] = {};
+};
+
 // ─── CustomLightsManager ─────────────────────────────────────────────────────
 
 class CustomLightsManager {
@@ -96,7 +118,7 @@ public:
     void BeginFrame(float deltaSeconds);
 
     // Called from WrappedD3D9Device::Present (after g_remixLightingManager.EndFrame)
-    void EndFrame();
+    void EndFrame(const CameraState& cam);
 
     // Light management
     CustomLight& AddLight(CustomLightType type);
@@ -117,6 +139,7 @@ private:
     static float    ComputeAnimatedScale(const AnimationParams& anim);
     static bool     BuildNativeLightInfo(const CustomLight& l,
                                          float animScale,
+                                         const float colorMul[3],
                                          remixapi_LightInfo*            outInfo,
                                          remixapi_LightInfoSphereEXT*   outSphere,
                                          remixapi_LightInfoRectEXT*     outRect,
@@ -125,6 +148,7 @@ private:
                                          remixapi_LightInfoDistantEXT*  outDistant,
                                          remixapi_LightInfoDomeEXT*     outDome,
                                          wchar_t*                       outDomePath);
+    static void     ComputeAnimatedColorMultiplier(const AnimationParams& anim, float out[3]);
     static void     NormalizeInPlace(float v[3]);
     static void     Cross3(const float a[3], const float b[3], float out[3]);
     static uint64_t ComputeStableHash(uint32_t id);
