@@ -4272,7 +4272,7 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
         changed = false;
 
         if (!knownHasMv && *hasView && *hasWorld) {
-            knownMv = MultiplyMatrix(*view, *world);
+            knownMv = MultiplyMatrix(*world, *view);
             knownHasMv = true;
             changed = true;
         }
@@ -4287,14 +4287,14 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
             changed = true;
         }
         if (!knownHasMvp && knownHasVp && *hasWorld) {
-            knownMvp = MultiplyMatrix(knownVp, *world);
+            knownMvp = MultiplyMatrix(*world, knownVp);
             knownHasMvp = true;
             changed = true;
         }
 
         if (knownHasMvp && *hasWorld && !knownHasVp) {
             D3DMATRIX solvedVp = {};
-            if (TrySolveFromInverseRightMultiply(knownMvp, *world, &solvedVp)) {
+            if (TrySolveFromInverseLeftMultiply(*world, knownMvp, &solvedVp)) {
                 knownVp = solvedVp;
                 knownHasVp = true;
                 changed = true;
@@ -4311,8 +4311,8 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
 
         if (knownHasMv && !*hasWorld && *hasView) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*view, knownMv, &solved) &&
-                solveWorld(solved, "World = inv(View) * MV")) {
+            if (TrySolveFromInverseRightMultiply(knownMv, *view, &solved) &&
+                solveWorld(solved, "World = MV * inv(View)")) {
                 changed = true;
             }
         }
@@ -4326,8 +4326,8 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
 
         if (knownHasVp && !*hasView && *hasProjection) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*projection, knownVp, &solved) &&
-                solveView(solved, "View = inv(Projection) * VP")) {
+            if (TrySolveFromInverseRightMultiply(knownVp, *projection, &solved) &&
+                solveView(solved, "View = VP * inv(Projection)")) {
                 changed = true;
             }
         }
@@ -4341,8 +4341,8 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
 
         if (knownHasMvp && knownHasVp && !*hasWorld) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(knownVp, knownMvp, &solved) &&
-                solveWorld(solved, "World = inv(VP) * MVP")) {
+            if (TrySolveFromInverseRightMultiply(knownMvp, knownVp, &solved) &&
+                solveWorld(solved, "World = MVP * inv(VP)")) {
                 changed = true;
             }
         }
@@ -4355,7 +4355,7 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
         }
         if (knownHasVp && !*hasProjection && !*hasView && hasGeneratedProjection && g_config.allowGeneratedProjectionForVPDecomposition) {
             D3DMATRIX solvedView = {};
-            if (TrySolveFromInverseLeftMultiply(*generatedProjection, knownVp, &solvedView) &&
+            if (TrySolveFromInverseRightMultiply(knownVp, *generatedProjection, &solvedView) &&
                 IsProjectionCandidateForDecomposition(*generatedProjection) &&
                 IsViewCandidateForDecomposition(solvedView)) {
                 *projection = *generatedProjection;
@@ -4367,7 +4367,7 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
                 snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula),
                          "Projection = Generated manual/auto matrix (config-enabled)");
                 snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula),
-                         "View = inv(GeneratedProjection) * VP");
+                         "View = VP * inv(GeneratedProjection)");
                 changed = true;
             }
         }
@@ -5402,16 +5402,19 @@ public:
                                                   &generatedProjection, hasGeneratedProjection);
 
         if (g_combinedDecompDebug.solvedWorld) {
+            m_everHadWorld = true;
             m_worldLastFrame = g_frameCount;
             StoreWorldMatrix(m_currentWorld, shaderKey, -1, 4, false, false,
                              "deterministic combined decomposition");
         }
         if (g_combinedDecompDebug.solvedView) {
+            m_everHadView = true;
             m_viewLastFrame = g_frameCount;
             StoreViewMatrix(m_currentView, shaderKey, -1, 4, false, false,
                             "deterministic combined decomposition");
         }
         if (g_combinedDecompDebug.solvedProjection) {
+            m_everHadProj = true;
             m_projLastFrame = g_frameCount;
             StoreProjectionMatrix(m_currentProj, shaderKey, -1, 4, false, false,
                                   "deterministic combined decomposition");
