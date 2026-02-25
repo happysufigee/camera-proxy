@@ -44,6 +44,8 @@
 #include "imgui/backends/imgui_impl_win32.h"
 #include "remix_lighting_manager.h"
 #include "lights_tab_ui.h"
+#include "custom_lights.h"
+#include "custom_lights_ui.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -783,11 +785,13 @@ static unsigned long long g_frameTimeSamples = 0;
 static LARGE_INTEGER g_perfFrequency = {};
 static LARGE_INTEGER g_prevCounter = {};
 static bool g_perfInitialized = false;
+static float g_lastDeltaSec = 0.016f;
 
 static std::deque<std::string> g_logLines = {};
 static std::vector<std::string> g_logSnapshot = {};
 static std::vector<std::string> g_memoryScanResults = {};
 static RemixLightingManager g_remixLightingManager = {};
+static CustomLightsManager g_customLightsManager = {};
 
 static ShaderLightingMetadata BuildLightingMetadataForShader(uintptr_t shaderKey) {
     ShaderLightingMetadata meta = {};
@@ -2459,6 +2463,7 @@ static void UpdateFrameTimeStats() {
     double delta = static_cast<double>(now.QuadPart - g_prevCounter.QuadPart) /
                    static_cast<double>(g_perfFrequency.QuadPart);
     g_prevCounter = now;
+	g_lastDeltaSec = static_cast<float>(delta);
 
     float ms = static_cast<float>(delta * 1000.0);
     g_frameTimeHistory[g_frameTimeIndex] = ms;
@@ -3067,6 +3072,11 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             DrawRemixLightsTab(g_remixLightingManager);
             ImGui::EndTabItem();
         }
+		
+		if (ImGui::BeginTabItem("Custom API Lights")) {
+			DrawCustomLightsTab(g_customLightsManager);
+			ImGui::EndTabItem();
+		}
 
         if (ImGui::BeginTabItem("Constants")) {
             g_constantUploadRecordingEnabled = true;
@@ -4942,7 +4952,7 @@ public:
                 if (haveProjectionForViewDerivation) {
                     D3DMATRIX projectionInv = {};
                     if (InvertMatrix4x4Deterministic(resolvedProjection, &projectionInv, nullptr)) {
-                        D3DMATRIX derivedView = MultiplyMatrix(projectionInv, mat);
+                        D3DMATRIX derivedView = MultiplyMatrix(mat, projectionInv);
                         OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
                         m_hasView = true;
@@ -5489,6 +5499,7 @@ public:
 
         if (m_remixFrameOpen) {
             g_remixLightingManager.EndFrame();
+			g_customLightsManager.EndFrame();
             m_remixFrameOpen = false;
         }
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
@@ -5561,6 +5572,7 @@ public:
         }
         if (!m_remixFrameOpen) {
             g_remixLightingManager.BeginFrame();
+			g_customLightsManager.BeginFrame(g_lastDeltaSec);
             m_remixFrameOpen = true;
         }
         return m_real->BeginScene();
@@ -6280,6 +6292,7 @@ static void EnsureProxyInitialized() {
         g_hD3D9 = LoadTargetD3D9();
         if (g_config.useRemixRuntime) {
             g_remixLightingManager.Initialize();
+			g_customLightsManager.SetSaveFilePath("custom_lights.cltx");
         }
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
