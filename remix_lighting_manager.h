@@ -8,6 +8,7 @@
 #include "remixapi/bridge_remix_api.h"
 
 enum class LightingSpace {
+    Auto  = -1,
     World = 0,
     View,
     Object
@@ -22,6 +23,7 @@ struct ShaderLightingMetadata {
     int positionRegister      = -1;
     int coneAngleRegister     = -1;
     int lightingConstantBase  = -1;
+    int lightCount            = 1;
     LightingSpace lightSpace  = LightingSpace::World;
     const bool* constantUsage = nullptr;
     int constantCount         = 0;
