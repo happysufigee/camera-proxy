@@ -385,7 +385,13 @@ enum ShaderListOrderMode {
     ShaderListOrder_Insertion = 0,
     ShaderListOrder_HashAsc = 1
 };
+enum ShaderSearchScopeMode {
+    ShaderSearchScope_LabelOnly = 0,
+    ShaderSearchScope_AllAssemblies = 1,
+    ShaderSearchScope_SelectedAssembly = 2
+};
 static int g_shaderListOrderMode = ShaderListOrder_Insertion;
+static int g_shaderSearchScopeMode = ShaderSearchScope_LabelOnly;
 static uintptr_t g_activeVertexShaderKey = 0;
 static uintptr_t g_activePixelShaderKey = 0;
 static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
@@ -401,6 +407,18 @@ static std::string TrimCopy(const std::string& s) {
     size_t e = s.size();
     while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
     return s.substr(b, e - b);
+}
+
+static bool ContainsCaseInsensitive(const std::string& haystack, const char* needle) {
+    if (!needle || needle[0] == '\0') return true;
+    if (haystack.empty()) return false;
+    const size_t needleLen = std::strlen(needle);
+    if (needleLen == 0 || needleLen > haystack.size()) return needleLen == 0;
+    return std::search(haystack.begin(), haystack.end(), needle, needle + needleLen,
+                       [](char lhs, char rhs) {
+                           return std::tolower(static_cast<unsigned char>(lhs)) ==
+                                  std::tolower(static_cast<unsigned char>(rhs));
+                       }) != haystack.end();
 }
 
 static int ParseWriteMaskBits(const std::string& reg) {
@@ -2874,7 +2892,15 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
         if (ImGui::BeginTabItem("Shader")) {
             static char shaderFilter[64] = "";
             static const char* kShaderListOrderModes[] = {"Insertion order", "Hash (ascending)"};
+            static const char* kShaderSearchScopeModes[] = {
+                "List labels",
+                "All shader assemblies",
+                "Selected shader assembly"
+            };
             ImGui::InputText("Filter", shaderFilter, sizeof(shaderFilter));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::Combo("Search scope", &g_shaderSearchScopeMode, kShaderSearchScopeModes, IM_ARRAYSIZE(kShaderSearchScopeModes));
             ImGui::SameLine();
             ImGui::SetNextItemWidth(180.0f);
             ImGui::Combo("Order", &g_shaderListOrderMode, kShaderListOrderModes, IM_ARRAYSIZE(kShaderListOrderModes));
@@ -2911,7 +2937,23 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                          rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
                          static_cast<int>(rec.ir.size()), rec.usageCount,
                          (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
-                if (shaderFilter[0] && strstr(visibleLabel, shaderFilter) == nullptr) continue;
+                if (shaderFilter[0]) {
+                    bool matchesFilter = ContainsCaseInsensitive(visibleLabel, shaderFilter);
+                    if (g_shaderSearchScopeMode == ShaderSearchScope_AllAssemblies) {
+                        if (!matchesFilter) {
+                            matchesFilter = ContainsCaseInsensitive(rec.cachedDisassembly, shaderFilter) ||
+                                            ContainsCaseInsensitive(rec.editableAssembly, shaderFilter);
+                        }
+                    } else if (g_shaderSearchScopeMode == ShaderSearchScope_SelectedAssembly) {
+                        if (shaderKey != g_selectedShaderKey) {
+                            matchesFilter = false;
+                        } else if (!matchesFilter) {
+                            matchesFilter = ContainsCaseInsensitive(rec.cachedDisassembly, shaderFilter) ||
+                                            ContainsCaseInsensitive(rec.editableAssembly, shaderFilter);
+                        }
+                    }
+                    if (!matchesFilter) continue;
+                }
                 bool selected = (shaderKey == g_selectedShaderKey);
                 char selectableLabel[320];
                 snprintf(selectableLabel, sizeof(selectableLabel), "%s###shader_row_%p", visibleLabel,
