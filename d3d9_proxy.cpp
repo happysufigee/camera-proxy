@@ -4497,6 +4497,9 @@ private:
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
+    bool m_everHadView  = false;
+    bool m_everHadProj  = false;
+    bool m_everHadWorld = false;
     bool m_mgrrUseAutoProjection = false;
     int m_constantLogThrottle = 0;
     int m_viewLastFrame = -1;
@@ -4556,7 +4559,7 @@ public:
                 D3DMATRIX m = {};
                 if (state && TryBuildMatrixSnapshot(*state, base, 4, false, &m)) {
                     m_currentWorld = m;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                 }
             }
         }
@@ -4568,12 +4571,12 @@ public:
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR profile is strict: only emit transforms when all three known registers
             // have been captured. Never emit identity/fallback transforms in this mode.
-            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+            if (!(m_everHadWorld && m_everHadView && m_everHadProj)) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "MGR draw skipped: missing matrix/matrices (Proj=%s View=%s World=%s).",
-                         m_hasProj ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasWorld ? "ready" : "missing");
+                         "MGR draw skipped: no valid matrices ever captured (Proj=%s View=%s World=%s).",
+                         m_everHadProj  ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadWorld ? "ready" : "never seen");
                 return;
             }
 
@@ -4589,12 +4592,12 @@ public:
         }
 
         if (g_activeGameProfile == GameProfile_DevilMayCry4) {
-            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+            if (!(m_everHadWorld && m_everHadView && m_everHadProj)) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "DMC4 draw skipped: missing matrix/matrices (World=%s View=%s Proj=%s).",
-                         m_hasWorld ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasProj ? "ready" : "missing");
+                         "DMC4 draw skipped: no valid matrices ever captured (World=%s View=%s Proj=%s).",
+                         m_everHadWorld ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadProj  ? "ready" : "never seen");
                 return;
             }
 
@@ -4611,12 +4614,12 @@ public:
 
         if (g_activeGameProfile == GameProfile_Barnyard) {
             const bool useGameViewProj = g_config.barnyardUseGameSetTransformsForViewProjection;
-            if (!m_hasWorld || (useGameViewProj && (!m_hasView || !m_hasProj))) {
+            if (!m_everHadWorld || (useGameViewProj && (!m_everHadView || !m_everHadProj))) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "Barnyard draw skipped: missing matrices (World=%s View=%s Proj=%s).",
-                         m_hasWorld ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasProj ? "ready" : "missing");
+                         "Barnyard draw skipped: no valid matrices ever captured (World=%s View=%s Proj=%s).",
+                         m_everHadWorld ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadProj  ? "ready" : "never seen");
                 return;
             }
 
@@ -4655,7 +4658,7 @@ public:
                                                         &usedAuto, &resolvedAspect,
                                                         &width, &height)) {
                 m_currentProj = customProjection;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = -1;
@@ -4679,43 +4682,21 @@ public:
             }
         }
 
-        D3DMATRIX identity = {};
-        CreateIdentityMatrix(&identity);
-        D3DMATRIX emitWorld = m_currentWorld;
-        D3DMATRIX emitView = m_currentView;
-        D3DMATRIX emitProj = m_currentProj;
-
-        if (!m_hasWorld) emitWorld = identity;
-        if (!m_hasView) emitView = identity;
-        if (!m_hasProj) emitProj = identity;
-
-        if (m_worldLastFrame >= 0 && g_frameCount > m_worldLastFrame + 1) {
-            LogMsg("World matrix stale (last update frame %d, current %d); emitting identity.", m_worldLastFrame, g_frameCount);
-            emitWorld = identity;
-        }
-        if (m_viewLastFrame >= 0 && g_frameCount > m_viewLastFrame + 1) {
-            LogMsg("View matrix stale (last update frame %d, current %d); emitting identity.", m_viewLastFrame, g_frameCount);
-            emitView = identity;
-        }
-        if (m_projLastFrame >= 0 && g_frameCount > m_projLastFrame + 1) {
-            LogMsg("Projection matrix stale (last update frame %d, current %d); emitting identity.", m_projLastFrame, g_frameCount);
-            emitProj = identity;
-        }
-
         g_lastInverseViewAsWorldEligible = false;
         g_lastInverseViewAsWorldApplied = false;
         g_lastInverseViewAsWorldUsedFast = false;
-        if (g_config.experimentalInverseViewAsWorld && m_hasView && !strictMgrProfileActive) {
-            const bool viewLooksValid = LooksLikeViewStrict(emitView);
+        if (g_config.experimentalInverseViewAsWorld && m_everHadView && !strictMgrProfileActive) {
+            const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
             g_lastInverseViewAsWorldEligible = viewLooksValid;
             if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
                 D3DMATRIX derivedWorld = {};
                 bool usedFastInverse = false;
                 bool fastEligible = false;
-                if (TryBuildWorldFromView(emitView, g_config.experimentalInverseViewAsWorldFast,
+                if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
                                           &derivedWorld, &usedFastInverse, &fastEligible)) {
-                    emitWorld = derivedWorld;
-                    g_lastInverseViewAsWorldApplied = true;
+                    m_currentWorld  = derivedWorld;
+                    m_everHadWorld  = true;
+                    g_lastInverseViewAsWorldApplied  = true;
                     g_lastInverseViewAsWorldUsedFast = usedFastInverse;
                     if (!fastEligible && g_config.experimentalInverseViewAsWorldFast) {
                         LogMsg("Fast inverse requested but view matrix did not qualify (possible scaling/shear); used full inverse.");
@@ -4724,9 +4705,12 @@ public:
             }
         }
 
-        m_real->SetTransform(D3DTS_WORLD, &emitWorld);
-        m_real->SetTransform(D3DTS_VIEW, &emitView);
-        m_real->SetTransform(D3DTS_PROJECTION, &emitProj);
+        // Only emit slots that have ever had a valid capture.
+        // Never emit identity for uncaptured slots — leave Remix state untouched instead.
+        // Always use last-known-good for stale slots rather than poisoning with identity.
+        if (m_everHadWorld) m_real->SetTransform(D3DTS_WORLD,      &m_currentWorld);
+        if (m_everHadView)  m_real->SetTransform(D3DTS_VIEW,       &m_currentView);
+        if (m_everHadProj)  m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
     }
 
 
@@ -4833,17 +4817,17 @@ public:
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = manualMat;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = manualMat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = manualMat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = binding.baseRegister;
@@ -4891,7 +4875,7 @@ public:
                 g_profileCoreRegistersSeen[0] = true;
                 g_mgrProjectionRegisterValid = IsTypicalProjectionMatrix(mat);
                 m_currentProj = mat;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 g_mgrProjCapturedThisFrame = true;
                 if (g_mgrProjectionRegisterValid) {
@@ -4936,7 +4920,7 @@ public:
                                                          true)) {
                         resolvedProjection = generatedProjection;
                         m_currentProj = generatedProjection;
-                        m_hasProj = true;
+                        m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                         g_mgrProjCapturedThisFrame = true;
                         g_projectionDetectedByNumericStructure = true;
@@ -4955,7 +4939,7 @@ public:
                         D3DMATRIX derivedView = MultiplyMatrix(mat, projectionInv);
                         OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
-                        m_hasView = true;
+                        m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                         g_mgrViewCapturedThisFrame = true;
                         g_profileViewDerivedFromInverse = true;
@@ -4977,7 +4961,7 @@ public:
 
             if (tryExtractMgrMatrix(16, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 g_mgrWorldCapturedForDraw = true;
                 g_profileCoreRegistersSeen[2] = true;
@@ -4996,7 +4980,7 @@ public:
                 TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                  0, 4, false, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 worldCaptured = true;
                 g_profileCoreRegistersSeen[2] = true;
@@ -5008,7 +4992,7 @@ public:
                 TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                  g_config.worldMatrixRegister, 4, false, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 worldCaptured = true;
                 g_profileCoreRegistersSeen[2] = true;
@@ -5044,7 +5028,7 @@ public:
 
                         if (cls == MatrixClass_World) {
                             m_currentWorld = candidate;
-                            m_hasWorld = true;
+                            m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                             worldCaptured = true;
                             g_profileCoreRegistersSeen[2] = true;
@@ -5089,7 +5073,7 @@ public:
                 StoreMVPMatrix(mat, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
                                "DevilMayCry4 profile combined MVP (c0-c3)");
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_World] = true;
                 g_profileCoreRegistersSeen[0] = true;
@@ -5100,7 +5084,7 @@ public:
             if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
                 anyCaptured = true;
                 m_currentView = mat;
-                m_hasView = true;
+                m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_View] = true;
                 g_profileCoreRegistersSeen[1] = true;
@@ -5112,7 +5096,7 @@ public:
             if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
                 anyCaptured = true;
                 m_currentProj = mat;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_Projection] = true;
                 g_projectionDetectedByNumericStructure = false;
@@ -5155,19 +5139,19 @@ public:
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = mat;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                      "explicit register override");
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = mat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                     "explicit register override");
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = mat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = configuredRegister;
@@ -5219,7 +5203,7 @@ public:
                     m_projLockedShader = shaderKey;
                     m_projLockedRegister = static_cast<int>(baseReg);
                     m_currentProj = mat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                     m_projLastFrame = g_frameCount;
                     m_projDetectedFrame = g_frameCount;
                     slotResolvedStructurally[MatrixSlot_Projection] = true;
@@ -5255,7 +5239,7 @@ public:
                     m_viewLockedShader = shaderKey;
                     m_viewLockedRegister = static_cast<int>(baseReg);
                     m_currentView = mat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                     m_viewLastFrame = g_frameCount;
                     slotResolvedStructurally[MatrixSlot_View] = true;
                     StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg),
@@ -5268,7 +5252,7 @@ public:
                        !slotResolvedByOverride[MatrixSlot_World] &&
                        !slotResolvedStructurally[MatrixSlot_World]) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 slotResolvedStructurally[MatrixSlot_World] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural world");
@@ -5592,19 +5576,19 @@ public:
             if (allowGenericSetTransformCompatibility && g_config.setTransformBypassProxyWhenGameProvides) {
                 if (State == D3DTS_WORLD) {
                     m_currentWorld = *pMatrix;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                     m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
                                      "game SetTransform(World) direct passthrough");
                 } else if (State == D3DTS_VIEW) {
                     m_currentView = *pMatrix;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                     m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
                                     "game SetTransform(View) direct passthrough");
                 } else if (State == D3DTS_PROJECTION) {
                     m_currentProj = *pMatrix;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                     m_projLastFrame = g_frameCount;
                     StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
                                           "game SetTransform(Projection) direct passthrough");
@@ -5623,19 +5607,19 @@ public:
                 }
                 if (State == D3DTS_WORLD) {
                     m_currentWorld = roundTrip;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                     m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
                                      "game SetTransform(World)+GetTransform compatibility");
                 } else if (State == D3DTS_VIEW) {
                     m_currentView = roundTrip;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                     m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
                                     "game SetTransform(View)+GetTransform compatibility");
                 } else if (State == D3DTS_PROJECTION) {
                     m_currentProj = roundTrip;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                     m_projLastFrame = g_frameCount;
                     StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
                                           "game SetTransform(Projection)+GetTransform compatibility");
@@ -5660,7 +5644,7 @@ public:
 
             if (State == D3DTS_VIEW) {
                 m_currentView = captured;
-                m_hasView = true;
+                m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                 g_profileCoreRegistersSeen[0] = true;
                 StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
@@ -5669,7 +5653,7 @@ public:
                                     : "Barnyard intercepted game SetTransform(View)");
             } else {
                 m_currentProj = captured;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 g_profileCoreRegistersSeen[1] = true;
                 g_projectionDetectedByNumericStructure = false;
