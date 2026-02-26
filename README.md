@@ -1,8 +1,18 @@
-# camera-proxy (experimental branch)
+# Camera Proxy (experimental branch)
 
 Experimental Direct3D9 proxy DLL for RTX Remix.
 
-This branch is focused on **deterministic matrix extraction** for arbitrary DX9 engines while still supporting fixed-profile game layouts when needed. The proxy wraps `IDirect3D9` / `IDirect3DDevice9`, observes vertex shader constant uploads, caches current transform state, and forwards fixed-function transforms immediately before draw calls.
+This branch is focused on **shader-driven Remix compatibility** for arbitrary DX9 engines. In addition to deterministic camera matrix extraction, it also includes shader-lighting metadata forwarding, Remix/custom light tooling, and optional raster/remix compositing controls for experimentation.
+
+At runtime, the proxy wraps `IDirect3D9` / `IDirect3DDevice9`, observes vertex shader constant uploads, caches transform state, and can forward fixed-function transforms immediately before draw calls.
+
+## Branch focus (shaders)
+
+- deterministic matrix extraction from shader constants with draw-time emission,
+- fixed-profile register layouts for known games,
+- Remix light forwarding based on shader lighting metadata,
+- custom light authoring/import/export helpers,
+- optional raster/remix blend pass controls (`[RasterBlend]` in `camera_proxy.ini`).
 
 ## Why this exists
 
