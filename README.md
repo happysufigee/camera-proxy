@@ -150,16 +150,6 @@ MGRR-specific helper:
 
 - `MGRRUseAutoProjectionWhenC4Invalid=1` prefers auto-generating projection from ViewProjection data if `c4-c7` fails projection validation.
 
-### 12) Experimental inverse-view world emission
-
-Optional world synthesis from inverse view:
-
-- `ExperimentalInverseViewAsWorld`
-- `ExperimentalInverseViewAsWorldAllowUnverified`
-- `ExperimentalInverseViewAsWorldFast`
-
-Useful for engines that expose a reliable VIEW but unstable/absent WORLD data.
-
 ---
 
 ## Setup
@@ -201,7 +191,6 @@ See `camera_proxy.ini` for full comments. Most important keys:
 - `ProbeInverseView`
 - `EnableCombinedMVP`
 - `ExperimentalCustomProjectionEnabled`
-- `ExperimentalInverseViewAsWorld`
 - `SetTransformBypassProxyWhenGameProvides`
 - `SetTransformRoundTripCompatibilityMode`
 - `DisableGameInputWhileMenuOpen`

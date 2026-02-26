@@ -138,9 +138,6 @@ struct ProxyConfig {
     float experimentalCustomProjectionAutoAspectFallback = 16.0f / 9.0f;
     ProjectionHandedness experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
     D3DMATRIX experimentalCustomProjectionManualMatrix = {};
-    bool experimentalInverseViewAsWorld = false;
-    bool experimentalInverseViewAsWorldAllowUnverified = false;
-    bool experimentalInverseViewAsWorldFast = false;
 };
 
 struct CombinedDecompositionDebugState {
@@ -279,9 +276,6 @@ static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
 static CombinedDecompositionDebugState g_combinedDecompDebug = {};
 static char g_customProjectionStatus[256] = "";
-static bool g_lastInverseViewAsWorldEligible = false;
-static bool g_lastInverseViewAsWorldApplied = false;
-static bool g_lastInverseViewAsWorldUsedFast = false;
 static bool g_gameSetTransformSeen[3] = { false, false, false }; // world, view, projection
 static bool g_gameSetTransformAnySeen = false;
 
@@ -1869,48 +1863,6 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
     return out;
 }
 
-static bool ViewMatrixCanUseFastInverse(const D3DMATRIX& view) {
-    const float row0len = sqrtf(Dot3(view._11, view._12, view._13, view._11, view._12, view._13));
-    const float row1len = sqrtf(Dot3(view._21, view._22, view._23, view._21, view._22, view._23));
-    const float row2len = sqrtf(Dot3(view._31, view._32, view._33, view._31, view._32, view._33));
-
-    if (fabsf(row0len - 1.0f) > 0.05f || fabsf(row1len - 1.0f) > 0.05f || fabsf(row2len - 1.0f) > 0.05f) {
-        return false;
-    }
-    if (fabsf(Dot3(view._11, view._12, view._13, view._21, view._22, view._23)) > 0.05f) return false;
-    if (fabsf(Dot3(view._11, view._12, view._13, view._31, view._32, view._33)) > 0.05f) return false;
-    if (fabsf(Dot3(view._21, view._22, view._23, view._31, view._32, view._33)) > 0.05f) return false;
-    if (fabsf(view._14) > 0.01f || fabsf(view._24) > 0.01f || fabsf(view._34) > 0.01f || fabsf(view._44 - 1.0f) > 0.01f) {
-        return false;
-    }
-    return true;
-}
-
-static bool TryBuildWorldFromView(const D3DMATRIX& view, bool preferFastInverse, D3DMATRIX* outWorld,
-                                  bool* outUsedFast, bool* outFastEligible) {
-    if (!outWorld) {
-        return false;
-    }
-
-    const bool fastEligible = ViewMatrixCanUseFastInverse(view);
-    if (outFastEligible) {
-        *outFastEligible = fastEligible;
-    }
-
-    if (preferFastInverse && fastEligible) {
-        *outWorld = InvertSimpleRigidView(view);
-        if (outUsedFast) {
-            *outUsedFast = true;
-        }
-        return true;
-    }
-
-    if (outUsedFast) {
-        *outUsedFast = false;
-    }
-    return InvertMatrix4x4Deterministic(view, outWorld, nullptr);
-}
-
 static const char* GameProfileLabel(GameProfileKind profile) {
     switch (profile) {
         case GameProfile_Barnyard: return "Barnyard";
@@ -2730,23 +2682,6 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             DrawMatrixWithTranspose("View", camSnapshot.view, camSnapshot.hasView,
                                     g_showTransposedMatrices);
             DrawMatrixSourceInfo(MatrixSlot_View, camSnapshot.hasView);
-            if (ImGui::CollapsingHeader("Experimental inverse View -> World", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::Checkbox("Use inverse(View) as emitted World matrix", &g_config.experimentalInverseViewAsWorld)) {
-                    SaveConfigBoolValue("ExperimentalInverseViewAsWorld", g_config.experimentalInverseViewAsWorld);
-                }
-                if (ImGui::Checkbox("Allow inverse(View) even if strict validity check fails", &g_config.experimentalInverseViewAsWorldAllowUnverified)) {
-                    SaveConfigBoolValue("ExperimentalInverseViewAsWorldAllowUnverified",
-                                        g_config.experimentalInverseViewAsWorldAllowUnverified);
-                }
-                if (ImGui::Checkbox("Fast inverse (rigid transform only)", &g_config.experimentalInverseViewAsWorldFast)) {
-                    SaveConfigBoolValue("ExperimentalInverseViewAsWorldFast",
-                                        g_config.experimentalInverseViewAsWorldFast);
-                }
-                ImGui::TextWrapped("Fast inverse assumes no scaling/shear: transpose the 3x3 rotation and recompute translation via negative dot products.");
-                ImGui::Text("Last strict validity result: %s", g_lastInverseViewAsWorldEligible ? "valid" : "invalid");
-                ImGui::Text("Last inverse(View)->World application: %s", g_lastInverseViewAsWorldApplied ? "applied" : "not applied");
-                ImGui::Text("Last method: %s", g_lastInverseViewAsWorldUsedFast ? "fast inverse" : "full 4x4 inverse");
-            }
             ImGui::Separator();
             DrawMatrixWithTranspose("Projection", camSnapshot.projection,
                                     camSnapshot.hasProjection, g_showTransposedMatrices);
@@ -4769,10 +4704,6 @@ public:
                 return;
             }
 
-            g_lastInverseViewAsWorldEligible = false;
-            g_lastInverseViewAsWorldApplied = false;
-            g_lastInverseViewAsWorldUsedFast = false;
-
             // Keep MGR strict and deterministic: WORLD always comes from c16-c19.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
@@ -4789,10 +4720,6 @@ public:
                          m_everHadProj  ? "ready" : "never seen");
                 return;
             }
-
-            g_lastInverseViewAsWorldEligible = false;
-            g_lastInverseViewAsWorldApplied = false;
-            g_lastInverseViewAsWorldUsedFast = false;
 
             // Keep DMC4 strict and deterministic: WORLD always comes from c0-c3.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
@@ -4811,10 +4738,6 @@ public:
                          m_everHadProj  ? "ready" : "never seen");
                 return;
             }
-
-            g_lastInverseViewAsWorldEligible = false;
-            g_lastInverseViewAsWorldApplied = false;
-            g_lastInverseViewAsWorldUsedFast = false;
 
             // Keep Barnyard profile semantics deterministic: WORLD comes from shader constants.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
@@ -4867,29 +4790,6 @@ public:
                 } else {
                     snprintf(g_customProjectionStatus, sizeof(g_customProjectionStatus),
                              "Experimental projection active (manual matrix mode).");
-                }
-            }
-        }
-
-        g_lastInverseViewAsWorldEligible = false;
-        g_lastInverseViewAsWorldApplied = false;
-        g_lastInverseViewAsWorldUsedFast = false;
-        if (g_config.experimentalInverseViewAsWorld && m_everHadView && !strictMgrProfileActive) {
-            const bool viewLooksValid = LooksLikeViewStrict(m_currentView);
-            g_lastInverseViewAsWorldEligible = viewLooksValid;
-            if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
-                D3DMATRIX derivedWorld = {};
-                bool usedFastInverse = false;
-                bool fastEligible = false;
-                if (TryBuildWorldFromView(m_currentView, g_config.experimentalInverseViewAsWorldFast,
-                                          &derivedWorld, &usedFastInverse, &fastEligible)) {
-                    m_currentWorld  = derivedWorld;
-                    m_everHadWorld  = true;
-                    g_lastInverseViewAsWorldApplied  = true;
-                    g_lastInverseViewAsWorldUsedFast = usedFastInverse;
-                    if (!fastEligible && g_config.experimentalInverseViewAsWorldFast) {
-                        LogMsg("Fast inverse requested but view matrix did not qualify (possible scaling/shear); used full inverse.");
-                    }
                 }
             }
         }
@@ -6461,12 +6361,6 @@ void LoadConfig() {
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideDetectedProjection", 0, path) != 0;
     g_config.experimentalCustomProjectionOverrideCombinedMVP =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideCombinedMVP", 0, path) != 0;
-    g_config.experimentalInverseViewAsWorld =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorld", 0, path) != 0;
-    g_config.experimentalInverseViewAsWorldAllowUnverified =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorldAllowUnverified", 0, path) != 0;
-    g_config.experimentalInverseViewAsWorldFast =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorldFast", 0, path) != 0;
     g_config.mgrrUseAutoProjectionWhenC4Invalid =
         GetPrivateProfileIntA("CameraProxy", "MGRRUseAutoProjectionWhenC4Invalid", 0, path) != 0;
 
