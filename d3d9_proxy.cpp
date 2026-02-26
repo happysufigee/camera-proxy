@@ -32,6 +32,7 @@
 #include <sstream>
 #include <fstream>
 #include <filesystem>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -42,6 +43,11 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_dx9.h"
 #include "imgui/backends/imgui_impl_win32.h"
+#include "remix_lighting_manager.h"
+#include "lights_tab_ui.h"
+#include "custom_lights.h"
+#include "custom_lights_ui.h"
+#include "remix_api.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -78,6 +84,13 @@ struct ProjectionAnalysis {
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
 static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
 static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr);
+static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
+                                                    HWND hwnd,
+                                                    D3DMATRIX* outProjection,
+                                                    bool* outUsedAuto = nullptr,
+                                                    float* outResolvedAspect = nullptr,
+                                                    UINT* outWidth = nullptr,
+                                                    UINT* outHeight = nullptr);
 void CreateIdentityMatrix(D3DMATRIX* out);
 class WrappedD3D9Device;
 
@@ -134,10 +147,31 @@ struct ProxyConfig {
     float experimentalCustomProjectionAutoAspectFallback = 16.0f / 9.0f;
     ProjectionHandedness experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
     D3DMATRIX experimentalCustomProjectionManualMatrix = {};
-    bool experimentalInverseViewAsWorld = false;
-    bool experimentalInverseViewAsWorldAllowUnverified = false;
-    bool experimentalInverseViewAsWorldFast = false;
+
+    bool rasterBlendEnabled = false;
+    int rasterBlendMode = 0;
+    float rasterBlendMixStrength = 1.0f;
+    bool rasterBlendWhiteMaterials = true;
 };
+
+enum RasterBlendMode {
+    RasterBlendMode_Multiply = 0,
+    RasterBlendMode_Additive = 1,
+    RasterBlendMode_Lerp = 2
+};
+
+struct RasterBlendVertex {
+    float x;
+    float y;
+    float z;
+    float rhw;
+    float u0;
+    float v0;
+    float u1;
+    float v1;
+};
+
+static constexpr DWORD kRasterBlendFVF = D3DFVF_XYZRHW | D3DFVF_TEX2;
 
 struct CombinedDecompositionDebugState {
     bool attempted = false;
@@ -184,6 +218,7 @@ static HINSTANCE g_moduleInstance = nullptr;
 static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
+static char g_modulePath[MAX_PATH] = "";
 static char g_gameExePath[MAX_PATH] = "";
 static char g_gameExeName[MAX_PATH] = "";
 static char g_gameDisplayName[256] = "";
@@ -248,8 +283,12 @@ static void UpdateMatrixSource(MatrixSlot slot,
 
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
+static bool g_rasterBlendResourcesFailed = false;
+static bool g_rasterBlendLastRasterCapture = false;
+static bool g_rasterBlendLastRemixCapture = false;
 static bool g_showImGui = false;
 static bool g_prevShowImGui = false;
+static bool g_selectCameraTabOnMenuOpen = false;
 static bool g_pauseRendering = false;
 static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
@@ -264,6 +303,20 @@ static bool g_imguiMgrrUseAutoProjection = false;
 static bool g_imguiBarnyardUseGameSetTransformsForViewProjection = true;
 static bool g_imguiDisableGameInputWhileMenuOpen = false;
 static bool g_imguiBaseStyleCaptured = false;
+ImFont* g_overlayFontRegular = nullptr;
+ImFont* g_overlayFontBold = nullptr;
+
+void PushOverlayBoldFont() {
+    if (g_overlayFontBold) {
+        ImGui::PushFont(g_overlayFontBold);
+    }
+}
+
+void PopOverlayBoldFont() {
+    if (g_overlayFontBold) {
+        ImGui::PopFont();
+    }
+}
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
 static char g_manualEmitStatus[192] = "";
@@ -275,9 +328,6 @@ static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
 static CombinedDecompositionDebugState g_combinedDecompDebug = {};
 static char g_customProjectionStatus[256] = "";
-static bool g_lastInverseViewAsWorldEligible = false;
-static bool g_lastInverseViewAsWorldApplied = false;
-static bool g_lastInverseViewAsWorldUsedFast = false;
 static bool g_gameSetTransformSeen[3] = { false, false, false }; // world, view, projection
 static bool g_gameSetTransformAnySeen = false;
 
@@ -359,6 +409,23 @@ struct ShaderRecord {
     bool isRemixSafe = false;
     int transformConstantBase = -1;
     int lightingConstantBase = -1;
+    int lightDirectionRegister = -1;
+    int lightColorRegister = -1;
+    int materialColorRegister = -1;
+    int attenuationRegister = -1;
+    int positionRegister = -1;
+    int coneAngleRegister = -1;
+    LightingSpace lightSpace = LightingSpace::World;
+
+    int coneAngleRegisterOverride = -1;
+    int lightDirectionRegisterOverride = -1;
+    int lightColorRegisterOverride = -1;
+    int materialColorRegisterOverride = -1;
+    int positionRegisterOverride = -1;
+    int attenuationRegisterOverride = -1;
+    int lightCountOverride = -1;
+    LightingSpace lightSpaceOverride = LightingSpace::Auto;
+
     bool constantUsage[kMaxConstantRegisters] = {};
     unsigned long long usageCount = 0;
     IUnknown* replacementShader = nullptr;
@@ -375,7 +442,13 @@ enum ShaderListOrderMode {
     ShaderListOrder_Insertion = 0,
     ShaderListOrder_HashAsc = 1
 };
+enum ShaderSearchScopeMode {
+    ShaderSearchScope_LabelOnly = 0,
+    ShaderSearchScope_AllAssemblies = 1,
+    ShaderSearchScope_SelectedAssembly = 2
+};
 static int g_shaderListOrderMode = ShaderListOrder_Insertion;
+static int g_shaderSearchScopeMode = ShaderSearchScope_LabelOnly;
 static uintptr_t g_activeVertexShaderKey = 0;
 static uintptr_t g_activePixelShaderKey = 0;
 static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
@@ -391,6 +464,18 @@ static std::string TrimCopy(const std::string& s) {
     size_t e = s.size();
     while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
     return s.substr(b, e - b);
+}
+
+static bool ContainsCaseInsensitive(const std::string& haystack, const char* needle) {
+    if (!needle || needle[0] == '\0') return true;
+    if (haystack.empty()) return false;
+    const size_t needleLen = std::strlen(needle);
+    if (needleLen == 0 || needleLen > haystack.size()) return needleLen == 0;
+    return std::search(haystack.begin(), haystack.end(), needle, needle + needleLen,
+                       [](char lhs, char rhs) {
+                           return std::tolower(static_cast<unsigned char>(lhs)) ==
+                                  std::tolower(static_cast<unsigned char>(rhs));
+                       }) != haystack.end();
 }
 
 static int ParseWriteMaskBits(const std::string& reg) {
@@ -639,6 +724,13 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
     rec->usesFlowControl = false;
     rec->transformConstantBase = -1;
     rec->lightingConstantBase = -1;
+    rec->lightDirectionRegister = -1;
+    rec->lightColorRegister = -1;
+    rec->materialColorRegister = -1;
+    rec->attenuationRegister = -1;
+    rec->positionRegister = -1;
+    rec->coneAngleRegister = -1;
+    rec->lightSpace = LightingSpace::World;
     int minConstReg = kMaxConstantRegisters;
 
     for (size_t i = 0; i < rec->ir.size(); ++i) {
@@ -686,6 +778,13 @@ static void ClassifyShaderRecord(ShaderRecord* rec) {
     rec->isFFPLighting = sawDot && sawMaxZero && sawMul;
     if (rec->isFFPLighting && minConstReg < kMaxConstantRegisters) {
         rec->lightingConstantBase = minConstReg;
+        rec->lightDirectionRegister = minConstReg;
+        rec->lightColorRegister = minConstReg + 1;
+        rec->positionRegister = minConstReg + 2;
+        rec->attenuationRegister = minConstReg + 3;
+        rec->coneAngleRegister = minConstReg + 3;
+        rec->materialColorRegister = minConstReg + 1;
+        rec->lightSpace = LightingSpace::View;
     }
     rec->isRemixSafe = !rec->usesFlowControl;
 }
@@ -763,10 +862,47 @@ static unsigned long long g_frameTimeSamples = 0;
 static LARGE_INTEGER g_perfFrequency = {};
 static LARGE_INTEGER g_prevCounter = {};
 static bool g_perfInitialized = false;
+static float g_lastDeltaSec = 0.016f;
 
 static std::deque<std::string> g_logLines = {};
 static std::vector<std::string> g_logSnapshot = {};
 static std::vector<std::string> g_memoryScanResults = {};
+static RemixLightingManager g_remixLightingManager = {};
+static CustomLightsManager g_customLightsManager = {};
+
+static ShaderLightingMetadata BuildLightingMetadataForShader(uintptr_t shaderKey) {
+    ShaderLightingMetadata meta = {};
+    auto it = g_shaderRecords.find(shaderKey);
+    if (it == g_shaderRecords.end()) {
+        return meta;
+    }
+    const ShaderRecord& rec = it->second;
+    meta.isFFPLighting = rec.isFFPLighting;
+    meta.lightDirectionRegister = rec.lightDirectionRegister;
+    meta.lightColorRegister = rec.lightColorRegister;
+    meta.materialColorRegister = rec.materialColorRegister;
+    meta.attenuationRegister = rec.attenuationRegister;
+    meta.positionRegister = rec.positionRegister;
+    meta.lightingConstantBase = (g_manualLightingBaseOverride >= 0)
+                                ? g_manualLightingBaseOverride
+                                : rec.lightingConstantBase;
+    meta.coneAngleRegister = rec.coneAngleRegister;
+
+    if (rec.lightDirectionRegisterOverride >= 0) meta.lightDirectionRegister = rec.lightDirectionRegisterOverride;
+    if (rec.lightColorRegisterOverride >= 0) meta.lightColorRegister = rec.lightColorRegisterOverride;
+    if (rec.materialColorRegisterOverride >= 0) meta.materialColorRegister = rec.materialColorRegisterOverride;
+    if (rec.positionRegisterOverride >= 0) meta.positionRegister = rec.positionRegisterOverride;
+    if (rec.attenuationRegisterOverride >= 0) meta.attenuationRegister = rec.attenuationRegisterOverride;
+    if (rec.coneAngleRegisterOverride >= 0) meta.coneAngleRegister = rec.coneAngleRegisterOverride;
+
+    meta.lightCount = (rec.lightCountOverride >= 1) ? rec.lightCountOverride : 1;
+    meta.lightSpace = (rec.lightSpaceOverride != LightingSpace::Auto)
+                      ? rec.lightSpaceOverride
+                      : rec.lightSpace;
+    meta.constantUsage = rec.constantUsage;
+    meta.constantCount = kMaxConstantRegisters;
+    return meta;
+}
 
 struct MemoryScanHit {
     std::string label;
@@ -1158,7 +1294,32 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    // Replace default blue accents with a readable red palette.
+    style.WindowRounding = 8.0f;
+    style.PopupRounding = 8.0f;
+    style.FrameRounding = 6.0f;
+    style.ChildRounding = 6.0f;
+    style.TabRounding = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowPadding = ImVec2(12.0f, 10.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
+    style.ScrollbarSize = 8.0f;
+    style.FrameBorderSize = 0.0f;
+    style.WindowBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
+
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.055f, 0.059f, 0.96f);
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.090f, 0.072f, 0.074f, 0.90f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.090f, 0.058f, 0.058f, 0.96f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.06f, 0.07f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.07f, 0.06f, 0.06f, 0.85f);
+
     style.Colors[ImGuiCol_CheckMark] = ImVec4(0.95f, 0.30f, 0.30f, 1.00f);
     style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.88f, 0.28f, 0.28f, 1.00f);
     style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(1.00f, 0.40f, 0.40f, 1.00f);
@@ -1179,18 +1340,85 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     style.Colors[ImGuiCol_TabActive] = ImVec4(0.48f, 0.18f, 0.18f, 1.00f);
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.18f, 0.10f, 0.10f, 0.97f);
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.33f, 0.14f, 0.14f, 1.00f);
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
-    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.07f, 0.07f, 0.95f);
     style.Colors[ImGuiCol_Border] = ImVec4(0.56f, 0.22f, 0.22f, 0.68f);
     style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.75f, 0.25f, 0.25f, 0.45f);
-    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
     style.Colors[ImGuiCol_NavHighlight] = ImVec4(0.96f, 0.34f, 0.34f, 1.00f);
+
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    io.Fonts->Clear();
+    g_overlayFontRegular = nullptr;
+    g_overlayFontBold = nullptr;
+
+    constexpr float kOverlayRegularFontSize = 14.5f;
+    constexpr float kOverlayBoldFontSize = 15.5f;
+    ImFontConfig overlayFontConfig;
+    overlayFontConfig.OversampleH = 2;
+    overlayFontConfig.OversampleV = 1;
+    overlayFontConfig.PixelSnapH = true;
+    overlayFontConfig.RasterizerMultiply = 1.1f;
+
+    char windowsDir[MAX_PATH] = {};
+    if (GetWindowsDirectoryA(windowsDir, MAX_PATH) > 0) {
+        std::filesystem::path fontsDir = std::filesystem::path(windowsDir) / "Fonts";
+        constexpr std::array<const char*, 2> kRobotoRegularCandidates = {
+            "Roboto-Regular.ttf",
+            "Roboto/static/Roboto-Regular.ttf"
+        };
+        constexpr std::array<const char*, 2> kRobotoBoldCandidates = {
+            "Roboto-Bold.ttf",
+            "Roboto/static/Roboto-Bold.ttf"
+        };
+
+        for (const char* candidate : kRobotoRegularCandidates) {
+            std::filesystem::path fontPath = fontsDir / candidate;
+            if (std::filesystem::exists(fontPath)) {
+                g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+                    fontPath.string().c_str(), kOverlayRegularFontSize, &overlayFontConfig);
+                if (g_overlayFontRegular) {
+                    break;
+                }
+            }
+        }
+        for (const char* candidate : kRobotoBoldCandidates) {
+            std::filesystem::path fontPath = fontsDir / candidate;
+            if (std::filesystem::exists(fontPath)) {
+                g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+                    fontPath.string().c_str(), kOverlayBoldFontSize, &overlayFontConfig);
+                if (g_overlayFontBold) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeui.ttf", kOverlayRegularFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeuib.ttf", kOverlayBoldFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\arial.ttf", kOverlayRegularFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\arialbd.ttf", kOverlayBoldFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\tahoma.ttf", kOverlayRegularFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = g_overlayFontRegular;
+    }
+    io.FontDefault = g_overlayFontRegular;
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX9_Init(device);
@@ -1233,6 +1461,42 @@ static void ShutdownImGui() {
     g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
     g_prevShowImGui = false;
+}
+
+static void DrawRemixApiStatusLine(RemixLightingManager& remixManager, CustomLightsManager& customManager) {
+    int shaderActive = 0;
+    for (const auto& kv : remixManager.ActiveLights()) {
+        if (kv.second.handle) {
+            ++shaderActive;
+        }
+    }
+    int customActive = 0;
+    for (const auto& l : customManager.Lights()) {
+        if (l.enabled && l.nativeHandle) {
+            ++customActive;
+        }
+    }
+
+    const bool ready = remix_api::g_initialized;
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float pulse = 0.65f + 0.35f * (0.5f + 0.5f * sinf(t * 6.2831853f));
+    const ImVec4 dotColor = ready ? ImVec4(0.20f, 0.95f, 0.35f, 1.00f) : ImVec4(0.92f, 0.22f, 0.22f, pulse);
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float radius = ready ? 4.0f : 3.0f + pulse * 1.5f;
+    ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + 7.0f, p.y + ImGui::GetTextLineHeight() * 0.5f), radius, ImGui::ColorConvertFloat4ToU32(dotColor));
+    ImGui::Dummy(ImVec2(14.0f, 0.0f));
+    ImGui::SameLine(0.0f, 6.0f);
+    if (ready) {
+        ImGui::TextColored(ImVec4(0.50f, 0.95f, 0.60f, 1.0f), "Remix API Ready");
+        ImGui::SameLine();
+        ImGui::TextDisabled("shader: %d  custom: %d", shaderActive, customActive);
+    } else {
+        ImGui::TextColored(ImVec4(0.96f, 0.36f, 0.36f, 1.0f), "Remix API not initialized");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(run with RTX Remix)");
+    }
+    ImGui::Separator();
 }
 
 static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) {
@@ -1466,6 +1730,24 @@ static bool SaveConfigRegisterValue(const char* key, int value) {
     return WritePrivateProfileStringA("CameraProxy", key, valueBuf, g_iniPath) != FALSE;
 }
 
+static bool SaveConfigRegisterValueInSection(const char* section, const char* key, int value) {
+    if (g_iniPath[0] == '\0') return false;
+    char valueBuf[32] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%d", value);
+    return WritePrivateProfileStringA(section, key, valueBuf, g_iniPath) != FALSE;
+}
+
+static bool SaveConfigBoolValueInSection(const char* section, const char* key, bool value) {
+    return SaveConfigRegisterValueInSection(section, key, value ? 1 : 0);
+}
+
+static bool SaveConfigFloatValueInSection(const char* section, const char* key, float value) {
+    if (g_iniPath[0] == '\0') return false;
+    char valueBuf[64] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%.7g", value);
+    return WritePrivateProfileStringA(section, key, valueBuf, g_iniPath) != FALSE;
+}
+
 static bool SaveConfigBoolValue(const char* key, bool value) {
     return SaveConfigRegisterValue(key, value ? 1 : 0);
 }
@@ -1626,6 +1908,21 @@ static void DrawMatrixWithTranspose(const char* label, const D3DMATRIX& mat, boo
     DrawMatrix(label, transposed, available);
 }
 
+static void DrawCameraMatrixPanel(const char* childId,
+                                  const char* title,
+                                  MatrixSlot slot,
+                                  const D3DMATRIX& mat,
+                                  bool available,
+                                  bool transpose) {
+    if (ImGui::BeginChild(childId, ImVec2(0, 0), true)) {
+        ImGui::TextUnformatted(title);
+        ImGui::Separator();
+        DrawMatrixWithTranspose("Matrix", mat, available, transpose);
+        DrawMatrixSourceInfo(slot, available);
+    }
+    ImGui::EndChild();
+}
+
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing) {
     if (shaderKey == 0 && !createIfMissing) {
         return nullptr;
@@ -1777,48 +2074,6 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
     out._42 = -(view._41 * out._12 + view._42 * out._22 + view._43 * out._32);
     out._43 = -(view._41 * out._13 + view._42 * out._23 + view._43 * out._33);
     return out;
-}
-
-static bool ViewMatrixCanUseFastInverse(const D3DMATRIX& view) {
-    const float row0len = sqrtf(Dot3(view._11, view._12, view._13, view._11, view._12, view._13));
-    const float row1len = sqrtf(Dot3(view._21, view._22, view._23, view._21, view._22, view._23));
-    const float row2len = sqrtf(Dot3(view._31, view._32, view._33, view._31, view._32, view._33));
-
-    if (fabsf(row0len - 1.0f) > 0.05f || fabsf(row1len - 1.0f) > 0.05f || fabsf(row2len - 1.0f) > 0.05f) {
-        return false;
-    }
-    if (fabsf(Dot3(view._11, view._12, view._13, view._21, view._22, view._23)) > 0.05f) return false;
-    if (fabsf(Dot3(view._11, view._12, view._13, view._31, view._32, view._33)) > 0.05f) return false;
-    if (fabsf(Dot3(view._21, view._22, view._23, view._31, view._32, view._33)) > 0.05f) return false;
-    if (fabsf(view._14) > 0.01f || fabsf(view._24) > 0.01f || fabsf(view._34) > 0.01f || fabsf(view._44 - 1.0f) > 0.01f) {
-        return false;
-    }
-    return true;
-}
-
-static bool TryBuildWorldFromView(const D3DMATRIX& view, bool preferFastInverse, D3DMATRIX* outWorld,
-                                  bool* outUsedFast, bool* outFastEligible) {
-    if (!outWorld) {
-        return false;
-    }
-
-    const bool fastEligible = ViewMatrixCanUseFastInverse(view);
-    if (outFastEligible) {
-        *outFastEligible = fastEligible;
-    }
-
-    if (preferFastInverse && fastEligible) {
-        *outWorld = InvertSimpleRigidView(view);
-        if (outUsedFast) {
-            *outUsedFast = true;
-        }
-        return true;
-    }
-
-    if (outUsedFast) {
-        *outUsedFast = false;
-    }
-    return InvertMatrix4x4Deterministic(view, outWorld, nullptr);
 }
 
 static const char* GameProfileLabel(GameProfileKind profile) {
@@ -2400,6 +2655,7 @@ static void UpdateHotkeys() {
     if (g_showImGui && !g_prevShowImGui) {
         // Menu just became visible — release any game mouse capture.
         ReleaseCapture();
+        g_selectCameraTabOnMenuOpen = true;
     }
     g_prevShowImGui = g_showImGui;
     UpdateInputBlockHooks();
@@ -2418,6 +2674,7 @@ static void UpdateFrameTimeStats() {
     double delta = static_cast<double>(now.QuadPart - g_prevCounter.QuadPart) /
                    static_cast<double>(g_perfFrequency.QuadPart);
     g_prevCounter = now;
+	g_lastDeltaSec = static_cast<float>(delta);
 
     float ms = static_cast<float>(delta * 1000.0);
     g_frameTimeHistory[g_frameTimeIndex] = ms;
@@ -2498,9 +2755,6 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
     }
     ImGui::SameLine();
     ImGui::Text("Status: %s", g_pauseRendering ? "Paused" : "Running");
-    ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them "
-                       "to the RTX Remix runtime through SetTransform() so Remix gets camera data in D3D9 titles.");
-
     if (ImGui::SliderFloat("UI scale", &g_imguiScaleRuntime, 0.5f, 3.0f, "%.2fx")) {
         ApplyImGuiScale(g_imguiHwnd);
         g_config.imguiScale = g_imguiScaleRuntime;
@@ -2548,18 +2802,138 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
     }
 
     ImGui::Separator();
-    ImGui::Text("Credits: ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
-    ImGui::SameLine();
-    ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
-    ImGui::Text("modified by ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
-
-    ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
-        if (ImGui::BeginTabItem("Camera")) {
+        PushOverlayBoldFont();
+        bool aboutTabOpen = ImGui::BeginTabItem("About");
+        PopOverlayBoldFont();
+        if (aboutTabOpen) {
+            auto DrawCenteredLine = [](const char* text, const ImVec4& color) {
+                ImVec2 textSize = ImGui::CalcTextSize(text);
+                float offset = (ImGui::GetContentRegionAvail().x - textSize.x) * 0.5f;
+                if (offset > 0.0f) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+                }
+                ImGui::TextColored(color, "%s", text);
+            };
+            auto DrawSectionLabel = [](const char* text) {
+                float width = ImGui::GetContentRegionAvail().x;
+                if (width < 220.0f) {
+                    width = 220.0f;
+                }
+                ImVec2 textSize = ImGui::CalcTextSize(text);
+                float offset = (ImGui::GetContentRegionAvail().x - width) * 0.5f;
+                if (offset > 0.0f) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+                }
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 7.0f));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.22f, 0.28f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.96f, 0.98f, 1.0f));
+                ImGui::BeginDisabled();
+                ImGui::Button(text, ImVec2(width, textSize.y + 14.0f));
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar(2);
+            };
+
+            ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them to RTX Remix through SetTransform(). The guidance below explains where each matrix typically appears, how to validate it, and how to avoid false positives.");
+            ImGui::Separator();
+
+            PushOverlayBoldFont();
+            ImGui::Text("Credits");
+            PopOverlayBoldFont();
+            ImGui::Text("Original project:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
+            ImGui::SameLine();
+            ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
+            ImGui::Text("Modified by ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
+
+            ImGui::Separator();
+            PushOverlayBoldFont();
+            ImGui::Text("Detailed tab guide for matrix hunting and verification");
+            PopOverlayBoldFont();
+            ImGui::BeginChild("AboutGuide", ImVec2(0, 430), true);
+
+            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Important: start from Camera, validate in Constants, then confirm source shaders before pinning overrides.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("1) Camera tab (default workflow anchor)");
+            ImGui::TextWrapped("Use Camera as your live truth panel. Verify SetTransform seen flags, monitor current World/View/Projection captures, and compare stability during movement, cutscenes, pause states, and FOV changes. Pin registers only after repeated scene transitions confirm stable behavior. If Remix drifts while matrices look plausible, compare update cadence (which matrix changes per frame) and reset overrides that desynchronize.");
+            ImGui::Spacing();
+
+            PushOverlayBoldFont();
+            ImGui::Text("Matrix taxonomy and literature-style examples");
+            PopOverlayBoldFont();
+            ImGui::TextWrapped("Reference conventions vary (row-major vs column-major, left-handed vs right-handed). Focus on recognizable patterns and behavior rather than exact sign placement.");
+            ImGui::Spacing();
+
+            ImGui::BeginChild("MatrixExamples", ImVec2(0, 290), true);
+            DrawCenteredLine("World matrix (object/local to world transform, common structure)", ImVec4(1.0f, 0.88f, 0.72f, 1.0f));
+            DrawCenteredLine("[ Xx   Xy   Xz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Yx   Yy   Yz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Zx   Zy   Zz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Tx   Ty   Tz   1 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            ImGui::Spacing();
+
+            DrawCenteredLine("View matrix (rigid camera transform, literature pattern)", ImVec4(0.74f, 0.88f, 1.0f, 1.0f));
+            DrawCenteredLine("[  Rx   Ry   Rz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            DrawCenteredLine("[  Ux   Uy   Uz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            DrawCenteredLine("[ -Fx  -Fy  -Fz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            DrawCenteredLine("[  Tx   Ty   Tz   1 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            ImGui::Spacing();
+
+            DrawCenteredLine("Projection matrix (D3D-style perspective, common structure)", ImVec4(0.74f, 1.0f, 0.78f, 1.0f));
+            DrawCenteredLine("[ sx   0    0    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            DrawCenteredLine("[ 0    sy   0    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            DrawCenteredLine("[ 0    0    A    1 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            DrawCenteredLine("[ 0    0    B    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            ImGui::Spacing();
+
+            DrawCenteredLine("Red flags for incorrect matrix candidates", ImVec4(1.0f, 0.78f, 0.78f, 1.0f));
+            DrawCenteredLine("- random high-magnitude jumps every frame", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
+            DrawCenteredLine("- no coherent response to camera rotation/translation", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
+            DrawCenteredLine("- perspective terms missing or unstable under FOV changes", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
+            ImGui::EndChild();
+            ImGui::Spacing();
+
+            DrawSectionLabel("2) Shaders tab (source attribution and assembly forensics)");
+            ImGui::TextWrapped("Use Shaders to identify exactly which vertex shader owns suspicious constants. Sort/filter by usage count and stable hash, then inspect disassembly comments to spot constant register ranges (for example, comments near dp4/mad instructions that reference c0-c3, c4-c7, c8-c11). These assembly comments often reveal matrix intent directly, making it faster to map constants to World, View, Projection, or combined MVP blocks before applying any override.");
+            ImGui::TextWrapped("When comments expose transform semantics, cross-check the same registers in Constants and verify temporal coherence over multiple camera motions. This prevents selecting short-lived registers used for effects instead of camera transforms.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("3) Constants tab (precision register validation)");
+            ImGui::TextWrapped("Constants is the high-precision inspector. Pick an active shader, watch live c-register values, and inspect 4-register groups as candidate 4x4 matrices. Validate candidates by structure first, then by motion response: view matrices should rotate/translate coherently with camera movement, while projection rows should reflect perspective scaling and depth mapping.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("4) Remix API tab (runtime integration sanity checks)");
+            ImGui::TextWrapped("Use this tab after matrices are stable. Confirm API readiness, inspect shader/custom light state, and separate camera extraction issues from runtime-side lighting/integration behavior.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("5) Memory Scanner tab (fallback hypothesis generation)");
+            ImGui::TextWrapped("When shader heuristics fail, scan memory for 4x4 candidates. Treat each hit as a hypothesis: assign temporarily, return to Camera, and reject any candidate that breaks under rapid movement, FOV change, area transitions, or pause/unpause.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("6) Logs tab (frame-accurate correlation)");
+            ImGui::TextWrapped("Correlate assignment events, shader switches, and scan timings with what you observe in Camera/Constants. Logs are the fastest way to identify the exact frame window where a matrix starts diverging.");
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Recommended workflow: Camera -> Shaders -> Constants -> (optional) Memory Scanner -> Camera re-check -> Remix API -> Logs.");
+
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
+        ImGuiTabItemFlags cameraTabFlags = g_selectCameraTabOnMenuOpen ? ImGuiTabItemFlags_SetSelected : 0;
+        bool cameraTabOpen = ImGui::BeginTabItem("Camera", nullptr, cameraTabFlags);
+        g_selectCameraTabOnMenuOpen = false;
+        PopOverlayBoldFont();
+        if (cameraTabOpen) {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
             ImGui::Text("Game SetTransform seen: WORLD=%s VIEW=%s PROJECTION=%s",
                         g_gameSetTransformSeen[0] ? "yes" : "no",
@@ -2632,34 +3006,35 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 }
             }
             ImGui::Separator();
-            DrawMatrixWithTranspose("World", camSnapshot.world, camSnapshot.hasWorld,
-                                    g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_World, camSnapshot.hasWorld);
-            ImGui::Separator();
-            DrawMatrixWithTranspose("View", camSnapshot.view, camSnapshot.hasView,
-                                    g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_View, camSnapshot.hasView);
-            if (ImGui::CollapsingHeader("Experimental inverse View -> World", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::Checkbox("Use inverse(View) as emitted World matrix", &g_config.experimentalInverseViewAsWorld)) {
-                    SaveConfigBoolValue("ExperimentalInverseViewAsWorld", g_config.experimentalInverseViewAsWorld);
-                }
-                if (ImGui::Checkbox("Allow inverse(View) even if strict validity check fails", &g_config.experimentalInverseViewAsWorldAllowUnverified)) {
-                    SaveConfigBoolValue("ExperimentalInverseViewAsWorldAllowUnverified",
-                                        g_config.experimentalInverseViewAsWorldAllowUnverified);
-                }
-                if (ImGui::Checkbox("Fast inverse (rigid transform only)", &g_config.experimentalInverseViewAsWorldFast)) {
-                    SaveConfigBoolValue("ExperimentalInverseViewAsWorldFast",
-                                        g_config.experimentalInverseViewAsWorldFast);
-                }
-                ImGui::TextWrapped("Fast inverse assumes no scaling/shear: transpose the 3x3 rotation and recompute translation via negative dot products.");
-                ImGui::Text("Last strict validity result: %s", g_lastInverseViewAsWorldEligible ? "valid" : "invalid");
-                ImGui::Text("Last inverse(View)->World application: %s", g_lastInverseViewAsWorldApplied ? "applied" : "not applied");
-                ImGui::Text("Last method: %s", g_lastInverseViewAsWorldUsedFast ? "fast inverse" : "full 4x4 inverse");
-            }
-            ImGui::Separator();
-            DrawMatrixWithTranspose("Projection", camSnapshot.projection,
-                                    camSnapshot.hasProjection, g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_Projection, camSnapshot.hasProjection);
+            const float matrixPanelHeight = ImGui::GetTextLineHeightWithSpacing() * 11.5f;
+            ImGui::Columns(3, "CameraPrimaryMatrices", false);
+            ImGui::BeginChild("WorldMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("WorldMatrixPanelInner",
+                                  "World",
+                                  MatrixSlot_World,
+                                  camSnapshot.world,
+                                  camSnapshot.hasWorld,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ViewMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("ViewMatrixPanelInner",
+                                  "View",
+                                  MatrixSlot_View,
+                                  camSnapshot.view,
+                                  camSnapshot.hasView,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ProjectionMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("ProjectionMatrixPanelInner",
+                                  "Projection",
+                                  MatrixSlot_Projection,
+                                  camSnapshot.projection,
+                                  camSnapshot.hasProjection,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::Columns(1);
             if (g_projectionDetectedByNumericStructure) {
                 ImGui::Text("Projection numeric detection: ACTIVE");
                 ImGui::Text("FOV: %.2f deg (%.3f rad)",
@@ -2822,13 +3197,57 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             if (g_matrixAssignStatus[0] != '\0') {
                 ImGui::TextWrapped("%s", g_matrixAssignStatus);
             }
+
+            ImGui::Separator();
+            ImGui::Text("Currently bound custom projection");
+            D3DMATRIX customProjectionPreview = {};
+            bool customProjectionUsesAuto = false;
+            float customProjectionAspect = 0.0f;
+            UINT customProjectionWidth = 0;
+            UINT customProjectionHeight = 0;
+            bool customProjectionAvailable = BuildExperimentalCustomProjectionMatrix(device,
+                                                                                      g_imguiHwnd,
+                                                                                      &customProjectionPreview,
+                                                                                      &customProjectionUsesAuto,
+                                                                                      &customProjectionAspect,
+                                                                                      &customProjectionWidth,
+                                                                                      &customProjectionHeight);
+            if (customProjectionAvailable) {
+                ImGui::Text("Mode: %s", customProjectionUsesAuto ? "auto-generated" : "manual");
+                if (customProjectionUsesAuto) {
+                    ImGui::Text("Resolved aspect: %.6f", customProjectionAspect);
+                    if (customProjectionWidth > 0 && customProjectionHeight > 0) {
+                        ImGui::Text("Source viewport: %ux%u", customProjectionWidth, customProjectionHeight);
+                    }
+                }
+            } else if (!g_config.experimentalCustomProjectionEnabled) {
+                ImGui::TextDisabled("Unavailable (ExperimentalCustomProjectionEnabled=0)");
+            } else {
+                ImGui::TextDisabled("Unavailable (projection mode or inputs invalid)");
+            }
+            DrawMatrixWithTranspose("Custom projection matrix",
+                                    customProjectionPreview,
+                                    customProjectionAvailable,
+                                    g_showTransposedMatrices);
+
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Shader")) {
+        PushOverlayBoldFont();
+        bool shaderTabOpen = ImGui::BeginTabItem("Shaders");
+        PopOverlayBoldFont();
+        if (shaderTabOpen) {
             static char shaderFilter[64] = "";
             static const char* kShaderListOrderModes[] = {"Insertion order", "Hash (ascending)"};
+            static const char* kShaderSearchScopeModes[] = {
+                "List labels",
+                "All shader assemblies",
+                "Selected shader assembly"
+            };
             ImGui::InputText("Filter", shaderFilter, sizeof(shaderFilter));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::Combo("Search scope", &g_shaderSearchScopeMode, kShaderSearchScopeModes, IM_ARRAYSIZE(kShaderSearchScopeModes));
             ImGui::SameLine();
             ImGui::SetNextItemWidth(180.0f);
             ImGui::Combo("Order", &g_shaderListOrderMode, kShaderListOrderModes, IM_ARRAYSIZE(kShaderListOrderModes));
@@ -2855,6 +3274,36 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             }
 
             ImGui::Columns(3, "ShaderCols", true);
+            ImGui::BeginChild("ShaderBrowserTools", ImVec2(0, 72), true);
+            ImGui::TextUnformatted("Shader dump tools");
+            ImGui::Spacing();
+            const float dumpButtonWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x);
+            const float halfDumpButtonWidth = dumpButtonWidth > 0.0f ? dumpButtonWidth * 0.5f : 0.0f;
+            if (ImGui::Button("Dump all assembly", ImVec2(halfDumpButtonWidth, 0))) {
+                std::filesystem::create_directories("Shader_dump");
+                for (ShaderRecord* recPtr : shaderSnapshot) {
+                    if (!recPtr) continue;
+                    char path[128];
+                    snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", recPtr->hash);
+                    std::ofstream(path) << recPtr->editableAssembly;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Dump all bytecode", ImVec2(halfDumpButtonWidth, 0))) {
+                std::filesystem::create_directories("Shader_dump");
+                for (ShaderRecord* recPtr : shaderSnapshot) {
+                    if (!recPtr) continue;
+                    char path[128];
+                    snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", recPtr->hash);
+                    std::ofstream f(path, std::ios::binary);
+                    const std::vector<uint32_t>& data = recPtr->replacementEnabled && !recPtr->modifiedBytecode.empty()
+                                                             ? recPtr->modifiedBytecode
+                                                             : recPtr->originalBytecode;
+                    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint32_t));
+                }
+            }
+            ImGui::EndChild();
+            ImGui::Spacing();
             ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
             for (ShaderRecord* recPtr : shaderSnapshot) {
                 if (!recPtr) continue;
@@ -2865,7 +3314,23 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                          rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
                          static_cast<int>(rec.ir.size()), rec.usageCount,
                          (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
-                if (shaderFilter[0] && strstr(visibleLabel, shaderFilter) == nullptr) continue;
+                if (shaderFilter[0]) {
+                    bool matchesFilter = ContainsCaseInsensitive(visibleLabel, shaderFilter);
+                    if (g_shaderSearchScopeMode == ShaderSearchScope_AllAssemblies) {
+                        if (!matchesFilter) {
+                            matchesFilter = ContainsCaseInsensitive(rec.cachedDisassembly, shaderFilter) ||
+                                            ContainsCaseInsensitive(rec.editableAssembly, shaderFilter);
+                        }
+                    } else if (g_shaderSearchScopeMode == ShaderSearchScope_SelectedAssembly) {
+                        if (shaderKey != g_selectedShaderKey) {
+                            matchesFilter = false;
+                        } else if (!matchesFilter) {
+                            matchesFilter = ContainsCaseInsensitive(rec.cachedDisassembly, shaderFilter) ||
+                                            ContainsCaseInsensitive(rec.editableAssembly, shaderFilter);
+                        }
+                    }
+                    if (!matchesFilter) continue;
+                }
                 bool selected = (shaderKey == g_selectedShaderKey);
                 char selectableLabel[320];
                 snprintf(selectableLabel, sizeof(selectableLabel), "%s###shader_row_%p", visibleLabel,
@@ -2997,6 +3462,45 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 ImGui::Checkbox("Force FFP transform emission", &g_forceFfpTransform);
                 ImGui::InputInt("Manual transform base", &g_manualTransformBaseOverride);
                 ImGui::InputInt("Manual lighting base", &g_manualLightingBaseOverride);
+                if (rec.isFFPLighting) {
+                    ImGui::Separator();
+                    ImGui::Text("Lighting register overrides (-1 = use auto-detected)");
+                    ImGui::TextDisabled("Auto: dir=c%d  color=c%d  pos=c%d  atten=c%d  cone=c%d",
+                                        rec.lightDirectionRegister,
+                                        rec.lightColorRegister,
+                                        rec.positionRegister,
+                                        rec.attenuationRegister,
+                                        rec.coneAngleRegister);
+
+                    ImGui::InputInt("Direction register##ldir", &rec.lightDirectionRegisterOverride);
+                    ImGui::InputInt("Color register##lcol", &rec.lightColorRegisterOverride);
+                    ImGui::InputInt("Material color reg##lmat", &rec.materialColorRegisterOverride);
+                    ImGui::InputInt("Position register##lpos", &rec.positionRegisterOverride);
+                    ImGui::InputInt("Attenuation register##latten", &rec.attenuationRegisterOverride);
+                    ImGui::InputInt("Cone angle register##lcone", &rec.coneAngleRegisterOverride);
+                    ImGui::InputInt("Light count override##lcnt", &rec.lightCountOverride);
+                    ImGui::TextDisabled("Light count: -1 = default (1)");
+
+                    ImGui::Text("Light space override:");
+                    const char* spaceLabels[] = { "Auto (use detected)", "World", "View", "Object" };
+                    int spaceIdx = static_cast<int>(rec.lightSpaceOverride) + 1;
+                    if (ImGui::Combo("##lspace", &spaceIdx, spaceLabels, 4)) {
+                        rec.lightSpaceOverride = static_cast<LightingSpace>(spaceIdx - 1);
+                    }
+
+                    if (rec.lightDirectionRegister >= 0) {
+                        int dr = (rec.lightDirectionRegisterOverride >= 0)
+                                     ? rec.lightDirectionRegisterOverride
+                                     : rec.lightDirectionRegister;
+                        int cr = (rec.lightColorRegisterOverride >= 0)
+                                     ? rec.lightColorRegisterOverride
+                                     : rec.lightColorRegister;
+                        ImGui::TextDisabled("Live dir  c%d: [%.3f %.3f %.3f]", dr,
+                                            g_vsConstants[dr][0], g_vsConstants[dr][1], g_vsConstants[dr][2]);
+                        ImGui::TextDisabled("Live color c%d: [%.3f %.3f %.3f]", cr,
+                                            g_vsConstants[cr][0], g_vsConstants[cr][1], g_vsConstants[cr][2]);
+                    }
+                }
 
                 ImGui::Separator();
                 ImGui::Text("Constant monitor (selected shader)");
@@ -3022,7 +3526,10 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Constants")) {
+        PushOverlayBoldFont();
+        bool constantsTabOpen = ImGui::BeginTabItem("Constants");
+        PopOverlayBoldFont();
+        if (constantsTabOpen) {
             g_constantUploadRecordingEnabled = true;
             ImGui::Text("Per-shader snapshots update every frame.");
             if (g_selectedShaderKey == 0) {
@@ -3370,7 +3877,93 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Memory Scanner")) {
+        PushOverlayBoldFont();
+        bool remixApiTabOpen = ImGui::BeginTabItem("Remix API");
+        PopOverlayBoldFont();
+        if (remixApiTabOpen) {
+            DrawRemixApiStatusLine(g_remixLightingManager, g_customLightsManager);
+            PushOverlayBoldFont();
+            if (ImGui::BeginTabBar("RemixApiSubTabs")) {
+                if (ImGui::BeginTabItem("Shader Lights")) {
+                    PopOverlayBoldFont();
+                    DrawRemixLightsTab(g_remixLightingManager, false);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                if (ImGui::BeginTabItem("Custom Lights")) {
+                    PopOverlayBoldFont();
+                    DrawCustomLightsTab(g_customLightsManager);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                if (ImGui::BeginTabItem("Blend Mode")) {
+                    PopOverlayBoldFont();
+                    bool configDirty = false;
+                    if (ImGui::Checkbox("Enable Raster Blend", &g_config.rasterBlendEnabled)) {
+                        configDirty |= SaveConfigBoolValueInSection("RasterBlend", "Enabled", g_config.rasterBlendEnabled);
+                    }
+                    if (g_config.rasterBlendEnabled && !remix_api::g_initialized) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.25f, 1.0f), "Raster Blend requires RTX Remix to be running.");
+                    }
+                    if (g_config.rasterBlendEnabled) {
+                        static const char* kBlendModes[] = {
+                            "Multiply (raster × remix)",
+                            "Additive (remix + raster)",
+                            "Lerp (mix ratio)"
+                        };
+                        if (ImGui::Combo("Blend Mode", &g_config.rasterBlendMode, kBlendModes, IM_ARRAYSIZE(kBlendModes))) {
+                            g_config.rasterBlendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+                            configDirty |= SaveConfigRegisterValueInSection("RasterBlend", "Mode", g_config.rasterBlendMode);
+                        }
+                        if (ImGui::SliderFloat("Mix Strength", &g_config.rasterBlendMixStrength, 0.0f, 1.0f, "%.2f")) {
+                            configDirty |= SaveConfigFloatValueInSection("RasterBlend", "MixStrength", g_config.rasterBlendMixStrength);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            if (g_config.rasterBlendMode == RasterBlendMode_Multiply) {
+                                ImGui::SetTooltip("1.0 = full multiply, 0.0 = pure Remix");
+                            } else if (g_config.rasterBlendMode == RasterBlendMode_Additive) {
+                                ImGui::SetTooltip("amount of rasterized image added over Remix");
+                            } else {
+                                ImGui::SetTooltip("0.0 = pure Remix, 1.0 = pure rasterizer");
+                            }
+                        }
+                        if (ImGui::Checkbox("White Materials in Remix", &g_config.rasterBlendWhiteMaterials)) {
+                            configDirty |= SaveConfigBoolValueInSection("RasterBlend", "WhiteMaterials", g_config.rasterBlendWhiteMaterials);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Enables rtx.whiteMaterialModeEnabled so multiply mode restores original textures over Remix lighting.");
+                        }
+
+                        ImGui::Separator();
+                        ImGui::Text("Status:");
+                        ImGui::TextColored(g_rasterBlendResourcesFailed ? ImVec4(0.95f, 0.35f, 0.35f, 1.0f) : ImVec4(0.35f, 0.95f, 0.35f, 1.0f),
+                                           "Resources: %s", g_rasterBlendResourcesFailed ? "failed" : "ready / pending");
+                        ImGui::TextColored(g_rasterBlendLastRasterCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                                           "Raster capture: %s", g_rasterBlendLastRasterCapture ? "ok" : "missing");
+                        ImGui::TextColored(g_rasterBlendLastRemixCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                                           "Remix capture: %s", g_rasterBlendLastRemixCapture ? "ok" : "missing");
+
+                        if (ImGui::CollapsingHeader("Known Limitations")) {
+                            ImGui::TextWrapped("Games that finish to offscreen render targets can produce a blank backbuffer capture at EndScene.");
+                            ImGui::TextWrapped("Raster post-processing (bloom, tone mapping, grading, UI) is captured and can be double-applied with Remix.");
+                            ImGui::TextWrapped("Multiply mode is designed for neutral/white Remix materials; enable White Materials for best results.");
+                            ImGui::TextWrapped("Feature is inactive while Remix is not running.");
+                        }
+                    }
+                    (void)configDirty;
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                ImGui::EndTabBar();
+            }
+            PopOverlayBoldFont();
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
+        bool memoryscannerTabOpen = ImGui::BeginTabItem("Memory Scanner");
+        PopOverlayBoldFont();
+        if (memoryscannerTabOpen) {
             if (ImGui::Button("Start memory scan")) {
                 StartMemoryScanner();
             }
@@ -3416,7 +4009,10 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Logs")) {
+        PushOverlayBoldFont();
+        bool logsTabOpen = ImGui::BeginTabItem("Logs");
+        PopOverlayBoldFont();
+        if (logsTabOpen) {
             ImGui::Checkbox("Live update", &g_logsLiveUpdate);
             ImGui::SameLine();
             if (ImGui::Button("Refresh")) {
@@ -3862,6 +4458,87 @@ static bool CrossValidateViewAgainstProjection(const D3DMATRIX& candidateView,
            (fabsf(vp_c1 - p_c1) / p_c1 < kTol);
 }
 
+static float MatrixMaxAbsDiff(const D3DMATRIX& a, const D3DMATRIX& b) {
+    const float* pa = reinterpret_cast<const float*>(&a);
+    const float* pb = reinterpret_cast<const float*>(&b);
+    float maxErr = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        maxErr = (std::max)(maxErr, fabsf(pa[i] - pb[i]));
+    }
+    return maxErr;
+}
+
+enum ViewCandidateConsistency {
+    ViewCandidateConsistency_None,
+    ViewCandidateConsistency_Original,
+    ViewCandidateConsistency_Inverse,
+    ViewCandidateConsistency_Ambiguous
+};
+
+static ViewCandidateConsistency ResolveViewInverseConsistency(const D3DMATRIX& originalView,
+                                                              const D3DMATRIX& inverseView,
+                                                              const D3DMATRIX* knownProjection,
+                                                              bool hasProjection,
+                                                              const D3DMATRIX* knownWorld,
+                                                              bool hasWorld,
+                                                              const D3DMATRIX* knownVP,
+                                                              bool hasVP,
+                                                              const D3DMATRIX* knownWV,
+                                                              bool hasWV,
+                                                              const D3DMATRIX* knownMVP,
+                                                              bool hasMVP) {
+    constexpr float kTolerance = 0.08f;
+    constexpr float kEdge = 0.02f;
+
+    int originalVotes = 0;
+    int inverseVotes = 0;
+    int checks = 0;
+
+    auto voteForLowerError = [&](float originalErr, float inverseErr) {
+        ++checks;
+        const bool originalGood = originalErr <= kTolerance;
+        const bool inverseGood = inverseErr <= kTolerance;
+        if (originalGood && !inverseGood) {
+            ++originalVotes;
+        } else if (inverseGood && !originalGood) {
+            ++inverseVotes;
+        } else if ((std::max)(0.0f, inverseErr - originalErr) > kEdge) {
+            ++originalVotes;
+        } else if ((std::max)(0.0f, originalErr - inverseErr) > kEdge) {
+            ++inverseVotes;
+        }
+    };
+
+    if (hasProjection && hasVP && knownProjection && knownVP) {
+        const D3DMATRIX originalVP = MultiplyMatrix(originalView, *knownProjection);
+        const D3DMATRIX inverseVP = MultiplyMatrix(inverseView, *knownProjection);
+        voteForLowerError(MatrixMaxAbsDiff(originalVP, *knownVP),
+                         MatrixMaxAbsDiff(inverseVP, *knownVP));
+    }
+    if (hasWorld && hasWV && knownWorld && knownWV) {
+        const D3DMATRIX originalWV = MultiplyMatrix(*knownWorld, originalView);
+        const D3DMATRIX inverseWV = MultiplyMatrix(*knownWorld, inverseView);
+        voteForLowerError(MatrixMaxAbsDiff(originalWV, *knownWV),
+                         MatrixMaxAbsDiff(inverseWV, *knownWV));
+    }
+    if (hasWorld && hasProjection && hasMVP && knownWorld && knownProjection && knownMVP) {
+        const D3DMATRIX originalMVP = MultiplyMatrix(MultiplyMatrix(*knownWorld, originalView), *knownProjection);
+        const D3DMATRIX inverseMVP = MultiplyMatrix(MultiplyMatrix(*knownWorld, inverseView), *knownProjection);
+        voteForLowerError(MatrixMaxAbsDiff(originalMVP, *knownMVP),
+                         MatrixMaxAbsDiff(inverseMVP, *knownMVP));
+    }
+
+    if (checks == 0 || originalVotes == inverseVotes) {
+        if (checks > 0 && originalVotes > 0 && inverseVotes > 0) {
+            return ViewCandidateConsistency_Ambiguous;
+        }
+        return ViewCandidateConsistency_None;
+    }
+    return (inverseVotes > originalVotes)
+        ? ViewCandidateConsistency_Inverse
+        : ViewCandidateConsistency_Original;
+}
+
 static bool IsIdentityMatrix(const D3DMATRIX& m, float tolerance) {
     return fabsf(m._11 - 1.0f) < tolerance &&
            fabsf(m._22 - 1.0f) < tolerance &&
@@ -4216,7 +4893,7 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
         changed = false;
 
         if (!knownHasMv && *hasView && *hasWorld) {
-            knownMv = MultiplyMatrix(*view, *world);
+            knownMv = MultiplyMatrix(*world, *view);
             knownHasMv = true;
             changed = true;
         }
@@ -4231,14 +4908,14 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
             changed = true;
         }
         if (!knownHasMvp && knownHasVp && *hasWorld) {
-            knownMvp = MultiplyMatrix(knownVp, *world);
+            knownMvp = MultiplyMatrix(*world, knownVp);
             knownHasMvp = true;
             changed = true;
         }
 
         if (knownHasMvp && *hasWorld && !knownHasVp) {
             D3DMATRIX solvedVp = {};
-            if (TrySolveFromInverseRightMultiply(knownMvp, *world, &solvedVp)) {
+            if (TrySolveFromInverseLeftMultiply(*world, knownMvp, &solvedVp)) {
                 knownVp = solvedVp;
                 knownHasVp = true;
                 changed = true;
@@ -4255,8 +4932,8 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
 
         if (knownHasMv && !*hasWorld && *hasView) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*view, knownMv, &solved) &&
-                solveWorld(solved, "World = inv(View) * MV")) {
+            if (TrySolveFromInverseRightMultiply(knownMv, *view, &solved) &&
+                solveWorld(solved, "World = MV * inv(View)")) {
                 changed = true;
             }
         }
@@ -4270,8 +4947,8 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
 
         if (knownHasVp && !*hasView && *hasProjection) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(*projection, knownVp, &solved) &&
-                solveView(solved, "View = inv(Projection) * VP")) {
+            if (TrySolveFromInverseRightMultiply(knownVp, *projection, &solved) &&
+                solveView(solved, "View = VP * inv(Projection)")) {
                 changed = true;
             }
         }
@@ -4285,8 +4962,8 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
 
         if (knownHasMvp && knownHasVp && !*hasWorld) {
             D3DMATRIX solved = {};
-            if (TrySolveFromInverseLeftMultiply(knownVp, knownMvp, &solved) &&
-                solveWorld(solved, "World = inv(VP) * MVP")) {
+            if (TrySolveFromInverseRightMultiply(knownMvp, knownVp, &solved) &&
+                solveWorld(solved, "World = MVP * inv(VP)")) {
                 changed = true;
             }
         }
@@ -4299,7 +4976,7 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
         }
         if (knownHasVp && !*hasProjection && !*hasView && hasGeneratedProjection && g_config.allowGeneratedProjectionForVPDecomposition) {
             D3DMATRIX solvedView = {};
-            if (TrySolveFromInverseLeftMultiply(*generatedProjection, knownVp, &solvedView) &&
+            if (TrySolveFromInverseRightMultiply(knownVp, *generatedProjection, &solvedView) &&
                 IsProjectionCandidateForDecomposition(*generatedProjection) &&
                 IsViewCandidateForDecomposition(solvedView)) {
                 *projection = *generatedProjection;
@@ -4311,7 +4988,7 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
                 snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula),
                          "Projection = Generated manual/auto matrix (config-enabled)");
                 snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula),
-                         "View = inv(GeneratedProjection) * VP");
+                         "View = VP * inv(GeneratedProjection)");
                 changed = true;
             }
         }
@@ -4441,6 +5118,9 @@ private:
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
+    bool m_everHadView  = false;
+    bool m_everHadProj  = false;
+    bool m_everHadWorld = false;
     bool m_mgrrUseAutoProjection = false;
     int m_constantLogThrottle = 0;
     int m_viewLastFrame = -1;
@@ -4451,6 +5131,189 @@ private:
     int m_viewLockedRegister = -1;
     uintptr_t m_projLockedShader = 0;
     int m_projLockedRegister = -1;
+    bool m_remixFrameOpen = false;
+    IDirect3DSurface9* m_rasterCaptureSurface = nullptr;
+    IDirect3DSurface9* m_remixOutputSurface = nullptr;
+    IDirect3DTexture9* m_rasterCaptureTexture = nullptr;
+    IDirect3DTexture9* m_remixOutputTexture = nullptr;
+    IDirect3DVertexBuffer9* m_blendQuadVB = nullptr;
+    bool m_blendResourceCreationFailed = false;
+    bool m_lastWhiteMaterialApplied = false;
+    bool m_rasterCaptureTakenThisFrame = false;
+    bool m_lastRasterCaptureSucceeded = false;
+    bool m_lastRemixCaptureSucceeded = false;
+    bool m_lastBlendEnabledState = false;
+
+    void ReleaseBlendResources() {
+        if (m_blendQuadVB) { m_blendQuadVB->Release(); m_blendQuadVB = nullptr; }
+        if (m_rasterCaptureSurface) { m_rasterCaptureSurface->Release(); m_rasterCaptureSurface = nullptr; }
+        if (m_remixOutputSurface) { m_remixOutputSurface->Release(); m_remixOutputSurface = nullptr; }
+        if (m_rasterCaptureTexture) { m_rasterCaptureTexture->Release(); m_rasterCaptureTexture = nullptr; }
+        if (m_remixOutputTexture) { m_remixOutputTexture->Release(); m_remixOutputTexture = nullptr; }
+    }
+
+    bool EnsureBlendResources() {
+        if (m_blendResourceCreationFailed) {
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        if (m_rasterCaptureSurface && m_remixOutputSurface && m_blendQuadVB && m_rasterCaptureTexture && m_remixOutputTexture) {
+            return true;
+        }
+
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (FAILED(m_real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer) {
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        D3DSURFACE_DESC bbDesc = {};
+        HRESULT descHr = backBuffer->GetDesc(&bbDesc);
+        backBuffer->Release();
+        if (FAILED(descHr)) {
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        ReleaseBlendResources();
+        HRESULT hr = m_real->CreateTexture(bbDesc.Width, bbDesc.Height, 1, D3DUSAGE_RENDERTARGET, bbDesc.Format,
+                                           D3DPOOL_DEFAULT, &m_rasterCaptureTexture, nullptr);
+        if (FAILED(hr) || !m_rasterCaptureTexture ||
+            FAILED(m_rasterCaptureTexture->GetSurfaceLevel(0, &m_rasterCaptureSurface)) || !m_rasterCaptureSurface) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        hr = m_real->CreateTexture(bbDesc.Width, bbDesc.Height, 1, D3DUSAGE_RENDERTARGET, bbDesc.Format,
+                                   D3DPOOL_DEFAULT, &m_remixOutputTexture, nullptr);
+        if (FAILED(hr) || !m_remixOutputTexture ||
+            FAILED(m_remixOutputTexture->GetSurfaceLevel(0, &m_remixOutputSurface)) || !m_remixOutputSurface) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        hr = m_real->CreateVertexBuffer(sizeof(RasterBlendVertex) * 4, 0, kRasterBlendFVF, D3DPOOL_DEFAULT, &m_blendQuadVB, nullptr);
+        if (FAILED(hr) || !m_blendQuadVB) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        RasterBlendVertex* vbData = nullptr;
+        if (FAILED(m_blendQuadVB->Lock(0, 0, reinterpret_cast<void**>(&vbData), 0)) || !vbData) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        vbData[0] = { -0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        vbData[1] = { static_cast<float>(bbDesc.Width) - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f };
+        vbData[2] = { static_cast<float>(bbDesc.Width) - 0.5f, static_cast<float>(bbDesc.Height) - 0.5f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        vbData[3] = { -0.5f, static_cast<float>(bbDesc.Height) - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f };
+        m_blendQuadVB->Unlock();
+        g_rasterBlendResourcesFailed = false;
+        return true;
+    }
+
+    void ExecuteRasterBlendPass() {
+        if (!m_rasterCaptureTexture || !m_remixOutputTexture || !m_blendQuadVB) {
+            return;
+        }
+        DWORD zEnable = FALSE, zWrite = FALSE, alphaBlend = FALSE, alphaTest = FALSE, cullMode = D3DCULL_NONE, lighting = FALSE;
+        m_real->GetRenderState(D3DRS_ZENABLE, &zEnable);
+        m_real->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+        m_real->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend);
+        m_real->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest);
+        m_real->GetRenderState(D3DRS_CULLMODE, &cullMode);
+        m_real->GetRenderState(D3DRS_LIGHTING, &lighting);
+
+        IDirect3DVertexShader9* oldVS = nullptr;
+        IDirect3DPixelShader9* oldPS = nullptr;
+        IDirect3DBaseTexture9* oldT0 = nullptr;
+        IDirect3DBaseTexture9* oldT1 = nullptr;
+        IDirect3DVertexBuffer9* oldVB = nullptr;
+        UINT oldOffset = 0, oldStride = 0;
+        DWORD oldFVF = 0;
+        m_real->GetVertexShader(&oldVS);
+        m_real->GetPixelShader(&oldPS);
+        m_real->GetTexture(0, &oldT0);
+        m_real->GetTexture(1, &oldT1);
+        m_real->GetStreamSource(0, &oldVB, &oldOffset, &oldStride);
+        m_real->GetFVF(&oldFVF);
+
+        m_real->SetVertexShader(nullptr);
+        m_real->SetPixelShader(nullptr);
+        m_real->SetRenderState(D3DRS_ZENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_LIGHTING, FALSE);
+        m_real->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        m_real->SetFVF(kRasterBlendFVF);
+        m_real->SetTexture(0, m_rasterCaptureTexture);
+        m_real->SetTexture(1, m_remixOutputTexture);
+
+        const int blendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+        DWORD tfactor = D3DCOLOR_COLORVALUE(g_config.rasterBlendMixStrength, g_config.rasterBlendMixStrength,
+                                            g_config.rasterBlendMixStrength, g_config.rasterBlendMixStrength);
+        m_real->SetRenderState(D3DRS_TEXTUREFACTOR, tfactor);
+        if (blendMode == RasterBlendMode_Multiply) {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_LERP);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+        } else if (blendMode == RasterBlendMode_Additive) {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_ADD);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TEMP);
+        } else {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_LERP);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        }
+        m_real->SetTextureStageState(3, D3DTSS_COLOROP, D3DTOP_DISABLE);
+
+        m_real->SetStreamSource(0, m_blendQuadVB, 0, sizeof(RasterBlendVertex));
+        m_real->DrawPrimitive(D3DPT_TRIANGLEFAN, 0, 2);
+
+        m_real->SetTexture(0, oldT0);
+        m_real->SetTexture(1, oldT1);
+        m_real->SetStreamSource(0, oldVB, oldOffset, oldStride);
+        m_real->SetFVF(oldFVF);
+        m_real->SetVertexShader(oldVS);
+        m_real->SetPixelShader(oldPS);
+        m_real->SetRenderState(D3DRS_ZENABLE, zEnable);
+        m_real->SetRenderState(D3DRS_ZWRITEENABLE, zWrite);
+        m_real->SetRenderState(D3DRS_ALPHABLENDENABLE, alphaBlend);
+        m_real->SetRenderState(D3DRS_ALPHATESTENABLE, alphaTest);
+        m_real->SetRenderState(D3DRS_CULLMODE, cullMode);
+        m_real->SetRenderState(D3DRS_LIGHTING, lighting);
+
+        if (oldVB) oldVB->Release();
+        if (oldT1) oldT1->Release();
+        if (oldT0) oldT0->Release();
+        if (oldPS) oldPS->Release();
+        if (oldVS) oldVS->Release();
+    }
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
@@ -4469,15 +5332,26 @@ public:
         if (!m_hwnd) {
             m_hwnd = GetForegroundWindow();
         }
+		
         LogMsg("WrappedD3D9Device created, wrapping device at %p", real);
     }
 
     ~WrappedD3D9Device() {
+        if (m_lastWhiteMaterialApplied && remix_api::g_initialized && remix_api::g_api.SetConfigVariable) {
+            remix_api::g_api.SetConfigVariable("rtx.whiteMaterialModeEnabled", "0");
+            m_lastWhiteMaterialApplied = false;
+        }
+        ReleaseBlendResources();
         if (m_realEx) {
             m_realEx->Release();
             m_realEx = nullptr;
         }
         LogMsg("WrappedD3D9Device destroyed");
+    }
+
+    void SubmitLightingFromCurrentDraw() {
+        ShaderLightingMetadata meta = BuildLightingMetadataForShader(g_activeVertexShaderKey);
+        g_remixLightingManager.ProcessDrawCall(meta, g_vsConstants, m_currentWorld, m_currentView, m_hasWorld, m_hasView);
     }
 
     void EmitFixedFunctionTransforms() {
@@ -4493,7 +5367,7 @@ public:
                 D3DMATRIX m = {};
                 if (state && TryBuildMatrixSnapshot(*state, base, 4, false, &m)) {
                     m_currentWorld = m;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                 }
             }
         }
@@ -4505,18 +5379,14 @@ public:
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR profile is strict: only emit transforms when all three known registers
             // have been captured. Never emit identity/fallback transforms in this mode.
-            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+            if (!(m_everHadWorld && m_everHadView && m_everHadProj)) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "MGR draw skipped: missing matrix/matrices (Proj=%s View=%s World=%s).",
-                         m_hasProj ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasWorld ? "ready" : "missing");
+                         "MGR draw skipped: no valid matrices ever captured (Proj=%s View=%s World=%s).",
+                         m_everHadProj  ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadWorld ? "ready" : "never seen");
                 return;
             }
-
-            g_lastInverseViewAsWorldEligible = false;
-            g_lastInverseViewAsWorldApplied = false;
-            g_lastInverseViewAsWorldUsedFast = false;
 
             // Keep MGR strict and deterministic: WORLD always comes from c16-c19.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
@@ -4526,18 +5396,14 @@ public:
         }
 
         if (g_activeGameProfile == GameProfile_DevilMayCry4) {
-            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+            if (!(m_everHadWorld && m_everHadView && m_everHadProj)) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "DMC4 draw skipped: missing matrix/matrices (World=%s View=%s Proj=%s).",
-                         m_hasWorld ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasProj ? "ready" : "missing");
+                         "DMC4 draw skipped: no valid matrices ever captured (World=%s View=%s Proj=%s).",
+                         m_everHadWorld ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadProj  ? "ready" : "never seen");
                 return;
             }
-
-            g_lastInverseViewAsWorldEligible = false;
-            g_lastInverseViewAsWorldApplied = false;
-            g_lastInverseViewAsWorldUsedFast = false;
 
             // Keep DMC4 strict and deterministic: WORLD always comes from c0-c3.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
@@ -4548,18 +5414,14 @@ public:
 
         if (g_activeGameProfile == GameProfile_Barnyard) {
             const bool useGameViewProj = g_config.barnyardUseGameSetTransformsForViewProjection;
-            if (!m_hasWorld || (useGameViewProj && (!m_hasView || !m_hasProj))) {
+            if (!m_everHadWorld || (useGameViewProj && (!m_everHadView || !m_everHadProj))) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "Barnyard draw skipped: missing matrices (World=%s View=%s Proj=%s).",
-                         m_hasWorld ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasProj ? "ready" : "missing");
+                         "Barnyard draw skipped: no valid matrices ever captured (World=%s View=%s Proj=%s).",
+                         m_everHadWorld ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadProj  ? "ready" : "never seen");
                 return;
             }
-
-            g_lastInverseViewAsWorldEligible = false;
-            g_lastInverseViewAsWorldApplied = false;
-            g_lastInverseViewAsWorldUsedFast = false;
 
             // Keep Barnyard profile semantics deterministic: WORLD comes from shader constants.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
@@ -4592,7 +5454,7 @@ public:
                                                         &usedAuto, &resolvedAspect,
                                                         &width, &height)) {
                 m_currentProj = customProjection;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = -1;
@@ -4616,54 +5478,12 @@ public:
             }
         }
 
-        D3DMATRIX identity = {};
-        CreateIdentityMatrix(&identity);
-        D3DMATRIX emitWorld = m_currentWorld;
-        D3DMATRIX emitView = m_currentView;
-        D3DMATRIX emitProj = m_currentProj;
-
-        if (!m_hasWorld) emitWorld = identity;
-        if (!m_hasView) emitView = identity;
-        if (!m_hasProj) emitProj = identity;
-
-        if (m_worldLastFrame >= 0 && g_frameCount > m_worldLastFrame + 1) {
-            LogMsg("World matrix stale (last update frame %d, current %d); emitting identity.", m_worldLastFrame, g_frameCount);
-            emitWorld = identity;
-        }
-        if (m_viewLastFrame >= 0 && g_frameCount > m_viewLastFrame + 1) {
-            LogMsg("View matrix stale (last update frame %d, current %d); emitting identity.", m_viewLastFrame, g_frameCount);
-            emitView = identity;
-        }
-        if (m_projLastFrame >= 0 && g_frameCount > m_projLastFrame + 1) {
-            LogMsg("Projection matrix stale (last update frame %d, current %d); emitting identity.", m_projLastFrame, g_frameCount);
-            emitProj = identity;
-        }
-
-        g_lastInverseViewAsWorldEligible = false;
-        g_lastInverseViewAsWorldApplied = false;
-        g_lastInverseViewAsWorldUsedFast = false;
-        if (g_config.experimentalInverseViewAsWorld && m_hasView && !strictMgrProfileActive) {
-            const bool viewLooksValid = LooksLikeViewStrict(emitView);
-            g_lastInverseViewAsWorldEligible = viewLooksValid;
-            if (viewLooksValid || g_config.experimentalInverseViewAsWorldAllowUnverified) {
-                D3DMATRIX derivedWorld = {};
-                bool usedFastInverse = false;
-                bool fastEligible = false;
-                if (TryBuildWorldFromView(emitView, g_config.experimentalInverseViewAsWorldFast,
-                                          &derivedWorld, &usedFastInverse, &fastEligible)) {
-                    emitWorld = derivedWorld;
-                    g_lastInverseViewAsWorldApplied = true;
-                    g_lastInverseViewAsWorldUsedFast = usedFastInverse;
-                    if (!fastEligible && g_config.experimentalInverseViewAsWorldFast) {
-                        LogMsg("Fast inverse requested but view matrix did not qualify (possible scaling/shear); used full inverse.");
-                    }
-                }
-            }
-        }
-
-        m_real->SetTransform(D3DTS_WORLD, &emitWorld);
-        m_real->SetTransform(D3DTS_VIEW, &emitView);
-        m_real->SetTransform(D3DTS_PROJECTION, &emitProj);
+        // Only emit slots that have ever had a valid capture.
+        // Never emit identity for uncaptured slots — leave Remix state untouched instead.
+        // Always use last-known-good for stale slots rather than poisoning with identity.
+        if (m_everHadWorld) m_real->SetTransform(D3DTS_WORLD,      &m_currentWorld);
+        if (m_everHadView)  m_real->SetTransform(D3DTS_VIEW,       &m_currentView);
+        if (m_everHadProj)  m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
     }
 
 
@@ -4770,17 +5590,17 @@ public:
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = manualMat;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = manualMat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = manualMat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = binding.baseRegister;
@@ -4828,7 +5648,7 @@ public:
                 g_profileCoreRegistersSeen[0] = true;
                 g_mgrProjectionRegisterValid = IsTypicalProjectionMatrix(mat);
                 m_currentProj = mat;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 g_mgrProjCapturedThisFrame = true;
                 if (g_mgrProjectionRegisterValid) {
@@ -4873,7 +5693,7 @@ public:
                                                          true)) {
                         resolvedProjection = generatedProjection;
                         m_currentProj = generatedProjection;
-                        m_hasProj = true;
+                        m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                         g_mgrProjCapturedThisFrame = true;
                         g_projectionDetectedByNumericStructure = true;
@@ -4889,10 +5709,10 @@ public:
                 if (haveProjectionForViewDerivation) {
                     D3DMATRIX projectionInv = {};
                     if (InvertMatrix4x4Deterministic(resolvedProjection, &projectionInv, nullptr)) {
-                        D3DMATRIX derivedView = MultiplyMatrix(projectionInv, mat);
+                        D3DMATRIX derivedView = MultiplyMatrix(mat, projectionInv);
                         OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
-                        m_hasView = true;
+                        m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                         g_mgrViewCapturedThisFrame = true;
                         g_profileViewDerivedFromInverse = true;
@@ -4914,7 +5734,7 @@ public:
 
             if (tryExtractMgrMatrix(16, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 g_mgrWorldCapturedForDraw = true;
                 g_profileCoreRegistersSeen[2] = true;
@@ -4933,7 +5753,7 @@ public:
                 TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                  0, 4, false, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 worldCaptured = true;
                 g_profileCoreRegistersSeen[2] = true;
@@ -4945,7 +5765,7 @@ public:
                 TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                  g_config.worldMatrixRegister, 4, false, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 worldCaptured = true;
                 g_profileCoreRegistersSeen[2] = true;
@@ -4981,7 +5801,7 @@ public:
 
                         if (cls == MatrixClass_World) {
                             m_currentWorld = candidate;
-                            m_hasWorld = true;
+                            m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                             worldCaptured = true;
                             g_profileCoreRegistersSeen[2] = true;
@@ -5026,7 +5846,7 @@ public:
                 StoreMVPMatrix(mat, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
                                "DevilMayCry4 profile combined MVP (c0-c3)");
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_World] = true;
                 g_profileCoreRegistersSeen[0] = true;
@@ -5037,7 +5857,7 @@ public:
             if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
                 anyCaptured = true;
                 m_currentView = mat;
-                m_hasView = true;
+                m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_View] = true;
                 g_profileCoreRegistersSeen[1] = true;
@@ -5049,7 +5869,7 @@ public:
             if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
                 anyCaptured = true;
                 m_currentProj = mat;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_Projection] = true;
                 g_projectionDetectedByNumericStructure = false;
@@ -5092,19 +5912,19 @@ public:
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = mat;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                      "explicit register override");
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = mat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                     "explicit register override");
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = mat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = configuredRegister;
@@ -5156,7 +5976,7 @@ public:
                     m_projLockedShader = shaderKey;
                     m_projLockedRegister = static_cast<int>(baseReg);
                     m_currentProj = mat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                     m_projLastFrame = g_frameCount;
                     m_projDetectedFrame = g_frameCount;
                     slotResolvedStructurally[MatrixSlot_Projection] = true;
@@ -5192,7 +6012,7 @@ public:
                     m_viewLockedShader = shaderKey;
                     m_viewLockedRegister = static_cast<int>(baseReg);
                     m_currentView = mat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                     m_viewLastFrame = g_frameCount;
                     slotResolvedStructurally[MatrixSlot_View] = true;
                     StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg),
@@ -5205,7 +6025,7 @@ public:
                        !slotResolvedByOverride[MatrixSlot_World] &&
                        !slotResolvedStructurally[MatrixSlot_World]) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
                 slotResolvedStructurally[MatrixSlot_World] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural world");
@@ -5220,6 +6040,22 @@ public:
 
         g_profileDisableStructuralDetection = false;
         const bool allowStructuralDetection = !profileActive;
+
+        D3DMATRIX knownCombinedVp = {};
+        D3DMATRIX knownCombinedWv = {};
+        D3DMATRIX knownCombinedMvp = {};
+        bool hasKnownCombinedVp = false;
+        bool hasKnownCombinedWv = false;
+        bool hasKnownCombinedMvp = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+            knownCombinedVp = g_cameraMatrices.vp;
+            knownCombinedWv = g_cameraMatrices.wv;
+            knownCombinedMvp = g_cameraMatrices.mvp;
+            hasKnownCombinedVp = g_cameraMatrices.hasVP;
+            hasKnownCombinedWv = g_cameraMatrices.hasWV;
+            hasKnownCombinedMvp = g_cameraMatrices.hasMVP;
+        }
 
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 12) {
             if (CountStridedCandidates(effectiveConstantData, StartRegister,
@@ -5278,7 +6114,8 @@ public:
                                                             transposed)) {
                         finalClass = MatrixClass_None;
                     }
-                    if (finalClass == MatrixClass_None && g_probeInverseView && rows == 4u) {
+                    if (g_probeInverseView && rows == 4u &&
+                        (finalClass == MatrixClass_None || finalClass == MatrixClass_View)) {
                         const float row0Len = sqrtf(Dot3(mat._11, mat._12, mat._13, mat._11, mat._12, mat._13));
                         const float row1Len = sqrtf(Dot3(mat._21, mat._22, mat._23, mat._21, mat._22, mat._23));
                         const float row2Len = sqrtf(Dot3(mat._31, mat._32, mat._33, mat._31, mat._32, mat._33));
@@ -5290,11 +6127,38 @@ public:
                             fabsf(Dot3(mat._11, mat._12, mat._13, mat._31, mat._32, mat._33)) < 0.05f &&
                             fabsf(Dot3(mat._21, mat._22, mat._23, mat._31, mat._32, mat._33)) < 0.05f;
                         if (orthonormal) {
-                            D3DMATRIX inverseView = InvertSimpleRigidView(mat);
-                            MatrixClassification inverseClass = ClassifyMatrixDeterministic(inverseView, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
-                            if (inverseClass == MatrixClass_View) {
-                                mat = inverseView;
+                            const D3DMATRIX originalMat = mat;
+                            const D3DMATRIX invCandidate = InvertSimpleRigidView(mat);
+                            MatrixClassification inverseClass = ClassifyMatrixDeterministic(invCandidate, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+
+                            if (finalClass == MatrixClass_None && inverseClass == MatrixClass_View) {
+                                mat = invCandidate;
                                 finalClass = inverseClass;
+                            }
+
+                            if (finalClass == MatrixClass_View) {
+                                const ViewCandidateConsistency viewConsistency = ResolveViewInverseConsistency(
+                                    originalMat,
+                                    invCandidate,
+                                    &m_currentProj,
+                                    m_hasProj,
+                                    &m_currentWorld,
+                                    m_hasWorld,
+                                    &knownCombinedVp,
+                                    hasKnownCombinedVp,
+                                    &knownCombinedWv,
+                                    hasKnownCombinedWv,
+                                    &knownCombinedMvp,
+                                    hasKnownCombinedMvp);
+                                if (viewConsistency == ViewCandidateConsistency_Inverse) {
+                                    mat = invCandidate;
+                                    LogMsg("Structural view disambiguation: c%d prefers inverse candidate using composition consistency",
+                                           static_cast<int>(baseReg));
+                                } else if (viewConsistency == ViewCandidateConsistency_Ambiguous ||
+                                           viewConsistency == ViewCandidateConsistency_None) {
+                                    LogMsg("Structural view disambiguation: c%d ambiguous/no consistency signal; keeping classified candidate",
+                                           static_cast<int>(baseReg));
+                                }
                             }
                         }
                     }
@@ -5355,16 +6219,19 @@ public:
                                                   &generatedProjection, hasGeneratedProjection);
 
         if (g_combinedDecompDebug.solvedWorld) {
+            m_everHadWorld = true;
             m_worldLastFrame = g_frameCount;
             StoreWorldMatrix(m_currentWorld, shaderKey, -1, 4, false, false,
                              "deterministic combined decomposition");
         }
         if (g_combinedDecompDebug.solvedView) {
+            m_everHadView = true;
             m_viewLastFrame = g_frameCount;
             StoreViewMatrix(m_currentView, shaderKey, -1, 4, false, false,
                             "deterministic combined decomposition");
         }
         if (g_combinedDecompDebug.solvedProjection) {
+            m_everHadProj = true;
             m_projLastFrame = g_frameCount;
             StoreProjectionMatrix(m_currentProj, shaderKey, -1, 4, false, false,
                                   "deterministic combined decomposition");
@@ -5434,6 +6301,56 @@ public:
             }
         }
 
+        if (m_remixFrameOpen) {
+            g_remixLightingManager.EndFrame();
+            {
+                CameraState cam = {};
+                if (m_everHadView) {
+                    D3DMATRIX vi = InvertSimpleRigidView(m_currentView);
+                    cam.valid = true;
+                    cam.row0[0] = vi._11; cam.row0[1] = vi._12; cam.row0[2] = vi._13;
+                    cam.row1[0] = vi._21; cam.row1[1] = vi._22; cam.row1[2] = vi._23;
+                    cam.row2[0] = vi._31; cam.row2[1] = vi._32; cam.row2[2] = vi._33;
+                    cam.position[0] = vi._41;
+                    cam.position[1] = vi._42;
+                    cam.position[2] = vi._43;
+                }
+                g_customLightsManager.EndFrame(cam);
+            }
+            m_remixFrameOpen = false;
+        }
+
+        if (m_lastBlendEnabledState && !g_config.rasterBlendEnabled) {
+            m_blendResourceCreationFailed = false;
+            g_rasterBlendResourcesFailed = false;
+            g_rasterBlendLastRasterCapture = false;
+            g_rasterBlendLastRemixCapture = false;
+        }
+        m_lastBlendEnabledState = g_config.rasterBlendEnabled;
+
+        if (remix_api::g_initialized && remix_api::g_api.SetConfigVariable) {
+            const bool desiredWhiteMode = g_config.rasterBlendEnabled && g_config.rasterBlendWhiteMaterials;
+            if (desiredWhiteMode != m_lastWhiteMaterialApplied) {
+                remix_api::g_api.SetConfigVariable("rtx.whiteMaterialModeEnabled", desiredWhiteMode ? "1" : "0");
+                m_lastWhiteMaterialApplied = desiredWhiteMode;
+            }
+        }
+
+        m_lastRemixCaptureSucceeded = false;
+        if (g_config.rasterBlendEnabled && remix_api::g_initialized && EnsureBlendResources() &&
+            remix_api::g_api.dxvk_CopyRenderingOutput) {
+            const remixapi_ErrorCode copyResult = remix_api::g_api.dxvk_CopyRenderingOutput(
+                m_remixOutputSurface, REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR);
+            m_lastRemixCaptureSucceeded = (copyResult == REMIXAPI_ERROR_CODE_SUCCESS);
+            g_rasterBlendLastRemixCapture = m_lastRemixCaptureSucceeded;
+            if (m_lastRemixCaptureSucceeded) {
+                ExecuteRasterBlendPass();
+            }
+        } else {
+            g_rasterBlendLastRemixCapture = false;
+        }
+
+        m_rasterCaptureTakenThisFrame = false;
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     }
 
@@ -5452,6 +6369,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) override { return m_real->GetSwapChain(iSwapChain, pSwapChain); }
     UINT STDMETHODCALLTYPE GetNumberOfSwapChains() override { return m_real->GetNumberOfSwapChains(); }
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
+        ReleaseBlendResources();
         if (g_imguiInitialized) {
             ImGui_ImplDX9_InvalidateDeviceObjects();
             // Do NOT call ImGui_ImplWin32_Shutdown here.
@@ -5502,9 +6420,32 @@ public:
             m_projLockedShader = 0;
             m_projLockedRegister = -1;
         }
+        if (!m_remixFrameOpen) {
+            g_remixLightingManager.BeginFrame();
+			g_customLightsManager.BeginFrame(g_lastDeltaSec);
+            m_remixFrameOpen = true;
+        }
+        m_rasterCaptureTakenThisFrame = false;
         return m_real->BeginScene();
     }
-    HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
+    HRESULT STDMETHODCALLTYPE EndScene() override {
+        if (g_config.rasterBlendEnabled && remix_api::g_initialized && !m_rasterCaptureTakenThisFrame) {
+            if (EnsureBlendResources()) {
+                IDirect3DSurface9* currentRT = nullptr;
+                if (SUCCEEDED(m_real->GetRenderTarget(0, &currentRT)) && currentRT) {
+                    m_lastRasterCaptureSucceeded = SUCCEEDED(
+                        m_real->StretchRect(currentRT, nullptr, m_rasterCaptureSurface, nullptr, D3DTEXF_NONE));
+                    g_rasterBlendLastRasterCapture = m_lastRasterCaptureSucceeded;
+                    currentRT->Release();
+                    m_rasterCaptureTakenThisFrame = true;
+                } else {
+                    m_lastRasterCaptureSucceeded = false;
+                    g_rasterBlendLastRasterCapture = false;
+                }
+            }
+        }
+        return m_real->EndScene();
+    }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
     HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override {
         int transformIdx = -1;
@@ -5519,19 +6460,19 @@ public:
             if (allowGenericSetTransformCompatibility && g_config.setTransformBypassProxyWhenGameProvides) {
                 if (State == D3DTS_WORLD) {
                     m_currentWorld = *pMatrix;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                     m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
                                      "game SetTransform(World) direct passthrough");
                 } else if (State == D3DTS_VIEW) {
                     m_currentView = *pMatrix;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                     m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
                                     "game SetTransform(View) direct passthrough");
                 } else if (State == D3DTS_PROJECTION) {
                     m_currentProj = *pMatrix;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                     m_projLastFrame = g_frameCount;
                     StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
                                           "game SetTransform(Projection) direct passthrough");
@@ -5550,19 +6491,19 @@ public:
                 }
                 if (State == D3DTS_WORLD) {
                     m_currentWorld = roundTrip;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
                     m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
                                      "game SetTransform(World)+GetTransform compatibility");
                 } else if (State == D3DTS_VIEW) {
                     m_currentView = roundTrip;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
                     m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
                                     "game SetTransform(View)+GetTransform compatibility");
                 } else if (State == D3DTS_PROJECTION) {
                     m_currentProj = roundTrip;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
                     m_projLastFrame = g_frameCount;
                     StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
                                           "game SetTransform(Projection)+GetTransform compatibility");
@@ -5587,7 +6528,7 @@ public:
 
             if (State == D3DTS_VIEW) {
                 m_currentView = captured;
-                m_hasView = true;
+                m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
                 g_profileCoreRegistersSeen[0] = true;
                 StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
@@ -5596,7 +6537,7 @@ public:
                                     : "Barnyard intercepted game SetTransform(View)");
             } else {
                 m_currentProj = captured;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
                 m_projLastFrame = g_frameCount;
                 g_profileCoreRegistersSeen[1] = true;
                 g_projectionDetectedByNumericStructure = false;
@@ -5656,6 +6597,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
         if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
@@ -5665,6 +6607,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
         if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
@@ -5674,6 +6617,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
@@ -5681,6 +6625,7 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
     }
@@ -6067,7 +7012,7 @@ void LoadConfig() {
     snprintf(path, sizeof(path), "%s", exePath);
     char* lastSlash = strrchr(path, '\\');
     if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
+        strcpy_s(lastSlash + 1, MAX_PATH - static_cast<size_t>(lastSlash - path) - 1, "camera_proxy.ini");
     }
 
     g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", -1, path);
@@ -6121,6 +7066,14 @@ void LoadConfig() {
     if (g_config.imguiScale > 3.0f) g_config.imguiScale = 3.0f;
     GetPrivateProfileStringA("CameraProxy", "RemixDllName", "d3d9_remix.dll", g_config.remixDllName,
                              MAX_PATH, path);
+    if (g_config.remixDllName[0] == '\0') {
+        snprintf(g_config.remixDllName, sizeof(g_config.remixDllName), "%s", "d3d9_remix.dll");
+    }
+    const char* remixExt = strrchr(g_config.remixDllName, '.');
+    if (!remixExt || _stricmp(remixExt, ".dll") != 0) {
+        LogMsg("WARNING: Invalid RemixDllName '%s' in camera_proxy.ini. Falling back to d3d9_remix.dll", g_config.remixDllName);
+        snprintf(g_config.remixDllName, sizeof(g_config.remixDllName), "%s", "d3d9_remix.dll");
+    }
     g_probeTransposedLayouts = GetPrivateProfileIntA("CameraProxy", "ProbeTransposedLayouts", 1, path) != 0;
     g_probeInverseView = GetPrivateProfileIntA("CameraProxy", "ProbeInverseView", 1, path) != 0;
     g_overrideScopeMode = GetPrivateProfileIntA("CameraProxy", "OverrideScopeMode", Override_Sticky, path);
@@ -6143,12 +7096,6 @@ void LoadConfig() {
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideDetectedProjection", 0, path) != 0;
     g_config.experimentalCustomProjectionOverrideCombinedMVP =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideCombinedMVP", 0, path) != 0;
-    g_config.experimentalInverseViewAsWorld =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorld", 0, path) != 0;
-    g_config.experimentalInverseViewAsWorldAllowUnverified =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorldAllowUnverified", 0, path) != 0;
-    g_config.experimentalInverseViewAsWorldFast =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalInverseViewAsWorldFast", 0, path) != 0;
     g_config.mgrrUseAutoProjectionWhenC4Invalid =
         GetPrivateProfileIntA("CameraProxy", "MGRRUseAutoProjectionWhenC4Invalid", 0, path) != 0;
 
@@ -6165,6 +7112,14 @@ void LoadConfig() {
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionAutoHandedness", ProjectionHandedness_Left, path);
     g_config.experimentalCustomProjectionAutoHandedness =
         (rawHandedness == ProjectionHandedness_Right) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
+
+    g_config.rasterBlendEnabled = GetPrivateProfileIntA("RasterBlend", "Enabled", 0, path) != 0;
+    g_config.rasterBlendMode = GetPrivateProfileIntA("RasterBlend", "Mode", 0, path);
+    g_config.rasterBlendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+    GetPrivateProfileStringA("RasterBlend", "MixStrength", "1.0", customBuf, sizeof(customBuf), path);
+    g_config.rasterBlendMixStrength = (float)atof(customBuf);
+    g_config.rasterBlendMixStrength = std::clamp(g_config.rasterBlendMixStrength, 0.0f, 1.0f);
+    g_config.rasterBlendWhiteMaterials = GetPrivateProfileIntA("RasterBlend", "WhiteMaterials", 1, path) != 0;
 
     D3DMATRIX defaultManualProjection = {};
     CreateProjectionMatrixWithHandedness(&defaultManualProjection,
@@ -6198,13 +7153,17 @@ static void EnsureProxyInitialized() {
     std::call_once(g_initOnce, []() {
         LoadConfig();
         if (g_config.enableLogging) {
-            g_logFile = fopen("camera_proxy.log", "w");
+            fopen_s(&g_logFile, "camera_proxy.log", "w");
             LogMsg("=== %s ===", kCameraProxyVersion);
             LogMsg("Game executable path: %s", g_gameExePath[0] ? g_gameExePath : "<unknown>");
             LogMsg("Game executable name: %s", g_gameExeName[0] ? g_gameExeName : "<unknown>");
             LogMsg("Game display name: %s", g_gameDisplayName[0] ? g_gameDisplayName : "<unknown>");
         }
         g_hD3D9 = LoadTargetD3D9();
+        if (g_config.useRemixRuntime) {
+            g_remixLightingManager.Initialize();
+			g_customLightsManager.SetSaveFilePath("custom_lights.cltx");
+        }
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
             g_origDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hD3D9, "Direct3DCreate9Ex");
@@ -6273,9 +7232,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         g_moduleInstance = hinstDLL;
+        DWORD modulePathLen = GetModuleFileNameA(hinstDLL, g_modulePath, MAX_PATH);
+        if (modulePathLen == 0 || modulePathLen >= MAX_PATH) {
+            g_modulePath[0] = '\0';
+        }
         DisableThreadLibraryCalls(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         g_moduleInstance = nullptr;
+        g_modulePath[0] = '\0';
         if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
         if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
     }
