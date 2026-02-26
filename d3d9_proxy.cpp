@@ -1353,6 +1353,14 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     g_overlayFontRegular = nullptr;
     g_overlayFontBold = nullptr;
 
+    constexpr float kOverlayRegularFontSize = 14.5f;
+    constexpr float kOverlayBoldFontSize = 15.5f;
+    ImFontConfig overlayFontConfig;
+    overlayFontConfig.OversampleH = 2;
+    overlayFontConfig.OversampleV = 1;
+    overlayFontConfig.PixelSnapH = true;
+    overlayFontConfig.RasterizerMultiply = 1.1f;
+
     char windowsDir[MAX_PATH] = {};
     if (GetWindowsDirectoryA(windowsDir, MAX_PATH) > 0) {
         std::filesystem::path fontsDir = std::filesystem::path(windowsDir) / "Fonts";
@@ -1368,7 +1376,8 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
         for (const char* candidate : kRobotoRegularCandidates) {
             std::filesystem::path fontPath = fontsDir / candidate;
             if (std::filesystem::exists(fontPath)) {
-                g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 14.0f);
+                g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+                    fontPath.string().c_str(), kOverlayRegularFontSize, &overlayFontConfig);
                 if (g_overlayFontRegular) {
                     break;
                 }
@@ -1377,7 +1386,8 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
         for (const char* candidate : kRobotoBoldCandidates) {
             std::filesystem::path fontPath = fontsDir / candidate;
             if (std::filesystem::exists(fontPath)) {
-                g_overlayFontBold = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 15.0f);
+                g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+                    fontPath.string().c_str(), kOverlayBoldFontSize, &overlayFontConfig);
                 if (g_overlayFontBold) {
                     break;
                 }
@@ -1386,19 +1396,24 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     }
 
     if (!g_overlayFontRegular) {
-        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 14.0f);
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeui.ttf", kOverlayRegularFontSize, &overlayFontConfig);
     }
     if (!g_overlayFontBold) {
-        g_overlayFontBold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 15.0f);
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeuib.ttf", kOverlayBoldFontSize, &overlayFontConfig);
     }
     if (!g_overlayFontRegular) {
-        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 14.0f);
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\arial.ttf", kOverlayRegularFontSize, &overlayFontConfig);
     }
     if (!g_overlayFontBold) {
-        g_overlayFontBold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arialbd.ttf", 15.0f);
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\arialbd.ttf", kOverlayBoldFontSize, &overlayFontConfig);
     }
     if (!g_overlayFontRegular) {
-        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\tahoma.ttf", 14.0f);
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\tahoma.ttf", kOverlayRegularFontSize, &overlayFontConfig);
     }
     if (!g_overlayFontBold) {
         g_overlayFontBold = g_overlayFontRegular;
