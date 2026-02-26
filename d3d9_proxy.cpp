@@ -2762,6 +2762,26 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 }
                 ImGui::TextColored(color, "%s", text);
             };
+            auto DrawSectionLabel = [](const char* text) {
+                float width = ImGui::GetContentRegionAvail().x;
+                if (width < 220.0f) {
+                    width = 220.0f;
+                }
+                ImVec2 textSize = ImGui::CalcTextSize(text);
+                float offset = (ImGui::GetContentRegionAvail().x - width) * 0.5f;
+                if (offset > 0.0f) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+                }
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 7.0f));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.22f, 0.28f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.96f, 0.98f, 1.0f));
+                ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+                ImGui::Button(text, ImVec2(width, textSize.y + 14.0f));
+                ImGui::PopItemFlag();
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar(2);
+            };
 
             ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them to RTX Remix through SetTransform(). The guidance below explains where each matrix typically appears, how to validate it, and how to avoid false positives.");
             ImGui::Separator();
@@ -2787,43 +2807,8 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Important: start from Camera, validate in Constants, then confirm source shaders before pinning overrides.");
             ImGui::Spacing();
 
-            PushOverlayBoldFont();
-            ImGui::Text("1) Camera tab (default workflow anchor)");
-            PopOverlayBoldFont();
+            DrawSectionLabel("1) Camera tab (default workflow anchor)");
             ImGui::TextWrapped("Use Camera as your live truth panel. Verify SetTransform seen flags, monitor current World/View/Projection captures, and compare stability during movement, cutscenes, pause states, and FOV changes. Pin registers only after repeated scene transitions confirm stable behavior. If Remix drifts while matrices look plausible, compare update cadence (which matrix changes per frame) and reset overrides that desynchronize.");
-            ImGui::Spacing();
-
-            PushOverlayBoldFont();
-            ImGui::Text("2) Shaders tab (source attribution and assembly forensics)");
-            PopOverlayBoldFont();
-            ImGui::TextWrapped("Use Shaders to identify exactly which vertex shader owns suspicious constants. Sort/filter by usage count and stable hash, then inspect disassembly comments to spot constant register ranges (for example, comments near dp4/mad instructions that reference c0-c3, c4-c7, c8-c11). These assembly comments often reveal matrix intent directly, making it faster to map constants to World, View, Projection, or combined MVP blocks before applying any override.");
-            ImGui::TextWrapped("When comments expose transform semantics, cross-check the same registers in Constants and verify temporal coherence over multiple camera motions. This prevents selecting short-lived registers used for effects instead of camera transforms.");
-            ImGui::Spacing();
-
-            PushOverlayBoldFont();
-            ImGui::Text("3) Constants tab (precision register validation)");
-            PopOverlayBoldFont();
-            ImGui::TextWrapped("Constants is the high-precision inspector. Pick an active shader, watch live c-register values, and inspect 4-register groups as candidate 4x4 matrices. Validate candidates by structure first, then by motion response: view matrices should rotate/translate coherently with camera movement, while projection rows should reflect perspective scaling and depth mapping.");
-            ImGui::Spacing();
-
-            PushOverlayBoldFont();
-            ImGui::Text("4) Remix API tab (runtime integration sanity checks)");
-            PopOverlayBoldFont();
-            ImGui::TextWrapped("Use this tab after matrices are stable. Confirm API readiness, inspect shader/custom light state, and separate camera extraction issues from runtime-side lighting/integration behavior.");
-            ImGui::Spacing();
-
-            PushOverlayBoldFont();
-            ImGui::Text("5) Memory Scanner tab (fallback hypothesis generation)");
-            PopOverlayBoldFont();
-            ImGui::TextWrapped("When shader heuristics fail, scan memory for 4x4 candidates. Treat each hit as a hypothesis: assign temporarily, return to Camera, and reject any candidate that breaks under rapid movement, FOV change, area transitions, or pause/unpause.");
-            ImGui::Spacing();
-
-            PushOverlayBoldFont();
-            ImGui::Text("6) Logs tab (frame-accurate correlation)");
-            PopOverlayBoldFont();
-            ImGui::TextWrapped("Correlate assignment events, shader switches, and scan timings with what you observe in Camera/Constants. Logs are the fastest way to identify the exact frame window where a matrix starts diverging.");
-            ImGui::Spacing();
-            ImGui::Separator();
             ImGui::Spacing();
 
             PushOverlayBoldFont();
@@ -2832,7 +2817,14 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::TextWrapped("Reference conventions vary (row-major vs column-major, left-handed vs right-handed). Focus on recognizable patterns and behavior rather than exact sign placement.");
             ImGui::Spacing();
 
-            ImGui::BeginChild("MatrixExamples", ImVec2(0, 230), true);
+            ImGui::BeginChild("MatrixExamples", ImVec2(0, 290), true);
+            DrawCenteredLine("World matrix (object/local to world transform, common structure)", ImVec4(1.0f, 0.88f, 0.72f, 1.0f));
+            DrawCenteredLine("[ Xx   Xy   Xz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Yx   Yy   Yz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Zx   Zy   Zz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Tx   Ty   Tz   1 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            ImGui::Spacing();
+
             DrawCenteredLine("View matrix (rigid camera transform, literature pattern)", ImVec4(0.74f, 0.88f, 1.0f, 1.0f));
             DrawCenteredLine("[  Rx   Ry   Rz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
             DrawCenteredLine("[  Ux   Uy   Uz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
@@ -2852,7 +2844,30 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             DrawCenteredLine("- no coherent response to camera rotation/translation", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
             DrawCenteredLine("- perspective terms missing or unstable under FOV changes", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
             ImGui::EndChild();
+            ImGui::Spacing();
 
+            DrawSectionLabel("2) Shaders tab (source attribution and assembly forensics)");
+            ImGui::TextWrapped("Use Shaders to identify exactly which vertex shader owns suspicious constants. Sort/filter by usage count and stable hash, then inspect disassembly comments to spot constant register ranges (for example, comments near dp4/mad instructions that reference c0-c3, c4-c7, c8-c11). These assembly comments often reveal matrix intent directly, making it faster to map constants to World, View, Projection, or combined MVP blocks before applying any override.");
+            ImGui::TextWrapped("When comments expose transform semantics, cross-check the same registers in Constants and verify temporal coherence over multiple camera motions. This prevents selecting short-lived registers used for effects instead of camera transforms.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("3) Constants tab (precision register validation)");
+            ImGui::TextWrapped("Constants is the high-precision inspector. Pick an active shader, watch live c-register values, and inspect 4-register groups as candidate 4x4 matrices. Validate candidates by structure first, then by motion response: view matrices should rotate/translate coherently with camera movement, while projection rows should reflect perspective scaling and depth mapping.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("4) Remix API tab (runtime integration sanity checks)");
+            ImGui::TextWrapped("Use this tab after matrices are stable. Confirm API readiness, inspect shader/custom light state, and separate camera extraction issues from runtime-side lighting/integration behavior.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("5) Memory Scanner tab (fallback hypothesis generation)");
+            ImGui::TextWrapped("When shader heuristics fail, scan memory for 4x4 candidates. Treat each hit as a hypothesis: assign temporarily, return to Camera, and reject any candidate that breaks under rapid movement, FOV change, area transitions, or pause/unpause.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("6) Logs tab (frame-accurate correlation)");
+            ImGui::TextWrapped("Correlate assignment events, shader switches, and scan timings with what you observe in Camera/Constants. Logs are the fastest way to identify the exact frame window where a matrix starts diverging.");
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
             ImGui::Spacing();
             ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Recommended workflow: Camera -> Shaders -> Constants -> (optional) Memory Scanner -> Camera re-check -> Remix API -> Logs.");
 
