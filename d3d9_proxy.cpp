@@ -83,6 +83,13 @@ struct ProjectionAnalysis {
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
 static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
 static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr);
+static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
+                                                    HWND hwnd,
+                                                    D3DMATRIX* outProjection,
+                                                    bool* outUsedAuto = nullptr,
+                                                    float* outResolvedAspect = nullptr,
+                                                    UINT* outWidth = nullptr,
+                                                    UINT* outHeight = nullptr);
 void CreateIdentityMatrix(D3DMATRIX* out);
 class WrappedD3D9Device;
 
@@ -6522,7 +6529,7 @@ void LoadConfig() {
     snprintf(path, sizeof(path), "%s", exePath);
     char* lastSlash = strrchr(path, '\\');
     if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
+        strcpy_s(lastSlash + 1, MAX_PATH - static_cast<size_t>(lastSlash - path) - 1, "camera_proxy.ini");
     }
 
     g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", -1, path);
@@ -6655,7 +6662,7 @@ static void EnsureProxyInitialized() {
     std::call_once(g_initOnce, []() {
         LoadConfig();
         if (g_config.enableLogging) {
-            g_logFile = fopen("camera_proxy.log", "w");
+            fopen_s(&g_logFile, "camera_proxy.log", "w");
             LogMsg("=== %s ===", kCameraProxyVersion);
             LogMsg("Game executable path: %s", g_gameExePath[0] ? g_gameExePath : "<unknown>");
             LogMsg("Game executable name: %s", g_gameExeName[0] ? g_gameExeName : "<unknown>");
