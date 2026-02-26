@@ -15,6 +15,9 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <d3dcommon.h>
+#include <d3dcompiler.h>
+#include <winver.h>
 #include <cstdio>
 #include <cmath>
 #include <unordered_map>
@@ -26,6 +29,13 @@
 #include <limits>
 #include <mutex>
 #include <cassert>
+#include <sstream>
+#include <fstream>
+#include <filesystem>
+#include <array>
+#include <cctype>
+#include <cstdint>
+#include <cstring>
 
 #define IMGUI_IMPL_WIN32_DISABLE_GAMEPAD
 #define IMGUI_DEFINE_MATH_OPERATORS
@@ -33,6 +43,11 @@
 #include "imgui/imgui.h"
 #include "imgui/backends/imgui_impl_dx9.h"
 #include "imgui/backends/imgui_impl_win32.h"
+#include "remix_lighting_manager.h"
+#include "lights_tab_ui.h"
+#include "custom_lights.h"
+#include "custom_lights_ui.h"
+#include "remix_api.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -45,10 +60,19 @@ static bool LooksLikeViewStrict(const D3DMATRIX& m);
 static bool LooksLikeProjectionStrict(const D3DMATRIX& m);
 float ExtractFOV(const D3DMATRIX& proj);
 
+static float Dot3(float ax, float ay, float az, float bx, float by, float bz);
+static void CopyFilenameFromPath(const char* fullPath, char* outName, size_t outNameSize);
+static bool TryReadFileDescription(const char* exePath, char* outDescription, size_t outDescriptionSize);
+
 enum ProjectionHandedness {
     ProjectionHandedness_Unknown = 0,
     ProjectionHandedness_Left,
     ProjectionHandedness_Right
+};
+
+enum CustomProjectionMode {
+    CustomProjectionMode_Manual = 1,
+    CustomProjectionMode_Auto = 2
 };
 
 struct ProjectionAnalysis {
@@ -59,16 +83,30 @@ struct ProjectionAnalysis {
 
 static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysis* out);
 static const char* ProjectionHandednessLabel(ProjectionHandedness handedness);
+static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr);
+static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
+                                                    HWND hwnd,
+                                                    D3DMATRIX* outProjection,
+                                                    bool* outUsedAuto = nullptr,
+                                                    float* outResolvedAspect = nullptr,
+                                                    UINT* outWidth = nullptr,
+                                                    UINT* outHeight = nullptr);
 void CreateIdentityMatrix(D3DMATRIX* out);
 class WrappedD3D9Device;
 
 #pragma comment(lib, "user32.lib")
+#pragma comment(lib, "version.lib")
+
+static const char* kCameraProxyVersion = "Camera Proxy v0.2.0 experimental branch";
 
 // Configuration
 struct ProxyConfig {
     int viewMatrixRegister = -1;
     int projMatrixRegister = -1;
     int worldMatrixRegister = -1;
+    int mvpMatrixRegister = -1;
+    int mvMatrixRegister = -1;
+    int vpMatrixRegister = -1;
     bool enableLogging = true;
     float minFOV = 0.1f;
     float maxFOV = 2.5f;
@@ -90,49 +128,66 @@ struct ProxyConfig {
     int hotkeyEmitMatricesVk = VK_F8;
     int hotkeyResetMatrixOverridesVk = VK_F7;
 
-    bool enableCombinedMVP = false;
-    bool combinedMVPRequireWorld = false;
-    bool combinedMVPAssumeIdentityWorld = true;
-    bool combinedMVPForceDecomposition = false;
-    bool combinedMVPLogDecomposition = false;
+    bool enableCombinedDecomposition = true;
+    bool combinedDecompositionLog = false;
+    bool allowGeneratedProjectionForVPDecomposition = false;
 
     bool experimentalCustomProjectionEnabled = false;
-    int experimentalCustomProjectionMode = 2; // 1 = manual matrix, 2 = auto-generated
+    CustomProjectionMode experimentalCustomProjectionMode = CustomProjectionMode_Auto;
     bool experimentalCustomProjectionOverrideDetectedProjection = false;
     bool experimentalCustomProjectionOverrideCombinedMVP = false;
     bool mgrrUseAutoProjectionWhenC4Invalid = false;
+    bool barnyardUseGameSetTransformsForViewProjection = true;
+    bool disableGameInputWhileMenuOpen = false;
+    bool setTransformBypassProxyWhenGameProvides = false;
+    bool setTransformRoundTripCompatibilityMode = false;
     float experimentalCustomProjectionAutoFovDeg = 60.0f;
     float experimentalCustomProjectionAutoNearZ = 0.1f;
     float experimentalCustomProjectionAutoFarZ = 1000.0f;
     float experimentalCustomProjectionAutoAspectFallback = 16.0f / 9.0f;
-    int experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
+    ProjectionHandedness experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
     D3DMATRIX experimentalCustomProjectionManualMatrix = {};
+
+    bool rasterBlendEnabled = false;
+    int rasterBlendMode = 0;
+    float rasterBlendMixStrength = 1.0f;
+    bool rasterBlendWhiteMaterials = true;
 };
 
-enum CombinedMVPStrategy {
-    CombinedMVPStrategy_None = 0,
-    CombinedMVPStrategy_WorldAndMVP,
-    CombinedMVPStrategy_MVPOnly,
-    CombinedMVPStrategy_WorldRequiredNoWorld,
-    CombinedMVPStrategy_Disabled,
-    CombinedMVPStrategy_SkippedFullWVP,
-    CombinedMVPStrategy_Failed
+enum RasterBlendMode {
+    RasterBlendMode_Multiply = 0,
+    RasterBlendMode_Additive = 1,
+    RasterBlendMode_Lerp = 2
 };
 
-static const char* CombinedMVPStrategyLabel(CombinedMVPStrategy strategy);
+struct RasterBlendVertex {
+    float x;
+    float y;
+    float z;
+    float rhw;
+    float u0;
+    float v0;
+    float u1;
+    float v1;
+};
 
-struct CombinedMVPDebugState {
-    int registerBase = -1;
-    CombinedMVPStrategy strategy = CombinedMVPStrategy_None;
-    bool succeeded = false;
-    float fovRadians = 0.0f;
-    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
+static constexpr DWORD kRasterBlendFVF = D3DFVF_XYZRHW | D3DFVF_TEX2;
+
+struct CombinedDecompositionDebugState {
+    bool attempted = false;
+    bool solvedWorld = false;
+    bool solvedView = false;
+    bool solvedProjection = false;
+    char worldFormula[160] = {};
+    char viewFormula[160] = {};
+    char projectionFormula[160] = {};
 };
 
 enum GameProfileKind {
     GameProfile_None = 0,
     GameProfile_MetalGearRising,
-    GameProfile_DevilMayCry4
+    GameProfile_DevilMayCry4,
+    GameProfile_Barnyard
 };
 
 struct RegisterLayoutProfile {
@@ -155,21 +210,32 @@ static bool g_mgrProjCapturedThisFrame = false;
 static bool g_mgrViewCapturedThisFrame = false;
 static bool g_mgrWorldCapturedForDraw = false;
 static bool g_mgrProjectionRegisterValid = false;
+static bool g_barnyardForceWorldFromC0 = false;
 
 static ProxyConfig g_config;
 static HMODULE g_hD3D9 = nullptr;
+static HINSTANCE g_moduleInstance = nullptr;
+static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
+static char g_modulePath[MAX_PATH] = "";
+static char g_gameExePath[MAX_PATH] = "";
+static char g_gameExeName[MAX_PATH] = "";
+static char g_gameDisplayName[256] = "";
 
 struct CameraMatrices {
     D3DMATRIX view;
     D3DMATRIX projection;
     D3DMATRIX world;
     D3DMATRIX mvp;
+    D3DMATRIX vp;
+    D3DMATRIX wv;
     bool hasView;
     bool hasProjection;
     bool hasWorld;
     bool hasMVP;
+    bool hasVP;
+    bool hasWV;
 };
 
 enum MatrixSlot {
@@ -177,7 +243,9 @@ enum MatrixSlot {
     MatrixSlot_View = 1,
     MatrixSlot_Projection = 2,
     MatrixSlot_MVP = 3,
-    MatrixSlot_Count = 4
+    MatrixSlot_VP = 4,
+    MatrixSlot_WV = 5,
+    MatrixSlot_Count = 6
 };
 
 
@@ -202,6 +270,7 @@ struct MatrixSourceInfo {
 
 static CameraMatrices g_cameraMatrices = {};
 static MatrixSourceInfo g_matrixSources[MatrixSlot_Count] = {};
+static std::mutex g_cameraMatricesMutex;
 static ManualMatrixBinding g_manualBindings[MatrixSlot_Count] = {};
 static void UpdateMatrixSource(MatrixSlot slot,
                                uintptr_t shaderKey,
@@ -214,18 +283,40 @@ static void UpdateMatrixSource(MatrixSlot slot,
 
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
+static bool g_rasterBlendResourcesFailed = false;
+static bool g_rasterBlendLastRasterCapture = false;
+static bool g_rasterBlendLastRemixCapture = false;
 static bool g_showImGui = false;
+static bool g_prevShowImGui = false;
+static bool g_selectCameraTabOnMenuOpen = false;
 static bool g_pauseRendering = false;
 static bool g_isRenderingImGui = false;
 static WNDPROC g_imguiPrevWndProc = nullptr;
 static bool g_showConstantsAsMatrices = true;
 static bool g_filterDetectedMatrices = false;
+static bool g_showAllConstantRegisters = false;
 static bool g_showFpsStats = false;
 static bool g_showTransposedMatrices = false;
 static float g_imguiScaleRuntime = 1.0f;
 static ImGuiStyle g_imguiBaseStyle = {};
 static bool g_imguiMgrrUseAutoProjection = false;
+static bool g_imguiBarnyardUseGameSetTransformsForViewProjection = true;
+static bool g_imguiDisableGameInputWhileMenuOpen = false;
 static bool g_imguiBaseStyleCaptured = false;
+ImFont* g_overlayFontRegular = nullptr;
+ImFont* g_overlayFontBold = nullptr;
+
+void PushOverlayBoldFont() {
+    if (g_overlayFontBold) {
+        ImGui::PushFont(g_overlayFontBold);
+    }
+}
+
+void PopOverlayBoldFont() {
+    if (g_overlayFontBold) {
+        ImGui::PopFont();
+    }
+}
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
 static char g_manualEmitStatus[192] = "";
@@ -235,8 +326,14 @@ static bool g_projectionDetectedByNumericStructure = false;
 static float g_projectionDetectedFovRadians = 0.0f;
 static int g_projectionDetectedRegister = -1;
 static ProjectionHandedness g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
-static CombinedMVPDebugState g_combinedMvpDebug = {};
+static CombinedDecompositionDebugState g_combinedDecompDebug = {};
 static char g_customProjectionStatus[256] = "";
+static bool g_gameSetTransformSeen[3] = { false, false, false }; // world, view, projection
+static bool g_gameSetTransformAnySeen = false;
+
+static HHOOK g_keyboardBlockHook = nullptr;
+static HHOOK g_mouseBlockHook = nullptr;
+static bool g_imguiAsyncKeyboardPrev[256] = {};
 
 enum HotkeyAction {
     HotkeyAction_ToggleMenu = 0,
@@ -251,11 +348,18 @@ static bool g_hotkeyWasDown[HotkeyAction_Count] = {};
 static int g_iniViewMatrixRegister = -1;
 static int g_iniProjMatrixRegister = -1;
 static int g_iniWorldMatrixRegister = -1;
+static int g_iniMvpMatrixRegister = -1;
+static int g_iniMvMatrixRegister = -1;
+static int g_iniVpMatrixRegister = -1;
+static char g_iniPath[MAX_PATH] = {};
 
 static constexpr int kMaxConstantRegisters = 256;
+static float g_vsConstants[kMaxConstantRegisters][4] = {};
+static float g_psConstants[kMaxConstantRegisters][4] = {};
 static int g_selectedRegister = -1;
 static uintptr_t g_activeShaderKey = 0;
 static uintptr_t g_selectedShaderKey = 0;
+static uint64_t g_selectedShaderHash = 0;
 
 enum OverrideScopeMode {
     Override_Sticky = 0,
@@ -264,10 +368,426 @@ enum OverrideScopeMode {
 };
 
 static bool g_probeTransposedLayouts = true;
+static bool g_constantUploadRecordingEnabled = false;
 static bool g_probeInverseView = true;
 static int g_overrideScopeMode = Override_Sticky;
 static int g_overrideNFrames = 3;
 static std::unordered_map<uintptr_t, uint32_t> g_shaderBytecodeHashes = {};
+
+enum ShaderStageType {
+    ShaderStage_Vertex = 0,
+    ShaderStage_Pixel = 1
+};
+
+struct VertexDeclSemanticInfo {
+    bool hasPosition = false;
+    bool hasNormal = false;
+    bool hasTangent = false;
+    bool hasBinormal = false;
+    int texcoordCount = 0;
+};
+
+struct ShaderIrInstruction {
+    std::string opcode;
+    std::string dst;
+    std::vector<std::string> src;
+    int dstWriteMask = 0;
+};
+
+struct ShaderRecord {
+    uintptr_t shaderKey = 0;
+    ShaderStageType stage = ShaderStage_Vertex;
+    std::vector<uint32_t> originalBytecode = {};
+    std::vector<uint32_t> modifiedBytecode = {};
+    uint32_t hash = 0;
+    std::string shaderModel = "unknown";
+    std::vector<ShaderIrInstruction> ir = {};
+    bool isFFPTransform = false;
+    bool isFFPLighting = false;
+    bool usesSkinning = false;
+    bool usesFlowControl = false;
+    bool isRemixSafe = false;
+    int transformConstantBase = -1;
+    int lightingConstantBase = -1;
+    int lightDirectionRegister = -1;
+    int lightColorRegister = -1;
+    int materialColorRegister = -1;
+    int attenuationRegister = -1;
+    int positionRegister = -1;
+    int coneAngleRegister = -1;
+    LightingSpace lightSpace = LightingSpace::World;
+
+    int coneAngleRegisterOverride = -1;
+    int lightDirectionRegisterOverride = -1;
+    int lightColorRegisterOverride = -1;
+    int materialColorRegisterOverride = -1;
+    int positionRegisterOverride = -1;
+    int attenuationRegisterOverride = -1;
+    int lightCountOverride = -1;
+    LightingSpace lightSpaceOverride = LightingSpace::Auto;
+
+    bool constantUsage[kMaxConstantRegisters] = {};
+    unsigned long long usageCount = 0;
+    IUnknown* replacementShader = nullptr;
+    bool replacementEnabled = false;
+    std::string cachedDisassembly = {};
+    std::string editableAssembly = {};
+    std::string replacementStatus = {};
+};
+
+static std::unordered_map<uintptr_t, ShaderRecord> g_shaderRecords = {};
+static std::unordered_map<uint32_t, uintptr_t> g_shaderHashToKey = {};
+static std::vector<ShaderRecord*> g_stableShaderList = {};
+enum ShaderListOrderMode {
+    ShaderListOrder_Insertion = 0,
+    ShaderListOrder_HashAsc = 1
+};
+enum ShaderSearchScopeMode {
+    ShaderSearchScope_LabelOnly = 0,
+    ShaderSearchScope_AllAssemblies = 1,
+    ShaderSearchScope_SelectedAssembly = 2
+};
+static int g_shaderListOrderMode = ShaderListOrder_Insertion;
+static int g_shaderSearchScopeMode = ShaderSearchScope_LabelOnly;
+static uintptr_t g_activeVertexShaderKey = 0;
+static uintptr_t g_activePixelShaderKey = 0;
+static VertexDeclSemanticInfo g_activeVertexDeclInfo = {};
+static bool g_forceFfpTransform = false;
+static int g_manualTransformBaseOverride = -1;
+static int g_manualLightingBaseOverride = -1;
+static uintptr_t g_shaderEditorKey = 0;
+static std::vector<char> g_shaderEditorBuffer(65536, 0);
+
+static std::string TrimCopy(const std::string& s) {
+    size_t b = 0;
+    while (b < s.size() && std::isspace(static_cast<unsigned char>(s[b]))) ++b;
+    size_t e = s.size();
+    while (e > b && std::isspace(static_cast<unsigned char>(s[e - 1]))) --e;
+    return s.substr(b, e - b);
+}
+
+static bool ContainsCaseInsensitive(const std::string& haystack, const char* needle) {
+    if (!needle || needle[0] == '\0') return true;
+    if (haystack.empty()) return false;
+    const size_t needleLen = std::strlen(needle);
+    if (needleLen == 0 || needleLen > haystack.size()) return needleLen == 0;
+    return std::search(haystack.begin(), haystack.end(), needle, needle + needleLen,
+                       [](char lhs, char rhs) {
+                           return std::tolower(static_cast<unsigned char>(lhs)) ==
+                                  std::tolower(static_cast<unsigned char>(rhs));
+                       }) != haystack.end();
+}
+
+static int ParseWriteMaskBits(const std::string& reg) {
+    size_t dot = reg.find('.');
+    if (dot == std::string::npos || dot + 1 >= reg.size()) return 0xF;
+    int mask = 0;
+    for (size_t i = dot + 1; i < reg.size(); ++i) {
+        if (reg[i] == 'x') mask |= 1;
+        if (reg[i] == 'y') mask |= 2;
+        if (reg[i] == 'z') mask |= 4;
+        if (reg[i] == 'w') mask |= 8;
+    }
+    return mask == 0 ? 0xF : mask;
+}
+
+static bool ExtractConstRegister(const std::string& operand, int* outReg) {
+    if (!outReg) return false;
+    size_t cpos = operand.find('c');
+    if (cpos == std::string::npos || cpos + 1 >= operand.size()) return false;
+    if (!std::isdigit(static_cast<unsigned char>(operand[cpos + 1]))) return false;
+    int v = 0;
+    size_t i = cpos + 1;
+    while (i < operand.size() && std::isdigit(static_cast<unsigned char>(operand[i]))) {
+        v = (v * 10) + (operand[i] - '0');
+        ++i;
+    }
+    *outReg = v;
+    return true;
+}
+
+struct ParsedAsmInstruction {
+    std::string raw;
+    std::string opcode;
+    std::vector<std::string> operands;
+    bool isInstruction = false;
+};
+
+static std::vector<std::string> SplitAsmOperands(const std::string& text) {
+    std::vector<std::string> out;
+    std::string current;
+    int depth = 0;
+    for (char ch : text) {
+        if (ch == '[') ++depth;
+        if (ch == ']') depth = (depth > 0) ? (depth - 1) : 0;
+        if (ch == ',' && depth == 0) {
+            std::string token = TrimCopy(current);
+            if (!token.empty()) out.push_back(token);
+            current.clear();
+            continue;
+        }
+        current.push_back(ch);
+    }
+    std::string token = TrimCopy(current);
+    if (!token.empty()) out.push_back(token);
+    return out;
+}
+
+static bool IsOpcodeModifierChar(char c) {
+    return c == '_' || c == 'x' || c == 'y' || c == 'z' || c == 'w' || c == 'p' || c == 's' || c == 't';
+}
+
+static std::string NormalizeOpcodeRoot(const std::string& opcode) {
+    size_t p = opcode.find('_');
+    if (p == std::string::npos) return opcode;
+    if (p + 1 < opcode.size() && std::isdigit(static_cast<unsigned char>(opcode[p + 1]))) {
+        return opcode;
+    }
+    size_t i = p + 1;
+    while (i < opcode.size() && IsOpcodeModifierChar(opcode[i])) ++i;
+    if (i < opcode.size() && opcode[i] == '_') return opcode.substr(0, i);
+    return opcode.substr(0, p);
+}
+
+static ParsedAsmInstruction ParseAsmInstructionLine(const std::string& line) {
+    ParsedAsmInstruction parsed = {};
+    parsed.raw = line;
+    std::string t = TrimCopy(line);
+    if (t.empty() || t[0] == '/' || t[0] == ';') {
+        return parsed;
+    }
+    if (t.size() > 4 && t[0] == '0' && t[1] == 'x') {
+        return parsed;
+    }
+    if ((t.rfind("vs_", 0) == 0 || t.rfind("ps_", 0) == 0) && t.find(' ') == std::string::npos) {
+        return parsed;
+    }
+    size_t sp = t.find(' ');
+    parsed.opcode = NormalizeOpcodeRoot(TrimCopy(sp == std::string::npos ? t : t.substr(0, sp)));
+    std::string rest = sp == std::string::npos ? "" : TrimCopy(t.substr(sp + 1));
+    if (!rest.empty()) {
+        parsed.operands = SplitAsmOperands(rest);
+    }
+    parsed.isInstruction = !parsed.opcode.empty();
+    return parsed;
+}
+
+static HMODULE LoadD3DCompilerModule() {
+    HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+    if (!compiler) compiler = LoadLibraryA("d3dcompiler_43.dll");
+    return compiler;
+}
+
+static bool BuildShaderReplacementFromAssembly(IDirect3DDevice9* device,
+                                               ShaderRecord* rec,
+                                               std::string* outError) {
+    if (!device || !rec) {
+        if (outError) *outError = "Invalid device or shader record.";
+        return false;
+    }
+    if (rec->editableAssembly.empty()) {
+        if (outError) *outError = "Assembly editor is empty.";
+        return false;
+    }
+
+    HMODULE compiler = LoadD3DCompilerModule();
+    if (!compiler) {
+        if (outError) *outError = "d3dcompiler_47.dll / d3dcompiler_43.dll not available.";
+        return false;
+    }
+
+    typedef HRESULT(WINAPI* D3DAssembleFn)(LPCVOID, SIZE_T, LPCSTR, const D3D_SHADER_MACRO*, ID3DInclude*, UINT, ID3DBlob**, ID3DBlob**);
+    D3DAssembleFn assembleFn = reinterpret_cast<D3DAssembleFn>(GetProcAddress(compiler, "D3DAssemble"));
+    if (!assembleFn) {
+        if (outError) *outError = "D3DAssemble is unavailable in loaded d3dcompiler.";
+        return false;
+    }
+
+    ID3DBlob* assembled = nullptr;
+    ID3DBlob* errors = nullptr;
+    HRESULT asmHr = assembleFn(rec->editableAssembly.c_str(),
+                               rec->editableAssembly.size(),
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               0,
+                               &assembled,
+                               &errors);
+    if (FAILED(asmHr) || !assembled) {
+        if (outError) {
+            if (errors && errors->GetBufferPointer()) {
+                *outError = static_cast<const char*>(errors->GetBufferPointer());
+            } else {
+                char msg[128] = {};
+                snprintf(msg, sizeof(msg), "Assembly failed: HRESULT=0x%08X", static_cast<unsigned int>(asmHr));
+                *outError = msg;
+            }
+        }
+        if (errors) errors->Release();
+        if (assembled) assembled->Release();
+        return false;
+    }
+
+    IUnknown* replacement = nullptr;
+    HRESULT createHr = D3DERR_INVALIDCALL;
+    if (rec->stage == ShaderStage_Vertex) {
+        IDirect3DVertexShader9* shader = nullptr;
+        createHr = device->CreateVertexShader(reinterpret_cast<const DWORD*>(assembled->GetBufferPointer()), &shader);
+        replacement = shader;
+    } else {
+        IDirect3DPixelShader9* shader = nullptr;
+        createHr = device->CreatePixelShader(reinterpret_cast<const DWORD*>(assembled->GetBufferPointer()), &shader);
+        replacement = shader;
+    }
+
+    if (FAILED(createHr) || !replacement) {
+        if (outError) {
+            char msg[128] = {};
+            snprintf(msg, sizeof(msg), "Device shader creation failed: HRESULT=0x%08X", static_cast<unsigned int>(createHr));
+            *outError = msg;
+        }
+        if (errors) errors->Release();
+        assembled->Release();
+        return false;
+    }
+
+    if (rec->replacementShader) {
+        rec->replacementShader->Release();
+        rec->replacementShader = nullptr;
+    }
+    rec->replacementShader = replacement;
+    rec->replacementEnabled = true;
+
+    const size_t dwordCount = assembled->GetBufferSize() / sizeof(uint32_t);
+    rec->modifiedBytecode.assign(reinterpret_cast<const uint32_t*>(assembled->GetBufferPointer()),
+                                 reinterpret_cast<const uint32_t*>(assembled->GetBufferPointer()) + dwordCount);
+
+    if (outError) outError->clear();
+    if (errors) errors->Release();
+    assembled->Release();
+    return true;
+}
+
+static std::string BuildD3DDisassembly(const std::vector<uint32_t>& bytecode) {
+    if (bytecode.empty()) return "";
+    HMODULE compiler = LoadD3DCompilerModule();
+    if (!compiler) return "<d3dcompiler not available>";
+    typedef HRESULT (WINAPI *D3DDisassembleFn)(LPCVOID, SIZE_T, UINT, LPCSTR, ID3DBlob**);
+    D3DDisassembleFn fn = reinterpret_cast<D3DDisassembleFn>(GetProcAddress(compiler, "D3DDisassemble"));
+    if (!fn) return "<D3DDisassemble missing>";
+    ID3DBlob* blob = nullptr;
+    HRESULT hr = fn(bytecode.data(), bytecode.size() * sizeof(uint32_t), 0, nullptr, &blob);
+    if (FAILED(hr) || !blob) return "<D3DDisassemble failed>";
+    std::string text(static_cast<const char*>(blob->GetBufferPointer()), blob->GetBufferSize());
+    blob->Release();
+    return text;
+}
+
+static std::vector<ShaderIrInstruction> BuildIrFromDisassembly(const std::string& disasm) {
+    std::vector<ShaderIrInstruction> ir;
+    std::istringstream in(disasm);
+    std::string line;
+    while (std::getline(in, line)) {
+        std::string t = TrimCopy(line);
+        if (t.empty() || t[0] == '/' || t[0] == ';') continue;
+        size_t sp = t.find(' ');
+        ShaderIrInstruction inst;
+        inst.opcode = TrimCopy(sp == std::string::npos ? t : t.substr(0, sp));
+        if (inst.opcode.empty()) continue;
+        std::string rest = sp == std::string::npos ? "" : TrimCopy(t.substr(sp + 1));
+        if (!rest.empty()) {
+            std::vector<std::string> ops;
+            size_t start = 0;
+            while (start < rest.size()) {
+                size_t comma = rest.find(',', start);
+                std::string token = TrimCopy(rest.substr(start, comma == std::string::npos ? std::string::npos : comma - start));
+                if (!token.empty()) ops.push_back(token);
+                if (comma == std::string::npos) break;
+                start = comma + 1;
+            }
+            if (!ops.empty()) {
+                inst.dst = ops[0];
+                inst.dstWriteMask = ParseWriteMaskBits(inst.dst);
+                for (size_t i = 1; i < ops.size(); ++i) inst.src.push_back(ops[i]);
+            }
+        }
+        ir.push_back(inst);
+    }
+    return ir;
+}
+
+static void ClassifyShaderRecord(ShaderRecord* rec) {
+    if (!rec) return;
+    rec->isFFPTransform = false;
+    rec->isFFPLighting = false;
+    rec->usesSkinning = false;
+    rec->usesFlowControl = false;
+    rec->transformConstantBase = -1;
+    rec->lightingConstantBase = -1;
+    rec->lightDirectionRegister = -1;
+    rec->lightColorRegister = -1;
+    rec->materialColorRegister = -1;
+    rec->attenuationRegister = -1;
+    rec->positionRegister = -1;
+    rec->coneAngleRegister = -1;
+    rec->lightSpace = LightingSpace::World;
+    int minConstReg = kMaxConstantRegisters;
+
+    for (size_t i = 0; i < rec->ir.size(); ++i) {
+        const ShaderIrInstruction& inst = rec->ir[i];
+        if (inst.opcode == "if" || inst.opcode == "loop" || inst.opcode == "rep" || inst.opcode == "call" || inst.opcode == "callnz") {
+            rec->usesFlowControl = true;
+        }
+        if (inst.dst.find("a0") != std::string::npos || (inst.dst.find('[') != std::string::npos && inst.dst.find('c') != std::string::npos)) {
+            rec->usesSkinning = true;
+        }
+        for (const std::string& src : inst.src) {
+            int c = -1;
+            if (ExtractConstRegister(src, &c) && c >= 0 && c < kMaxConstantRegisters) { rec->constantUsage[c] = true; if (c < minConstReg) minConstReg = c; }
+            if (src.find("a0") != std::string::npos || src.find("[a0") != std::string::npos) rec->usesSkinning = true;
+        }
+    }
+
+    for (size_t i = 0; i + 3 < rec->ir.size(); ++i) {
+        const ShaderIrInstruction& a = rec->ir[i + 0];
+        const ShaderIrInstruction& b = rec->ir[i + 1];
+        const ShaderIrInstruction& c = rec->ir[i + 2];
+        const ShaderIrInstruction& d = rec->ir[i + 3];
+        if (a.opcode == "dp4" && b.opcode == "dp4" && c.opcode == "dp4" && d.opcode == "dp4" &&
+            a.dst.find("oPos") != std::string::npos && b.dst.find("oPos") != std::string::npos &&
+            c.dst.find("oPos") != std::string::npos && d.dst.find("oPos") != std::string::npos &&
+            a.src.size() >= 2 && b.src.size() >= 2 && c.src.size() >= 2 && d.src.size() >= 2 &&
+            a.src[0] == b.src[0] && b.src[0] == c.src[0] && c.src[0] == d.src[0]) {
+            int c0 = -1, c1 = -1, c2 = -1, c3 = -1;
+            if (ExtractConstRegister(a.src[1], &c0) && ExtractConstRegister(b.src[1], &c1) &&
+                ExtractConstRegister(c.src[1], &c2) && ExtractConstRegister(d.src[1], &c3) &&
+                c1 == c0 + 1 && c2 == c0 + 2 && c3 == c0 + 3) {
+                rec->isFFPTransform = true;
+                rec->transformConstantBase = c0;
+                break;
+            }
+        }
+    }
+
+    bool sawDot = false, sawMaxZero = false, sawMul = false;
+    for (const ShaderIrInstruction& inst : rec->ir) {
+        sawDot |= (inst.opcode == "dp3" || inst.opcode == "dp4");
+        if (inst.opcode == "max" && inst.src.size() >= 2 && (inst.src[1] == "c0.x" || inst.src[1] == "0")) sawMaxZero = true;
+        sawMul |= (inst.opcode == "mul");
+    }
+    rec->isFFPLighting = sawDot && sawMaxZero && sawMul;
+    if (rec->isFFPLighting && minConstReg < kMaxConstantRegisters) {
+        rec->lightingConstantBase = minConstReg;
+        rec->lightDirectionRegister = minConstReg;
+        rec->lightColorRegister = minConstReg + 1;
+        rec->positionRegister = minConstReg + 2;
+        rec->attenuationRegister = minConstReg + 3;
+        rec->coneAngleRegister = minConstReg + 3;
+        rec->materialColorRegister = minConstReg + 1;
+        rec->lightSpace = LightingSpace::View;
+    }
+    rec->isRemixSafe = !rec->usesFlowControl;
+}
 
 static bool TryGetShaderBytecodeHash(uintptr_t shaderKey, uint32_t* outHash) {
     if (!outHash || shaderKey == 0) {
@@ -286,16 +806,35 @@ struct ShaderConstantState {
     bool valid[kMaxConstantRegisters] = {};
     float overrideConstants[kMaxConstantRegisters][4] = {};
     bool overrideValid[kMaxConstantRegisters] = {};
-    int overrideFramesRemaining[kMaxConstantRegisters] = {};
+    int overrideExpiresAtFrame[kMaxConstantRegisters];
     bool snapshotReady = false;
-    unsigned long long sampleCount = 0;
+    unsigned long long sampleCounts[kMaxConstantRegisters] = {};
     double mean[kMaxConstantRegisters][4] = {};
     double m2[kMaxConstantRegisters][4] = {};
-    int stableViewBase = -1;
-    int stableViewCount = 0;
-    int stableProjBase = -1;
-    int stableProjCount = 0;
     unsigned long long lastChangeSerial = 0;
+};
+
+enum ConstantUploadStage {
+    ConstantUploadStage_Vertex = 0,
+    ConstantUploadStage_Pixel = 1
+};
+
+
+struct ConstantUploadEvent {
+    ConstantUploadStage stage = ConstantUploadStage_Vertex;
+    uintptr_t shaderKey = 0;
+    uint32_t shaderHash = 0;
+    UINT startRegister = 0;
+    UINT vectorCount = 0;
+    unsigned long long changeSerial = 0;
+};
+
+struct GlobalVertexRegisterState {
+    float value[4] = {};
+    bool valid = false;
+    unsigned long long lastUploadSerial = 0;
+    uintptr_t lastShaderKey = 0;
+    uint32_t lastShaderHash = 0;
 };
 
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing);
@@ -304,6 +843,10 @@ static std::unordered_map<uintptr_t, ShaderConstantState> g_shaderConstants = {}
 static std::vector<uintptr_t> g_shaderOrder = {};
 static std::unordered_map<uintptr_t, bool> g_disabledShaders = {};
 static unsigned long long g_constantChangeSerial = 0;
+static unsigned long long g_constantUploadSerial = 0;
+static std::deque<ConstantUploadEvent> g_constantUploadEvents = {};
+static constexpr size_t kMaxConstantUploadEvents = 2000;
+static GlobalVertexRegisterState g_allVertexRegisters[kMaxConstantRegisters] = {};
 static HANDLE g_memoryScannerThread = nullptr;
 static DWORD g_memoryScannerThreadId = 0;
 static DWORD g_memoryScannerLastTick = 0;
@@ -319,10 +862,47 @@ static unsigned long long g_frameTimeSamples = 0;
 static LARGE_INTEGER g_perfFrequency = {};
 static LARGE_INTEGER g_prevCounter = {};
 static bool g_perfInitialized = false;
+static float g_lastDeltaSec = 0.016f;
 
 static std::deque<std::string> g_logLines = {};
 static std::vector<std::string> g_logSnapshot = {};
 static std::vector<std::string> g_memoryScanResults = {};
+static RemixLightingManager g_remixLightingManager = {};
+static CustomLightsManager g_customLightsManager = {};
+
+static ShaderLightingMetadata BuildLightingMetadataForShader(uintptr_t shaderKey) {
+    ShaderLightingMetadata meta = {};
+    auto it = g_shaderRecords.find(shaderKey);
+    if (it == g_shaderRecords.end()) {
+        return meta;
+    }
+    const ShaderRecord& rec = it->second;
+    meta.isFFPLighting = rec.isFFPLighting;
+    meta.lightDirectionRegister = rec.lightDirectionRegister;
+    meta.lightColorRegister = rec.lightColorRegister;
+    meta.materialColorRegister = rec.materialColorRegister;
+    meta.attenuationRegister = rec.attenuationRegister;
+    meta.positionRegister = rec.positionRegister;
+    meta.lightingConstantBase = (g_manualLightingBaseOverride >= 0)
+                                ? g_manualLightingBaseOverride
+                                : rec.lightingConstantBase;
+    meta.coneAngleRegister = rec.coneAngleRegister;
+
+    if (rec.lightDirectionRegisterOverride >= 0) meta.lightDirectionRegister = rec.lightDirectionRegisterOverride;
+    if (rec.lightColorRegisterOverride >= 0) meta.lightColorRegister = rec.lightColorRegisterOverride;
+    if (rec.materialColorRegisterOverride >= 0) meta.materialColorRegister = rec.materialColorRegisterOverride;
+    if (rec.positionRegisterOverride >= 0) meta.positionRegister = rec.positionRegisterOverride;
+    if (rec.attenuationRegisterOverride >= 0) meta.attenuationRegister = rec.attenuationRegisterOverride;
+    if (rec.coneAngleRegisterOverride >= 0) meta.coneAngleRegister = rec.coneAngleRegisterOverride;
+
+    meta.lightCount = (rec.lightCountOverride >= 1) ? rec.lightCountOverride : 1;
+    meta.lightSpace = (rec.lightSpaceOverride != LightingSpace::Auto)
+                      ? rec.lightSpaceOverride
+                      : rec.lightSpace;
+    meta.constantUsage = rec.constantUsage;
+    meta.constantCount = kMaxConstantRegisters;
+    return meta;
+}
 
 struct MemoryScanHit {
     std::string label;
@@ -348,6 +928,9 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
             ImGuiIO& io = ImGui::GetIO();
             const bool keyboardMsg = (msg >= WM_KEYFIRST && msg <= WM_KEYLAST) || msg == WM_CHAR || msg == WM_SYSCHAR;
             const bool mouseMsg = (msg >= WM_MOUSEFIRST && msg <= WM_MOUSELAST);
+            if (g_config.disableGameInputWhileMenuOpen && (keyboardMsg || mouseMsg)) {
+                return TRUE;
+            }
             if ((keyboardMsg && io.WantCaptureKeyboard) || (mouseMsg && io.WantCaptureMouse)) {
                 return TRUE;
             }
@@ -359,6 +942,177 @@ static LRESULT CALLBACK ImGuiWndProcHook(HWND hwnd, UINT msg, WPARAM wParam, LPA
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
+static bool ShouldBypassInputForImGuiMenu() {
+    return g_imguiInitialized && g_showImGui && g_config.disableGameInputWhileMenuOpen;
+}
+
+static bool IsProxyHotkeyVk(DWORD vkCode) {
+    return vkCode == static_cast<DWORD>(g_config.hotkeyToggleMenuVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyTogglePauseVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyEmitMatricesVk) ||
+           vkCode == static_cast<DWORD>(g_config.hotkeyResetMatrixOverridesVk);
+}
+
+static LRESULT CALLBACK LowLevelKeyboardBlockHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && ShouldBypassInputForImGuiMenu()) {
+        const KBDLLHOOKSTRUCT* keyInfo = reinterpret_cast<const KBDLLHOOKSTRUCT*>(lParam);
+        if (keyInfo && !IsProxyHotkeyVk(keyInfo->vkCode)) {
+            return 1;
+        }
+    }
+    return CallNextHookEx(g_keyboardBlockHook, nCode, wParam, lParam);
+}
+
+static LRESULT CALLBACK LowLevelMouseBlockHook(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && ShouldBypassInputForImGuiMenu()) {
+        return 1;
+    }
+    return CallNextHookEx(g_mouseBlockHook, nCode, wParam, lParam);
+}
+
+static void UpdateInputBlockHooks() {
+    const bool shouldBlock = ShouldBypassInputForImGuiMenu();
+    if (shouldBlock) {
+        if (!g_keyboardBlockHook) {
+            g_keyboardBlockHook = SetWindowsHookExA(WH_KEYBOARD_LL, LowLevelKeyboardBlockHook, g_moduleInstance, 0);
+        }
+        if (!g_mouseBlockHook) {
+            g_mouseBlockHook = SetWindowsHookExA(WH_MOUSE_LL, LowLevelMouseBlockHook, g_moduleInstance, 0);
+        }
+    } else {
+        if (g_keyboardBlockHook) {
+            UnhookWindowsHookEx(g_keyboardBlockHook);
+            g_keyboardBlockHook = nullptr;
+        }
+        if (g_mouseBlockHook) {
+            UnhookWindowsHookEx(g_mouseBlockHook);
+            g_mouseBlockHook = nullptr;
+        }
+    }
+}
+
+static ImGuiKey VkToImGuiKey(UINT vk) {
+    if (vk >= '0' && vk <= '9') return static_cast<ImGuiKey>(ImGuiKey_0 + (vk - '0'));
+    if (vk >= 'A' && vk <= 'Z') return static_cast<ImGuiKey>(ImGuiKey_A + (vk - 'A'));
+    if (vk >= VK_F1 && vk <= VK_F12) return static_cast<ImGuiKey>(ImGuiKey_F1 + (vk - VK_F1));
+    switch (vk) {
+    case VK_TAB: return ImGuiKey_Tab;
+    case VK_LEFT: return ImGuiKey_LeftArrow;
+    case VK_RIGHT: return ImGuiKey_RightArrow;
+    case VK_UP: return ImGuiKey_UpArrow;
+    case VK_DOWN: return ImGuiKey_DownArrow;
+    case VK_PRIOR: return ImGuiKey_PageUp;
+    case VK_NEXT: return ImGuiKey_PageDown;
+    case VK_HOME: return ImGuiKey_Home;
+    case VK_END: return ImGuiKey_End;
+    case VK_INSERT: return ImGuiKey_Insert;
+    case VK_DELETE: return ImGuiKey_Delete;
+    case VK_BACK: return ImGuiKey_Backspace;
+    case VK_SPACE: return ImGuiKey_Space;
+    case VK_RETURN: return ImGuiKey_Enter;
+    case VK_ESCAPE: return ImGuiKey_Escape;
+    case VK_OEM_7: return ImGuiKey_Apostrophe;
+    case VK_OEM_COMMA: return ImGuiKey_Comma;
+    case VK_OEM_MINUS: return ImGuiKey_Minus;
+    case VK_OEM_PERIOD: return ImGuiKey_Period;
+    case VK_OEM_2: return ImGuiKey_Slash;
+    case VK_OEM_1: return ImGuiKey_Semicolon;
+    case VK_OEM_PLUS: return ImGuiKey_Equal;
+    case VK_OEM_4: return ImGuiKey_LeftBracket;
+    case VK_OEM_5: return ImGuiKey_Backslash;
+    case VK_OEM_6: return ImGuiKey_RightBracket;
+    case VK_OEM_3: return ImGuiKey_GraveAccent;
+    case VK_CAPITAL: return ImGuiKey_CapsLock;
+    case VK_SCROLL: return ImGuiKey_ScrollLock;
+    case VK_NUMLOCK: return ImGuiKey_NumLock;
+    case VK_SNAPSHOT: return ImGuiKey_PrintScreen;
+    case VK_PAUSE: return ImGuiKey_Pause;
+    case VK_NUMPAD0: return ImGuiKey_Keypad0;
+    case VK_NUMPAD1: return ImGuiKey_Keypad1;
+    case VK_NUMPAD2: return ImGuiKey_Keypad2;
+    case VK_NUMPAD3: return ImGuiKey_Keypad3;
+    case VK_NUMPAD4: return ImGuiKey_Keypad4;
+    case VK_NUMPAD5: return ImGuiKey_Keypad5;
+    case VK_NUMPAD6: return ImGuiKey_Keypad6;
+    case VK_NUMPAD7: return ImGuiKey_Keypad7;
+    case VK_NUMPAD8: return ImGuiKey_Keypad8;
+    case VK_NUMPAD9: return ImGuiKey_Keypad9;
+    case VK_DECIMAL: return ImGuiKey_KeypadDecimal;
+    case VK_DIVIDE: return ImGuiKey_KeypadDivide;
+    case VK_MULTIPLY: return ImGuiKey_KeypadMultiply;
+    case VK_SUBTRACT: return ImGuiKey_KeypadSubtract;
+    case VK_ADD: return ImGuiKey_KeypadAdd;
+    case VK_LSHIFT: return ImGuiKey_LeftShift;
+    case VK_RSHIFT: return ImGuiKey_RightShift;
+    case VK_LCONTROL: return ImGuiKey_LeftCtrl;
+    case VK_RCONTROL: return ImGuiKey_RightCtrl;
+    case VK_LMENU: return ImGuiKey_LeftAlt;
+    case VK_RMENU: return ImGuiKey_RightAlt;
+    case VK_LWIN: return ImGuiKey_LeftSuper;
+    case VK_RWIN: return ImGuiKey_RightSuper;
+    case VK_APPS: return ImGuiKey_Menu;
+    default: return ImGuiKey_None;
+    }
+}
+
+static void UpdateImGuiKeyboardFromAsyncState() {
+    if (!g_showImGui || !g_imguiInitialized) {
+        memset(g_imguiAsyncKeyboardPrev, 0, sizeof(g_imguiAsyncKeyboardPrev));
+        return;
+    }
+
+    ImGuiIO& io = ImGui::GetIO();
+    for (UINT vk = 0; vk < 256; ++vk) {
+        const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
+        const bool prev = g_imguiAsyncKeyboardPrev[vk];
+        if (down == prev) {
+            continue;
+        }
+        g_imguiAsyncKeyboardPrev[vk] = down;
+        const ImGuiKey key = VkToImGuiKey(vk);
+        if (key != ImGuiKey_None) {
+            io.AddKeyEvent(key, down);
+            io.SetKeyEventNativeData(key, vk, static_cast<int>(MapVirtualKeyA(vk, MAPVK_VK_TO_VSC)));
+        }
+        if (down) {
+            BYTE keyboardState[256] = {};
+            if (GetKeyboardState(keyboardState)) {
+                WCHAR utf16Buf[4] = {};
+                const int translated = ToUnicode(vk,
+                                                 MapVirtualKeyA(vk, MAPVK_VK_TO_VSC),
+                                                 keyboardState,
+                                                 utf16Buf,
+                                                 4,
+                                                 0);
+                if (translated > 0) {
+                    for (int i = 0; i < translated; ++i) {
+                        io.AddInputCharacterUTF16(utf16Buf[i]);
+                    }
+                }
+            }
+        }
+    }
+
+    io.AddKeyEvent(ImGuiMod_Ctrl, (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Shift, (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Alt, (GetAsyncKeyState(VK_MENU) & 0x8000) != 0);
+    io.AddKeyEvent(ImGuiMod_Super, (GetAsyncKeyState(VK_LWIN) & 0x8000) != 0 ||
+                                  (GetAsyncKeyState(VK_RWIN) & 0x8000) != 0);
+}
+
+static void EnsureWndProcHookInstalled() {
+    if (!g_imguiInitialized || !g_imguiHwnd) {
+        return;
+    }
+    WNDPROC current = reinterpret_cast<WNDPROC>(
+        GetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC));
+    if (current != ImGuiWndProcHook) {
+        g_imguiPrevWndProc = current;
+        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
+                         reinterpret_cast<LONG_PTR>(ImGuiWndProcHook));
+    }
+}
+
 static void StoreViewMatrix(const D3DMATRIX& view,
                             uintptr_t shaderKey = 0,
                             int baseRegister = -1,
@@ -367,8 +1121,11 @@ static void StoreViewMatrix(const D3DMATRIX& view,
                             bool manual = false,
                             const char* sourceLabel = nullptr,
                             int extractedFromRegister = -1) {
-    g_cameraMatrices.view = view;
-    g_cameraMatrices.hasView = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.view = view;
+        g_cameraMatrices.hasView = true;
+    }
     UpdateMatrixSource(MatrixSlot_View, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -381,8 +1138,11 @@ static void StoreProjectionMatrix(const D3DMATRIX& projection,
                                   bool manual = false,
                                   const char* sourceLabel = nullptr,
                                   int extractedFromRegister = -1) {
-    g_cameraMatrices.projection = projection;
-    g_cameraMatrices.hasProjection = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.projection = projection;
+        g_cameraMatrices.hasProjection = true;
+    }
     UpdateMatrixSource(MatrixSlot_Projection, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -395,8 +1155,11 @@ static void StoreWorldMatrix(const D3DMATRIX& world,
                              bool manual = false,
                              const char* sourceLabel = nullptr,
                              int extractedFromRegister = -1) {
-    g_cameraMatrices.world = world;
-    g_cameraMatrices.hasWorld = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.world = world;
+        g_cameraMatrices.hasWorld = true;
+    }
     UpdateMatrixSource(MatrixSlot_World, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
@@ -409,9 +1172,47 @@ static void StoreMVPMatrix(const D3DMATRIX& mvp,
                            bool manual = false,
                            const char* sourceLabel = nullptr,
                            int extractedFromRegister = -1) {
-    g_cameraMatrices.mvp = mvp;
-    g_cameraMatrices.hasMVP = true;
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.mvp = mvp;
+        g_cameraMatrices.hasMVP = true;
+    }
     UpdateMatrixSource(MatrixSlot_MVP, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
+}
+
+
+static void StoreVPMatrix(const D3DMATRIX& vp,
+                          uintptr_t shaderKey = 0,
+                          int baseRegister = -1,
+                          int rows = 4,
+                          bool transposed = false,
+                          bool manual = false,
+                          const char* sourceLabel = nullptr,
+                          int extractedFromRegister = -1) {
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.vp = vp;
+        g_cameraMatrices.hasVP = true;
+    }
+    UpdateMatrixSource(MatrixSlot_VP, shaderKey, baseRegister, rows, transposed, manual,
+                       sourceLabel, extractedFromRegister);
+}
+
+static void StoreWVMatrix(const D3DMATRIX& wv,
+                          uintptr_t shaderKey = 0,
+                          int baseRegister = -1,
+                          int rows = 4,
+                          bool transposed = false,
+                          bool manual = false,
+                          const char* sourceLabel = nullptr,
+                          int extractedFromRegister = -1) {
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        g_cameraMatrices.wv = wv;
+        g_cameraMatrices.hasWV = true;
+    }
+    UpdateMatrixSource(MatrixSlot_WV, shaderKey, baseRegister, rows, transposed, manual,
                        sourceLabel, extractedFromRegister);
 }
 
@@ -493,7 +1294,32 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    // Replace default blue accents with a readable red palette.
+    style.WindowRounding = 8.0f;
+    style.PopupRounding = 8.0f;
+    style.FrameRounding = 6.0f;
+    style.ChildRounding = 6.0f;
+    style.TabRounding = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowPadding = ImVec2(12.0f, 10.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
+    style.ScrollbarSize = 8.0f;
+    style.FrameBorderSize = 0.0f;
+    style.WindowBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
+
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.055f, 0.059f, 0.96f);
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.090f, 0.072f, 0.074f, 0.90f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.090f, 0.058f, 0.058f, 0.96f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.06f, 0.07f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.07f, 0.06f, 0.06f, 0.85f);
+
     style.Colors[ImGuiCol_CheckMark] = ImVec4(0.95f, 0.30f, 0.30f, 1.00f);
     style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.88f, 0.28f, 0.28f, 1.00f);
     style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(1.00f, 0.40f, 0.40f, 1.00f);
@@ -514,14 +1340,85 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     style.Colors[ImGuiCol_TabActive] = ImVec4(0.48f, 0.18f, 0.18f, 1.00f);
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.18f, 0.10f, 0.10f, 0.97f);
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.33f, 0.14f, 0.14f, 1.00f);
-    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
+    style.Colors[ImGuiCol_Border] = ImVec4(0.56f, 0.22f, 0.22f, 0.68f);
+    style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.75f, 0.25f, 0.25f, 0.45f);
     style.Colors[ImGuiCol_NavHighlight] = ImVec4(0.96f, 0.34f, 0.34f, 1.00f);
+
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    io.Fonts->Clear();
+    g_overlayFontRegular = nullptr;
+    g_overlayFontBold = nullptr;
+
+    constexpr float kOverlayRegularFontSize = 14.5f;
+    constexpr float kOverlayBoldFontSize = 15.5f;
+    ImFontConfig overlayFontConfig;
+    overlayFontConfig.OversampleH = 2;
+    overlayFontConfig.OversampleV = 1;
+    overlayFontConfig.PixelSnapH = true;
+    overlayFontConfig.RasterizerMultiply = 1.1f;
+
+    char windowsDir[MAX_PATH] = {};
+    if (GetWindowsDirectoryA(windowsDir, MAX_PATH) > 0) {
+        std::filesystem::path fontsDir = std::filesystem::path(windowsDir) / "Fonts";
+        constexpr std::array<const char*, 2> kRobotoRegularCandidates = {
+            "Roboto-Regular.ttf",
+            "Roboto/static/Roboto-Regular.ttf"
+        };
+        constexpr std::array<const char*, 2> kRobotoBoldCandidates = {
+            "Roboto-Bold.ttf",
+            "Roboto/static/Roboto-Bold.ttf"
+        };
+
+        for (const char* candidate : kRobotoRegularCandidates) {
+            std::filesystem::path fontPath = fontsDir / candidate;
+            if (std::filesystem::exists(fontPath)) {
+                g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+                    fontPath.string().c_str(), kOverlayRegularFontSize, &overlayFontConfig);
+                if (g_overlayFontRegular) {
+                    break;
+                }
+            }
+        }
+        for (const char* candidate : kRobotoBoldCandidates) {
+            std::filesystem::path fontPath = fontsDir / candidate;
+            if (std::filesystem::exists(fontPath)) {
+                g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+                    fontPath.string().c_str(), kOverlayBoldFontSize, &overlayFontConfig);
+                if (g_overlayFontBold) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeui.ttf", kOverlayRegularFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\segoeuib.ttf", kOverlayBoldFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\arial.ttf", kOverlayRegularFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\arialbd.ttf", kOverlayBoldFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(
+            "C:\\Windows\\Fonts\\tahoma.ttf", kOverlayRegularFontSize, &overlayFontConfig);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = g_overlayFontRegular;
+    }
+    io.FontDefault = g_overlayFontRegular;
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX9_Init(device);
@@ -545,15 +1442,61 @@ static void ShutdownImGui() {
         return;
     }
 
+    // Remove our hook first so ImGui_ImplWin32_Shutdown restores correctly.
+    if (g_imguiHwnd && g_imguiPrevWndProc) {
+        WNDPROC current = reinterpret_cast<WNDPROC>(
+            GetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC));
+        if (current == ImGuiWndProcHook) {
+            SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC,
+                             reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
+        }
+    }
+
     ImGui_ImplDX9_Shutdown();
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
+    g_showImGui = false;
     g_imguiInitialized = false;
-    if (g_imguiPrevWndProc && g_imguiHwnd) {
-        SetWindowLongPtr(g_imguiHwnd, GWLP_WNDPROC, reinterpret_cast<LONG_PTR>(g_imguiPrevWndProc));
-    }
+    UpdateInputBlockHooks();
     g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
+    g_prevShowImGui = false;
+}
+
+static void DrawRemixApiStatusLine(RemixLightingManager& remixManager, CustomLightsManager& customManager) {
+    int shaderActive = 0;
+    for (const auto& kv : remixManager.ActiveLights()) {
+        if (kv.second.handle) {
+            ++shaderActive;
+        }
+    }
+    int customActive = 0;
+    for (const auto& l : customManager.Lights()) {
+        if (l.enabled && l.nativeHandle) {
+            ++customActive;
+        }
+    }
+
+    const bool ready = remix_api::g_initialized;
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float pulse = 0.65f + 0.35f * (0.5f + 0.5f * sinf(t * 6.2831853f));
+    const ImVec4 dotColor = ready ? ImVec4(0.20f, 0.95f, 0.35f, 1.00f) : ImVec4(0.92f, 0.22f, 0.22f, pulse);
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float radius = ready ? 4.0f : 3.0f + pulse * 1.5f;
+    ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + 7.0f, p.y + ImGui::GetTextLineHeight() * 0.5f), radius, ImGui::ColorConvertFloat4ToU32(dotColor));
+    ImGui::Dummy(ImVec2(14.0f, 0.0f));
+    ImGui::SameLine(0.0f, 6.0f);
+    if (ready) {
+        ImGui::TextColored(ImVec4(0.50f, 0.95f, 0.60f, 1.0f), "Remix API Ready");
+        ImGui::SameLine();
+        ImGui::TextDisabled("shader: %d  custom: %d", shaderActive, customActive);
+    } else {
+        ImGui::TextColored(ImVec4(0.96f, 0.36f, 0.36f, 1.0f), "Remix API not initialized");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(run with RTX Remix)");
+    }
+    ImGui::Separator();
 }
 
 static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) {
@@ -593,6 +1536,26 @@ static uint32_t GetShaderHashForKey(uintptr_t shaderKey) {
     return HashBytesFNV1a(reinterpret_cast<const uint8_t*>(&shaderKey), sizeof(shaderKey));
 }
 
+
+static void RecordConstantUpload(ConstantUploadStage stage,
+                                 uintptr_t shaderKey,
+                                 UINT startRegister,
+                                 UINT vectorCount) {
+    ConstantUploadEvent ev = {};
+    ev.stage = stage;
+    ev.shaderKey = shaderKey;
+    ev.shaderHash = GetShaderHashForKey(shaderKey);
+    ev.startRegister = startRegister;
+    ev.vectorCount = vectorCount;
+    ev.changeSerial = ++g_constantUploadSerial;
+
+    std::lock_guard<std::mutex> lock(g_uiDataMutex);
+    g_constantUploadEvents.emplace_back(ev);
+    while (g_constantUploadEvents.size() > kMaxConstantUploadEvents) {
+        g_constantUploadEvents.pop_front();
+    }
+}
+
 static bool IsShaderDisabled(uintptr_t shaderKey) {
     auto it = g_disabledShaders.find(shaderKey);
     return it != g_disabledShaders.end() && it->second;
@@ -628,7 +1591,7 @@ static void BuildShaderComboLabel(uintptr_t shaderKey, char* outLabel, size_t ou
     bool disabled = IsShaderDisabled(shaderKey);
     float flash = GetShaderFlashStrength(state);
     uint32_t displayHash = GetShaderHashForKey(shaderKey);
-    snprintf(outLabel, outSize, "0x%p (hash 0x%08X)%s%s%s",
+    snprintf(outLabel, outSize, "%p (hash 0x%08X)%s%s%s",
              reinterpret_cast<void*>(shaderKey),
              displayHash,
              shaderKey == g_activeShaderKey ? " (active)" : "",
@@ -660,6 +1623,7 @@ static void UpdateMatrixSource(MatrixSlot slot,
     info.transposed = transposed;
     info.sourceLabel = sourceLabel ? sourceLabel : (manual ? "manual constants selection" : "auto/config detection");
     info.extractedFromRegister = extractedFromRegister >= 0 ? extractedFromRegister : baseRegister;
+    std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
     g_matrixSources[slot] = info;
 }
 
@@ -668,7 +1632,11 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
         return;
     }
 
-    const MatrixSourceInfo& source = g_matrixSources[slot];
+    MatrixSourceInfo source = {};
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        source = g_matrixSources[slot];
+    }
     if (!source.valid) {
         ImGui::Text("Source: <unknown>");
         return;
@@ -679,7 +1647,7 @@ static void DrawMatrixSourceInfo(MatrixSlot slot, bool available) {
     if (source.shaderKey == 0) {
         ImGui::Text("Source shader: <none/runtime>");
     } else {
-        ImGui::Text("Source shader: 0x%p", reinterpret_cast<void*>(source.shaderKey));
+        ImGui::Text("Source shader: %p", reinterpret_cast<void*>(source.shaderKey));
         if (hasBytecodeHash) {
             ImGui::Text("Shader hash: 0x%08X", shaderHash);
         } else if (source.shaderHash != 0) {
@@ -725,6 +1693,21 @@ static bool CanAssignManualMatrix(MatrixSlot slot, char* reason, size_t reasonSi
                  "Manual WORLD assignment blocked: WorldMatrixRegister is configured in camera_proxy.ini.");
         return false;
     }
+    if (slot == MatrixSlot_MVP && g_iniMvpMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual MVP assignment blocked: MVPMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    if (slot == MatrixSlot_WV && g_iniMvMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual MV assignment blocked: MVMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
+    if (slot == MatrixSlot_VP && g_iniVpMatrixRegister >= 0) {
+        snprintf(reason, reasonSize,
+                 "Manual VP assignment blocked: VPMatrixRegister is configured in camera_proxy.ini.");
+        return false;
+    }
     return true;
 }
 
@@ -734,21 +1717,35 @@ static const char* MatrixSlotLabel(MatrixSlot slot) {
         case MatrixSlot_View: return "VIEW";
         case MatrixSlot_Projection: return "PROJECTION";
         case MatrixSlot_MVP: return "MVP";
+        case MatrixSlot_VP: return "VP";
+        case MatrixSlot_WV: return "MV";
         default: return "UNKNOWN";
     }
 }
 
 static bool SaveConfigRegisterValue(const char* key, int value) {
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    char* lastSlash = strrchr(path, '\\');
-    if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
-    }
-
+    if (g_iniPath[0] == '\0') return false;
     char valueBuf[32] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%d", value);
-    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, g_iniPath) != FALSE;
+}
+
+static bool SaveConfigRegisterValueInSection(const char* section, const char* key, int value) {
+    if (g_iniPath[0] == '\0') return false;
+    char valueBuf[32] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%d", value);
+    return WritePrivateProfileStringA(section, key, valueBuf, g_iniPath) != FALSE;
+}
+
+static bool SaveConfigBoolValueInSection(const char* section, const char* key, bool value) {
+    return SaveConfigRegisterValueInSection(section, key, value ? 1 : 0);
+}
+
+static bool SaveConfigFloatValueInSection(const char* section, const char* key, float value) {
+    if (g_iniPath[0] == '\0') return false;
+    char valueBuf[64] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%.7g", value);
+    return WritePrivateProfileStringA(section, key, valueBuf, g_iniPath) != FALSE;
 }
 
 static bool SaveConfigBoolValue(const char* key, bool value) {
@@ -756,16 +1753,10 @@ static bool SaveConfigBoolValue(const char* key, bool value) {
 }
 
 static bool SaveConfigFloatValue(const char* key, float value) {
-    char path[MAX_PATH] = {};
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
-    char* lastSlash = strrchr(path, '\\');
-    if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
-    }
-
+    if (g_iniPath[0] == '\0') return false;
     char valueBuf[64] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%.7g", value);
-    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, path) != FALSE;
+    return WritePrivateProfileStringA("CameraProxy", key, valueBuf, g_iniPath) != FALSE;
 }
 
 static bool ConsumeSingleKeyHotkey(HotkeyAction action, int virtualKey) {
@@ -782,12 +1773,18 @@ static void ResetMatrixRegisterOverridesToAuto() {
     g_config.worldMatrixRegister = -1;
     g_config.viewMatrixRegister = -1;
     g_config.projMatrixRegister = -1;
+    g_config.mvpMatrixRegister = -1;
+    g_config.mvMatrixRegister = -1;
+    g_config.vpMatrixRegister = -1;
     memset(g_manualBindings, 0, sizeof(g_manualBindings));
 
     bool savedWorld = SaveConfigRegisterValue("WorldMatrixRegister", -1);
     bool savedView = SaveConfigRegisterValue("ViewMatrixRegister", -1);
     bool savedProj = SaveConfigRegisterValue("ProjMatrixRegister", -1);
-    bool savedAll = savedWorld && savedView && savedProj;
+    bool savedMvp = SaveConfigRegisterValue("MVPMatrixRegister", -1);
+    bool savedMv = SaveConfigRegisterValue("MVMatrixRegister", -1);
+    bool savedVp = SaveConfigRegisterValue("VPMatrixRegister", -1);
+    bool savedAll = savedWorld && savedView && savedProj && savedMvp && savedMv && savedVp;
     if (g_config.autoDetectMatrices) {
         snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                  "Cleared matrix register overrides. Falling back to deterministic auto-detect (AutoDetectMatrices=1).%s",
@@ -801,7 +1798,11 @@ static void ResetMatrixRegisterOverridesToAuto() {
 }
 
 static void PinRegisterFromSource(MatrixSlot slot) {
-    const MatrixSourceInfo& source = g_matrixSources[slot];
+    MatrixSourceInfo source = {};
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        source = g_matrixSources[slot];
+    }
     if (!source.valid || source.baseRegister < 0) {
         snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
                  "Cannot pin %s: no register-backed source available.", MatrixSlotLabel(slot));
@@ -819,6 +1820,15 @@ static void PinRegisterFromSource(MatrixSlot slot) {
     } else if (slot == MatrixSlot_World) {
         key = "WorldMatrixRegister";
         target = &g_config.worldMatrixRegister;
+    } else if (slot == MatrixSlot_MVP) {
+        key = "MVPMatrixRegister";
+        target = &g_config.mvpMatrixRegister;
+    } else if (slot == MatrixSlot_WV) {
+        key = "MVMatrixRegister";
+        target = &g_config.mvMatrixRegister;
+    } else if (slot == MatrixSlot_VP) {
+        key = "VPMatrixRegister";
+        target = &g_config.vpMatrixRegister;
     }
 
     if (!key || !target) {
@@ -867,10 +1877,14 @@ static void TryAssignManualMatrixFromSelection(MatrixSlot slot,
         StoreProjectionMatrix(mat, shaderKey, baseRegister, rows, false, true);
     } else if (slot == MatrixSlot_MVP) {
         StoreMVPMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_VP) {
+        StoreVPMatrix(mat, shaderKey, baseRegister, rows, false, true);
+    } else if (slot == MatrixSlot_WV) {
+        StoreWVMatrix(mat, shaderKey, baseRegister, rows, false, true);
     }
 
     snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-             "Assigned %s from shader 0x%p registers c%d-c%d (%d rows).",
+             "Assigned %s from shader %p registers c%d-c%d (%d rows).",
              MatrixSlotLabel(slot), reinterpret_cast<void*>(shaderKey), baseRegister,
              baseRegister + rows - 1, rows);
 }
@@ -894,6 +1908,21 @@ static void DrawMatrixWithTranspose(const char* label, const D3DMATRIX& mat, boo
     DrawMatrix(label, transposed, available);
 }
 
+static void DrawCameraMatrixPanel(const char* childId,
+                                  const char* title,
+                                  MatrixSlot slot,
+                                  const D3DMATRIX& mat,
+                                  bool available,
+                                  bool transpose) {
+    if (ImGui::BeginChild(childId, ImVec2(0, 0), true)) {
+        ImGui::TextUnformatted(title);
+        ImGui::Separator();
+        DrawMatrixWithTranspose("Matrix", mat, available, transpose);
+        DrawMatrixSourceInfo(slot, available);
+    }
+    ImGui::EndChild();
+}
+
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing) {
     if (shaderKey == 0 && !createIfMissing) {
         return nullptr;
@@ -907,9 +1936,91 @@ static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMis
     }
     g_shaderOrder.push_back(shaderKey);
     auto inserted = g_shaderConstants.emplace(shaderKey, ShaderConstantState{});
+    for (int i = 0; i < kMaxConstantRegisters; ++i) inserted.first->second.overrideExpiresAtFrame[i] = -1;
     return &inserted.first->second;
 }
 
+
+static void OnVertexShaderReleased(uintptr_t shaderKey) {
+    if (shaderKey == 0) {
+        return;
+    }
+    g_shaderConstants.erase(shaderKey);
+    g_disabledShaders.erase(shaderKey);
+    g_shaderBytecodeHashes.erase(shaderKey);
+    auto it = std::find(g_shaderOrder.begin(), g_shaderOrder.end(), shaderKey);
+    if (it != g_shaderOrder.end()) {
+        g_shaderOrder.erase(it);
+    }
+    auto recIt = g_shaderRecords.find(shaderKey);
+    ShaderRecord* removedRecordPtr = nullptr;
+    if (recIt != g_shaderRecords.end()) {
+        removedRecordPtr = &recIt->second;
+        if (g_selectedShaderHash == static_cast<uint64_t>(recIt->second.hash)) {
+            g_selectedShaderHash = 0;
+        }
+        if (recIt->second.replacementShader) {
+            recIt->second.replacementShader->Release();
+            recIt->second.replacementShader = nullptr;
+        }
+        g_shaderHashToKey.erase(recIt->second.hash);
+        g_shaderRecords.erase(recIt);
+    }
+    auto listIt = std::find(g_stableShaderList.begin(), g_stableShaderList.end(), removedRecordPtr);
+    if (listIt != g_stableShaderList.end()) {
+        g_stableShaderList.erase(listIt);
+    }
+}
+
+static void RegisterShaderBytecode(uintptr_t shaderKey, ShaderStageType stage, const std::vector<uint32_t>& tokens) {
+    if (shaderKey == 0 || tokens.empty()) return;
+    if (g_shaderRecords.empty()) {
+        g_shaderRecords.reserve(1024);
+        g_shaderHashToKey.reserve(1024);
+        g_shaderBytecodeHashes.reserve(1024);
+        g_stableShaderList.reserve(1024);
+    }
+    auto existing = g_shaderRecords.find(shaderKey);
+    if (existing != g_shaderRecords.end()) {
+        return;
+    }
+    ShaderRecord rec = {};
+    rec.shaderKey = shaderKey;
+    rec.stage = stage;
+    rec.originalBytecode = tokens;
+    rec.hash = HashBytesFNV1a(reinterpret_cast<const uint8_t*>(tokens.data()), tokens.size() * sizeof(uint32_t));
+    uint32_t version = tokens[0];
+    char profile[32] = {};
+    const UINT major = (version >> 8) & 0xFF;
+    const UINT minor = version & 0xFF;
+    snprintf(profile, sizeof(profile), "%s_%u_%u", stage == ShaderStage_Vertex ? "vs" : "ps", major, minor);
+    rec.shaderModel = profile;
+    rec.cachedDisassembly = BuildD3DDisassembly(tokens);
+    {
+        std::istringstream disIn(rec.cachedDisassembly);
+        std::string disLine;
+        while (std::getline(disIn, disLine)) {
+            std::string trimmed = TrimCopy(disLine);
+            if (trimmed.empty() || trimmed[0] == '/' || trimmed[0] == ';') {
+                continue;
+            }
+            if (trimmed.rfind("vs_", 0) == 0 || trimmed.rfind("ps_", 0) == 0) {
+                rec.shaderModel = trimmed;
+            }
+            break;
+        }
+    }
+    rec.ir = BuildIrFromDisassembly(rec.cachedDisassembly);
+    rec.editableAssembly = rec.cachedDisassembly;
+    ClassifyShaderRecord(&rec);
+    g_shaderBytecodeHashes[shaderKey] = rec.hash;
+    g_shaderHashToKey[rec.hash] = shaderKey;
+    auto inserted = g_shaderRecords.emplace(shaderKey, std::move(rec));
+    g_stableShaderList.push_back(&inserted.first->second);
+    if (g_selectedShaderHash == 0) {
+        g_selectedShaderHash = static_cast<uint64_t>(inserted.first->second.hash);
+    }
+}
 
 static uint32_t ComputeShaderBytecodeHash(IDirect3DVertexShader9* shader) {
     if (!shader) {
@@ -967,6 +2078,7 @@ static D3DMATRIX InvertSimpleRigidView(const D3DMATRIX& view) {
 
 static const char* GameProfileLabel(GameProfileKind profile) {
     switch (profile) {
+        case GameProfile_Barnyard: return "Barnyard";
         case GameProfile_DevilMayCry4: return "DevilMayCry4";
         case GameProfile_MetalGearRising: return "MetalGearRising";
         case GameProfile_None:
@@ -989,6 +2101,10 @@ static GameProfileKind ParseGameProfile(const char* profileName) {
         _stricmp(profileName, "DevilMayCry4Original") == 0) {
         return GameProfile_DevilMayCry4;
     }
+    if (_stricmp(profileName, "Barnyard") == 0 ||
+        _stricmp(profileName, "Barnyard2006") == 0) {
+        return GameProfile_Barnyard;
+    }
     return GameProfile_None;
 }
 
@@ -1009,7 +2125,7 @@ static void ConfigureActiveProfileLayout() {
     }
 }
 
-static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant = nullptr) {
+static bool InvertMatrix4x4Deterministic(const D3DMATRIX& in, D3DMATRIX* out, float* outDeterminant) {
     if (!out) {
         return false;
     }
@@ -1150,7 +2266,7 @@ static void ClearAllShaderOverrides() {
         ShaderConstantState& state = entry.second;
         memset(state.overrideConstants, 0, sizeof(state.overrideConstants));
         memset(state.overrideValid, 0, sizeof(state.overrideValid));
-        memset(state.overrideFramesRemaining, 0, sizeof(state.overrideFramesRemaining));
+        for (int i = 0; i < kMaxConstantRegisters; ++i) state.overrideExpiresAtFrame[i] = -1;
     }
 }
 
@@ -1164,7 +2280,7 @@ static void ClearShaderRegisterOverride(uintptr_t shaderKey, int reg) {
     }
     memset(state->overrideConstants[reg], 0, sizeof(state->overrideConstants[reg]));
     state->overrideValid[reg] = false;
-    state->overrideFramesRemaining[reg] = 0;
+    state->overrideExpiresAtFrame[reg] = -1;
 }
 
 static bool BuildOverriddenConstants(ShaderConstantState& state,
@@ -1203,34 +2319,34 @@ static bool BuildOverriddenConstants(ShaderConstantState& state,
 
         memcpy(&scratch[i * 4], state.overrideConstants[reg], sizeof(state.overrideConstants[reg]));
 
-        if (state.overrideFramesRemaining[reg] > 0) {
-            state.overrideFramesRemaining[reg]--;
-            if (state.overrideFramesRemaining[reg] == 0) {
-                state.overrideValid[reg] = false;
-            }
+        if (state.overrideExpiresAtFrame[reg] >= 0 &&
+            g_frameCount >= state.overrideExpiresAtFrame[reg]) {
+            state.overrideValid[reg] = false;
+            state.overrideExpiresAtFrame[reg] = -1;
+            continue;
         }
     }
     return true;
 }
 
 static void UpdateVariance(ShaderConstantState& state, int reg, const float* values) {
-    state.sampleCount++;
+    state.sampleCounts[reg]++;
     for (int i = 0; i < 4; i++) {
         double value = static_cast<double>(values[i]);
         double delta = value - state.mean[reg][i];
-        state.mean[reg][i] += delta / static_cast<double>(state.sampleCount);
+        state.mean[reg][i] += delta / static_cast<double>(state.sampleCounts[reg]);
         double delta2 = value - state.mean[reg][i];
         state.m2[reg][i] += delta * delta2;
     }
 }
 
 static float GetVarianceMagnitude(const ShaderConstantState& state, int reg) {
-    if (state.sampleCount < 2) {
+    if (state.sampleCounts[reg] < 2) {
         return 0.0f;
     }
     double sum = 0.0;
     for (int i = 0; i < 4; i++) {
-        sum += state.m2[reg][i] / static_cast<double>(state.sampleCount - 1);
+        sum += state.m2[reg][i] / static_cast<double>(state.sampleCounts[reg] - 1);
     }
     return static_cast<float>(sum / 4.0);
 }
@@ -1341,6 +2457,49 @@ static bool TryBuildMatrixSnapshotInfo(const ShaderConstantState& state, int bas
     if (looksLike) {
         *looksLike = LooksLikeMatrix(reinterpret_cast<const float*>(outMatrix));
     }
+    return true;
+}
+
+static bool TryBuildMatrixFromGlobalRegisters(int baseRegister,
+                                              int rows,
+                                              bool transposed,
+                                              D3DMATRIX* outMatrix) {
+    if (!outMatrix || baseRegister < 0 || rows < 3 || rows > 4 ||
+        baseRegister + rows - 1 >= kMaxConstantRegisters) {
+        return false;
+    }
+
+    float m[16] = {};
+    for (int i = 0; i < rows; i++) {
+        const GlobalVertexRegisterState& globalState = g_allVertexRegisters[baseRegister + i];
+        if (!globalState.valid) {
+            return false;
+        }
+        memcpy(&m[i * 4], globalState.value, sizeof(globalState.value));
+    }
+
+    D3DMATRIX out = {};
+    if (!transposed) {
+        out._11 = m[0]; out._12 = m[1]; out._13 = m[2]; out._14 = m[3];
+        out._21 = m[4]; out._22 = m[5]; out._23 = m[6]; out._24 = m[7];
+        out._31 = m[8]; out._32 = m[9]; out._33 = m[10]; out._34 = m[11];
+        if (rows == 4) {
+            out._41 = m[12]; out._42 = m[13]; out._43 = m[14]; out._44 = m[15];
+        } else {
+            out._41 = 0.0f; out._42 = 0.0f; out._43 = 0.0f; out._44 = 1.0f;
+        }
+    } else {
+        out._11 = m[0]; out._21 = m[1]; out._31 = m[2]; out._41 = m[3];
+        out._12 = m[4]; out._22 = m[5]; out._32 = m[6]; out._42 = m[7];
+        out._13 = m[8]; out._23 = m[9]; out._33 = m[10]; out._43 = m[11];
+        if (rows == 4) {
+            out._14 = m[12]; out._24 = m[13]; out._34 = m[14]; out._44 = m[15];
+        } else {
+            out._14 = 0.0f; out._24 = 0.0f; out._34 = 0.0f; out._44 = 1.0f;
+        }
+    }
+
+    *outMatrix = out;
     return true;
 }
 
@@ -1468,6 +2627,8 @@ static void UpdateConstantSnapshot() {
 }
 
 static void UpdateHotkeys() {
+    EnsureWndProcHookInstalled();
+
     if (ConsumeSingleKeyHotkey(HotkeyAction_ToggleMenu, g_config.hotkeyToggleMenuVk)) {
         g_showImGui = !g_showImGui;
     }
@@ -1490,6 +2651,14 @@ static void UpdateHotkeys() {
     if (ConsumeSingleKeyHotkey(HotkeyAction_ResetMatrixOverrides, g_config.hotkeyResetMatrixOverridesVk)) {
         ResetMatrixRegisterOverridesToAuto();
     }
+
+    if (g_showImGui && !g_prevShowImGui) {
+        // Menu just became visible — release any game mouse capture.
+        ReleaseCapture();
+        g_selectCameraTabOnMenuOpen = true;
+    }
+    g_prevShowImGui = g_showImGui;
+    UpdateInputBlockHooks();
 }
 
 static void UpdateFrameTimeStats() {
@@ -1505,6 +2674,7 @@ static void UpdateFrameTimeStats() {
     double delta = static_cast<double>(now.QuadPart - g_prevCounter.QuadPart) /
                    static_cast<double>(g_perfFrequency.QuadPart);
     g_prevCounter = now;
+	g_lastDeltaSec = static_cast<float>(delta);
 
     float ms = static_cast<float>(delta * 1000.0);
     g_frameTimeHistory[g_frameTimeIndex] = ms;
@@ -1524,14 +2694,50 @@ static void UpdateFrameTimeStats() {
     g_frameTimeSamples++;
 }
 
-static void RenderImGuiOverlay() {
+static void RenderImGuiOverlay(IDirect3DDevice9* device) {
+    EnsureWndProcHookInstalled();
+
     if (!g_imguiInitialized || !g_showImGui) {
+        g_constantUploadRecordingEnabled = false;
         return;
+    }
+
+    ClipCursor(NULL);
+
+    CameraMatrices camSnapshot = {};
+    {
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        camSnapshot = g_cameraMatrices;
     }
 
     ApplyImGuiScale(g_imguiHwnd);
     ImGui_ImplDX9_NewFrame();
     ImGui_ImplWin32_NewFrame();
+    UpdateImGuiKeyboardFromAsyncState();
+    if (g_showImGui) {
+        POINT cursorScreen = {};
+        if (GetCursorPos(&cursorScreen) && ScreenToClient(g_imguiHwnd, &cursorScreen)) {
+            ImGui::GetIO().MousePos = ImVec2(
+                static_cast<float>(cursorScreen.x),
+                static_cast<float>(cursorScreen.y));
+        }
+        ImGuiIO& io = ImGui::GetIO();
+        io.MouseDown[0] = (GetAsyncKeyState(VK_LBUTTON) & 0x8000) != 0;
+        io.MouseDown[1] = (GetAsyncKeyState(VK_RBUTTON) & 0x8000) != 0;
+
+        io.KeyCtrl = (GetAsyncKeyState(VK_CONTROL) & 0x8000) != 0;
+        io.KeyShift = (GetAsyncKeyState(VK_SHIFT) & 0x8000) != 0;
+        io.KeyAlt = (GetAsyncKeyState(VK_MENU) & 0x8000) != 0;
+
+        static const int kNavKeys[] = {
+            VK_TAB, VK_LEFT, VK_RIGHT, VK_UP, VK_DOWN,
+            VK_PRIOR, VK_NEXT, VK_HOME, VK_END, VK_INSERT, VK_DELETE,
+            VK_BACK, VK_RETURN, VK_ESCAPE, VK_SPACE
+        };
+        for (int vk : kNavKeys) {
+            io.KeysDown[vk] = (GetAsyncKeyState(vk) & 0x8000) != 0;
+        }
+    }
     ImGui::GetIO().MouseDrawCursor = true;
     ImGui::NewFrame();
 
@@ -1540,18 +2746,24 @@ static void RenderImGuiOverlay() {
     ImGui::Begin("Camera Proxy for RTX Remix", nullptr,
                  ImGuiWindowFlags_NoCollapse |
                  ImGuiWindowFlags_NoSavedSettings);
+    ImGui::Text("%s", kCameraProxyVersion);
+    ImGui::Text("Game exe: %s", g_gameExeName[0] ? g_gameExeName : "<unknown>");
+    ImGui::Text("Game name: %s", g_gameDisplayName[0] ? g_gameDisplayName : "<unknown>");
     ImGui::Text("Hotkeys: Toggle menu(F10) Pause(F9) Emit matrices(F8) Reset matrix overrides(F7)");
     if (ImGui::Button(g_pauseRendering ? "Resume game rendering" : "Pause game rendering")) {
         g_pauseRendering = !g_pauseRendering;
     }
     ImGui::SameLine();
     ImGui::Text("Status: %s", g_pauseRendering ? "Paused" : "Running");
-    ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them "
-                       "to the RTX Remix runtime through SetTransform() so Remix gets camera data in D3D9 titles.");
-
     if (ImGui::SliderFloat("UI scale", &g_imguiScaleRuntime, 0.5f, 3.0f, "%.2fx")) {
         ApplyImGuiScale(g_imguiHwnd);
         g_config.imguiScale = g_imguiScaleRuntime;
+    }
+
+    if (ImGui::Checkbox("Disable game input while menu is open", &g_imguiDisableGameInputWhileMenuOpen)) {
+        g_config.disableGameInputWhileMenuOpen = g_imguiDisableGameInputWhileMenuOpen;
+        SaveConfigBoolValue("DisableGameInputWhileMenuOpen", g_config.disableGameInputWhileMenuOpen);
+        UpdateInputBlockHooks();
     }
 
     if (ImGui::Button("Pass camera matrices to RTX Remix (SetTransform)")) {
@@ -1590,19 +2802,155 @@ static void RenderImGuiOverlay() {
     }
 
     ImGui::Separator();
-    ImGui::Text("Credits: ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
-    ImGui::SameLine();
-    ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
-    ImGui::Text("modified by ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
-
-    ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
-        if (ImGui::BeginTabItem("Camera")) {
+        PushOverlayBoldFont();
+        bool aboutTabOpen = ImGui::BeginTabItem("About");
+        PopOverlayBoldFont();
+        if (aboutTabOpen) {
+            auto DrawCenteredLine = [](const char* text, const ImVec4& color) {
+                ImVec2 textSize = ImGui::CalcTextSize(text);
+                float offset = (ImGui::GetContentRegionAvail().x - textSize.x) * 0.5f;
+                if (offset > 0.0f) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+                }
+                ImGui::TextColored(color, "%s", text);
+            };
+            auto DrawSectionLabel = [](const char* text) {
+                float width = ImGui::GetContentRegionAvail().x;
+                if (width < 220.0f) {
+                    width = 220.0f;
+                }
+                ImVec2 textSize = ImGui::CalcTextSize(text);
+                float offset = (ImGui::GetContentRegionAvail().x - width) * 0.5f;
+                if (offset > 0.0f) {
+                    ImGui::SetCursorPosX(ImGui::GetCursorPosX() + offset);
+                }
+                ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
+                ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 7.0f));
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.22f, 0.28f, 1.0f));
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.96f, 0.98f, 1.0f));
+                ImGui::BeginDisabled();
+                ImGui::Button(text, ImVec2(width, textSize.y + 14.0f));
+                ImGui::EndDisabled();
+                ImGui::PopStyleColor(2);
+                ImGui::PopStyleVar(2);
+            };
+
+            ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them to RTX Remix through SetTransform(). The guidance below explains where each matrix typically appears, how to validate it, and how to avoid false positives.");
+            ImGui::Separator();
+
+            PushOverlayBoldFont();
+            ImGui::Text("Credits");
+            PopOverlayBoldFont();
+            ImGui::Text("Original project:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
+            ImGui::SameLine();
+            ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
+            ImGui::Text("Modified by ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
+
+            ImGui::Separator();
+            PushOverlayBoldFont();
+            ImGui::Text("Detailed tab guide for matrix hunting and verification");
+            PopOverlayBoldFont();
+            ImGui::BeginChild("AboutGuide", ImVec2(0, 430), true);
+
+            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Important: start from Camera, validate in Constants, then confirm source shaders before pinning overrides.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("1) Camera tab (default workflow anchor)");
+            ImGui::TextWrapped("Use Camera as your live truth panel. Verify SetTransform seen flags, monitor current World/View/Projection captures, and compare stability during movement, cutscenes, pause states, and FOV changes. Pin registers only after repeated scene transitions confirm stable behavior. If Remix drifts while matrices look plausible, compare update cadence (which matrix changes per frame) and reset overrides that desynchronize.");
+            ImGui::Spacing();
+
+            PushOverlayBoldFont();
+            ImGui::Text("Matrix taxonomy and literature-style examples");
+            PopOverlayBoldFont();
+            ImGui::TextWrapped("Reference conventions vary (row-major vs column-major, left-handed vs right-handed). Focus on recognizable patterns and behavior rather than exact sign placement.");
+            ImGui::Spacing();
+
+            ImGui::BeginChild("MatrixExamples", ImVec2(0, 290), true);
+            DrawCenteredLine("World matrix (object/local to world transform, common structure)", ImVec4(1.0f, 0.88f, 0.72f, 1.0f));
+            DrawCenteredLine("[ Xx   Xy   Xz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Yx   Yy   Yz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Zx   Zy   Zz   0 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            DrawCenteredLine("[ Tx   Ty   Tz   1 ]", ImVec4(1.0f, 0.95f, 0.88f, 1.0f));
+            ImGui::Spacing();
+
+            DrawCenteredLine("View matrix (rigid camera transform, literature pattern)", ImVec4(0.74f, 0.88f, 1.0f, 1.0f));
+            DrawCenteredLine("[  Rx   Ry   Rz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            DrawCenteredLine("[  Ux   Uy   Uz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            DrawCenteredLine("[ -Fx  -Fy  -Fz   0 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            DrawCenteredLine("[  Tx   Ty   Tz   1 ]", ImVec4(0.90f, 0.95f, 1.0f, 1.0f));
+            ImGui::Spacing();
+
+            DrawCenteredLine("Projection matrix (D3D-style perspective, common structure)", ImVec4(0.74f, 1.0f, 0.78f, 1.0f));
+            DrawCenteredLine("[ sx   0    0    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            DrawCenteredLine("[ 0    sy   0    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            DrawCenteredLine("[ 0    0    A    1 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            DrawCenteredLine("[ 0    0    B    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
+            ImGui::Spacing();
+
+            DrawCenteredLine("Red flags for incorrect matrix candidates", ImVec4(1.0f, 0.78f, 0.78f, 1.0f));
+            DrawCenteredLine("- random high-magnitude jumps every frame", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
+            DrawCenteredLine("- no coherent response to camera rotation/translation", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
+            DrawCenteredLine("- perspective terms missing or unstable under FOV changes", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
+            ImGui::EndChild();
+            ImGui::Spacing();
+
+            DrawSectionLabel("2) Shaders tab (source attribution and assembly forensics)");
+            ImGui::TextWrapped("Use Shaders to identify exactly which vertex shader owns suspicious constants. Sort/filter by usage count and stable hash, then inspect disassembly comments to spot constant register ranges (for example, comments near dp4/mad instructions that reference c0-c3, c4-c7, c8-c11). These assembly comments often reveal matrix intent directly, making it faster to map constants to World, View, Projection, or combined MVP blocks before applying any override.");
+            ImGui::TextWrapped("When comments expose transform semantics, cross-check the same registers in Constants and verify temporal coherence over multiple camera motions. This prevents selecting short-lived registers used for effects instead of camera transforms.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("3) Constants tab (precision register validation)");
+            ImGui::TextWrapped("Constants is the high-precision inspector. Pick an active shader, watch live c-register values, and inspect 4-register groups as candidate 4x4 matrices. Validate candidates by structure first, then by motion response: view matrices should rotate/translate coherently with camera movement, while projection rows should reflect perspective scaling and depth mapping.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("4) Remix API tab (runtime integration sanity checks)");
+            ImGui::TextWrapped("Use this tab after matrices are stable. Confirm API readiness, inspect shader/custom light state, and separate camera extraction issues from runtime-side lighting/integration behavior.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("5) Memory Scanner tab (fallback hypothesis generation)");
+            ImGui::TextWrapped("When shader heuristics fail, scan memory for 4x4 candidates. Treat each hit as a hypothesis: assign temporarily, return to Camera, and reject any candidate that breaks under rapid movement, FOV change, area transitions, or pause/unpause.");
+            ImGui::Spacing();
+
+            DrawSectionLabel("6) Logs tab (frame-accurate correlation)");
+            ImGui::TextWrapped("Correlate assignment events, shader switches, and scan timings with what you observe in Camera/Constants. Logs are the fastest way to identify the exact frame window where a matrix starts diverging.");
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            ImGui::Spacing();
+            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Recommended workflow: Camera -> Shaders -> Constants -> (optional) Memory Scanner -> Camera re-check -> Remix API -> Logs.");
+
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
+        ImGuiTabItemFlags cameraTabFlags = g_selectCameraTabOnMenuOpen ? ImGuiTabItemFlags_SetSelected : 0;
+        bool cameraTabOpen = ImGui::BeginTabItem("Camera", nullptr, cameraTabFlags);
+        g_selectCameraTabOnMenuOpen = false;
+        PopOverlayBoldFont();
+        if (cameraTabOpen) {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
+            ImGui::Text("Game SetTransform seen: WORLD=%s VIEW=%s PROJECTION=%s",
+                        g_gameSetTransformSeen[0] ? "yes" : "no",
+                        g_gameSetTransformSeen[1] ? "yes" : "no",
+                        g_gameSetTransformSeen[2] ? "yes" : "no");
+            if (g_gameSetTransformAnySeen) {
+                if (ImGui::Checkbox("Bypass proxy WVP emit when game provides SetTransform", &g_config.setTransformBypassProxyWhenGameProvides)) {
+                    SaveConfigBoolValue("SetTransformBypassProxyWhenGameProvides",
+                                        g_config.setTransformBypassProxyWhenGameProvides);
+                }
+                if (ImGui::Checkbox("Round-trip game SetTransform via GetTransform for strict compatibility", &g_config.setTransformRoundTripCompatibilityMode)) {
+                    SaveConfigBoolValue("SetTransformRoundTripCompatibilityMode",
+                                        g_config.setTransformRoundTripCompatibilityMode);
+                }
+            } else {
+                ImGui::TextDisabled("SetTransform compatibility options unlock once game calls SetTransform(WORLD/VIEW/PROJECTION).");
+            }
             if (g_activeGameProfile == GameProfile_MetalGearRising) {
                 ImGui::Text("MGR layout: Proj=c4-c7, ViewProjection=c8-c11, World=c16-c19");
                 ImGui::Checkbox("Use auto projection when c4 is invalid", &g_imguiMgrrUseAutoProjection);
@@ -1614,7 +2962,7 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("Projection c4-c7 validity: %s", g_mgrProjectionRegisterValid ? "valid" : "invalid");
                 float activeViewDeterminant = 0.0f;
                 D3DMATRIX activeViewInverse = {};
-                InvertMatrix4x4Deterministic(g_cameraMatrices.view, &activeViewInverse, &activeViewDeterminant);
+                InvertMatrix4x4Deterministic(camSnapshot.view, &activeViewInverse, &activeViewDeterminant);
                 ImGui::Text("Determinant of active View matrix: %.6f", activeViewDeterminant);
                 ImGui::Text("Captured this frame: Proj=%s View=%s",
                             g_mgrProjCapturedThisFrame ? "yes" : "no",
@@ -1639,18 +2987,54 @@ static void RenderImGuiOverlay() {
                     ImGui::TextWrapped("%s", g_profileStatusMessage);
                 }
             }
+            else if (g_activeGameProfile == GameProfile_Barnyard) {
+                ImGui::Text("Barnyard profile: WORLD from VS constants; VIEW/PROJECTION via intercepted game SetTransform");
+                if (ImGui::Checkbox("Use intercepted game View/Projection SetTransform", &g_imguiBarnyardUseGameSetTransformsForViewProjection)) {
+                    g_config.barnyardUseGameSetTransformsForViewProjection = g_imguiBarnyardUseGameSetTransformsForViewProjection;
+                    SaveConfigBoolValue("BarnyardUseGameSetTransformsForViewProjection",
+                                        g_config.barnyardUseGameSetTransformsForViewProjection);
+                }
+                if (ImGui::Checkbox("Always use c0-c3 as World", &g_barnyardForceWorldFromC0)) {
+                    SaveConfigBoolValue("BarnyardForceWorldFromC0", g_barnyardForceWorldFromC0);
+                }
+                ImGui::Text("Seen: View=%s Projection=%s World=%s",
+                            g_profileCoreRegistersSeen[0] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[1] ? "yes" : "no",
+                            g_profileCoreRegistersSeen[2] ? "yes" : "no");
+                if (g_profileStatusMessage[0] != '\0') {
+                    ImGui::TextWrapped("%s", g_profileStatusMessage);
+                }
+            }
             ImGui::Separator();
-            DrawMatrixWithTranspose("World", g_cameraMatrices.world, g_cameraMatrices.hasWorld,
-                                    g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_World, g_cameraMatrices.hasWorld);
-            ImGui::Separator();
-            DrawMatrixWithTranspose("View", g_cameraMatrices.view, g_cameraMatrices.hasView,
-                                    g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_View, g_cameraMatrices.hasView);
-            ImGui::Separator();
-            DrawMatrixWithTranspose("Projection", g_cameraMatrices.projection,
-                                    g_cameraMatrices.hasProjection, g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_Projection, g_cameraMatrices.hasProjection);
+            const float matrixPanelHeight = ImGui::GetTextLineHeightWithSpacing() * 11.5f;
+            ImGui::Columns(3, "CameraPrimaryMatrices", false);
+            ImGui::BeginChild("WorldMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("WorldMatrixPanelInner",
+                                  "World",
+                                  MatrixSlot_World,
+                                  camSnapshot.world,
+                                  camSnapshot.hasWorld,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ViewMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("ViewMatrixPanelInner",
+                                  "View",
+                                  MatrixSlot_View,
+                                  camSnapshot.view,
+                                  camSnapshot.hasView,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ProjectionMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("ProjectionMatrixPanelInner",
+                                  "Projection",
+                                  MatrixSlot_Projection,
+                                  camSnapshot.projection,
+                                  camSnapshot.hasProjection,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::Columns(1);
             if (g_projectionDetectedByNumericStructure) {
                 ImGui::Text("Projection numeric detection: ACTIVE");
                 ImGui::Text("FOV: %.2f deg (%.3f rad)",
@@ -1671,13 +3055,13 @@ static void RenderImGuiOverlay() {
                 if (!g_config.experimentalCustomProjectionEnabled) {
                     ImGui::TextWrapped("Set ExperimentalCustomProjectionEnabled=1 in camera_proxy.ini to activate this section.");
                 } else {
-                    if (ImGui::RadioButton("Manual matrix", g_config.experimentalCustomProjectionMode == 1)) {
-                        g_config.experimentalCustomProjectionMode = 1;
+                    if (ImGui::RadioButton("Manual matrix", g_config.experimentalCustomProjectionMode == CustomProjectionMode_Manual)) {
+                        g_config.experimentalCustomProjectionMode = CustomProjectionMode_Manual;
                         SaveConfigRegisterValue("ExperimentalCustomProjectionMode", g_config.experimentalCustomProjectionMode);
                     }
                     ImGui::SameLine();
-                    if (ImGui::RadioButton("Auto-generate", g_config.experimentalCustomProjectionMode == 2)) {
-                        g_config.experimentalCustomProjectionMode = 2;
+                    if (ImGui::RadioButton("Auto-generate", g_config.experimentalCustomProjectionMode == CustomProjectionMode_Auto)) {
+                        g_config.experimentalCustomProjectionMode = CustomProjectionMode_Auto;
                         SaveConfigRegisterValue("ExperimentalCustomProjectionMode", g_config.experimentalCustomProjectionMode);
                     }
 
@@ -1690,7 +3074,7 @@ static void RenderImGuiOverlay() {
                                             g_config.experimentalCustomProjectionOverrideCombinedMVP);
                     }
 
-                    if (g_config.experimentalCustomProjectionMode == 1) {
+                    if (g_config.experimentalCustomProjectionMode == CustomProjectionMode_Manual) {
                         float rows[4][4] = {
                             { g_config.experimentalCustomProjectionManualMatrix._11, g_config.experimentalCustomProjectionManualMatrix._12, g_config.experimentalCustomProjectionManualMatrix._13, g_config.experimentalCustomProjectionManualMatrix._14 },
                             { g_config.experimentalCustomProjectionManualMatrix._21, g_config.experimentalCustomProjectionManualMatrix._22, g_config.experimentalCustomProjectionManualMatrix._23, g_config.experimentalCustomProjectionManualMatrix._24 },
@@ -1748,37 +3132,34 @@ static void RenderImGuiOverlay() {
             }
 
             ImGui::Separator();
-            DrawMatrixWithTranspose("MVP", g_cameraMatrices.mvp, g_cameraMatrices.hasMVP,
+            DrawMatrixWithTranspose("MVP", camSnapshot.mvp, camSnapshot.hasMVP,
                                     g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_MVP, g_cameraMatrices.hasMVP);
+            DrawMatrixSourceInfo(MatrixSlot_MVP, camSnapshot.hasMVP);
+            DrawMatrixWithTranspose("VP", camSnapshot.vp, camSnapshot.hasVP,
+                                    g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_VP, camSnapshot.hasVP);
+            DrawMatrixWithTranspose("MV", camSnapshot.wv, camSnapshot.hasWV,
+                                    g_showTransposedMatrices);
+            DrawMatrixSourceInfo(MatrixSlot_WV, camSnapshot.hasWV);
 
-            if (ImGui::CollapsingHeader("Combined MVP handling", ImGuiTreeNodeFlags_DefaultOpen)) {
-                if (ImGui::Checkbox("Enable Combined MVP", &g_config.enableCombinedMVP)) {
-                    SaveConfigBoolValue("EnableCombinedMVP", g_config.enableCombinedMVP);
+            if (ImGui::CollapsingHeader("Combined matrix decomposition", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (ImGui::Checkbox("Enable deterministic decomposition", &g_config.enableCombinedDecomposition)) {
+                    SaveConfigBoolValue("EnableCombinedDecomposition", g_config.enableCombinedDecomposition);
                 }
-                if (ImGui::Checkbox("Require World", &g_config.combinedMVPRequireWorld)) {
-                    SaveConfigBoolValue("CombinedMVPRequireWorld", g_config.combinedMVPRequireWorld);
+                if (ImGui::Checkbox("Log decomposition", &g_config.combinedDecompositionLog)) {
+                    SaveConfigBoolValue("CombinedDecompositionLog", g_config.combinedDecompositionLog);
                 }
-                if (ImGui::Checkbox("Assume Identity World", &g_config.combinedMVPAssumeIdentityWorld)) {
-                    SaveConfigBoolValue("CombinedMVPAssumeIdentityWorld", g_config.combinedMVPAssumeIdentityWorld);
+                if (ImGui::Checkbox("Allow generated/manual projection for VP decomposition", &g_config.allowGeneratedProjectionForVPDecomposition)) {
+                    SaveConfigBoolValue("AllowGeneratedProjectionForVPDecomposition", g_config.allowGeneratedProjectionForVPDecomposition);
                 }
-                if (ImGui::Checkbox("Force Decomposition", &g_config.combinedMVPForceDecomposition)) {
-                    SaveConfigBoolValue("CombinedMVPForceDecomposition", g_config.combinedMVPForceDecomposition);
-                }
-                if (ImGui::Checkbox("Log Decomposition", &g_config.combinedMVPLogDecomposition)) {
-                    SaveConfigBoolValue("CombinedMVPLogDecomposition", g_config.combinedMVPLogDecomposition);
-                }
-
-                ImGui::Separator();
-                ImGui::Text("Current MVP register: %s", g_combinedMvpDebug.registerBase >= 0 ? "captured" : "n/a");
-                if (g_combinedMvpDebug.registerBase >= 0) {
-                    ImGui::SameLine();
-                    ImGui::Text("(c%d)", g_combinedMvpDebug.registerBase);
-                }
-                ImGui::Text("Strategy selected: %s", CombinedMVPStrategyLabel(g_combinedMvpDebug.strategy));
-                ImGui::Text("Decomposition succeeded: %s", g_combinedMvpDebug.succeeded ? "yes" : "no");
-                ImGui::Text("Extracted FOV: %.2f deg", g_combinedMvpDebug.fovRadians * 180.0f / 3.14159265f);
-                ImGui::Text("Handedness: %s", ProjectionHandednessLabel(g_combinedMvpDebug.handedness));
+                ImGui::TextWrapped("Formulas: inv(View)*MV=World, inv(World)*MV=View, inv(Projection)*VP=View, inv(View)*VP=Projection, inv(VP)*MVP=World, inv(MV)*MVP=Projection.");
+                ImGui::Text("Decomposition attempted: %s", g_combinedDecompDebug.attempted ? "yes" : "no");
+                ImGui::Text("Solved World: %s", g_combinedDecompDebug.solvedWorld ? "yes" : "no");
+                if (g_combinedDecompDebug.worldFormula[0] != '\0') ImGui::TextWrapped("  %s", g_combinedDecompDebug.worldFormula);
+                ImGui::Text("Solved View: %s", g_combinedDecompDebug.solvedView ? "yes" : "no");
+                if (g_combinedDecompDebug.viewFormula[0] != '\0') ImGui::TextWrapped("  %s", g_combinedDecompDebug.viewFormula);
+                ImGui::Text("Solved Projection: %s", g_combinedDecompDebug.solvedProjection ? "yes" : "no");
+                if (g_combinedDecompDebug.projectionFormula[0] != '\0') ImGui::TextWrapped("  %s", g_combinedDecompDebug.projectionFormula);
             }
 
             ImGui::Separator();
@@ -1795,20 +3176,361 @@ static void RenderImGuiOverlay() {
             if (ImGui::Button("Pin Projection register")) {
                 PinRegisterFromSource(MatrixSlot_Projection);
             }
+            if (ImGui::Button("Pin MVP register")) {
+                PinRegisterFromSource(MatrixSlot_MVP);
+            }
             ImGui::SameLine();
+            if (ImGui::Button("Pin MV register")) {
+                PinRegisterFromSource(MatrixSlot_WV);
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Pin VP register")) {
+                PinRegisterFromSource(MatrixSlot_VP);
+            }
             if (ImGui::Button("Reset register overrides to auto")) {
                 ResetMatrixRegisterOverridesToAuto();
             }
-            ImGui::Text("Pinned registers: World=c%d View=c%d Projection=c%d",
+            ImGui::Text("Pinned registers: World=c%d View=c%d Projection=c%d MVP=c%d MV=c%d VP=c%d",
                         g_config.worldMatrixRegister, g_config.viewMatrixRegister,
-                        g_config.projMatrixRegister);
+                        g_config.projMatrixRegister, g_config.mvpMatrixRegister,
+                        g_config.mvMatrixRegister, g_config.vpMatrixRegister);
             if (g_matrixAssignStatus[0] != '\0') {
                 ImGui::TextWrapped("%s", g_matrixAssignStatus);
             }
+
+            ImGui::Separator();
+            ImGui::Text("Currently bound custom projection");
+            D3DMATRIX customProjectionPreview = {};
+            bool customProjectionUsesAuto = false;
+            float customProjectionAspect = 0.0f;
+            UINT customProjectionWidth = 0;
+            UINT customProjectionHeight = 0;
+            bool customProjectionAvailable = BuildExperimentalCustomProjectionMatrix(device,
+                                                                                      g_imguiHwnd,
+                                                                                      &customProjectionPreview,
+                                                                                      &customProjectionUsesAuto,
+                                                                                      &customProjectionAspect,
+                                                                                      &customProjectionWidth,
+                                                                                      &customProjectionHeight);
+            if (customProjectionAvailable) {
+                ImGui::Text("Mode: %s", customProjectionUsesAuto ? "auto-generated" : "manual");
+                if (customProjectionUsesAuto) {
+                    ImGui::Text("Resolved aspect: %.6f", customProjectionAspect);
+                    if (customProjectionWidth > 0 && customProjectionHeight > 0) {
+                        ImGui::Text("Source viewport: %ux%u", customProjectionWidth, customProjectionHeight);
+                    }
+                }
+            } else if (!g_config.experimentalCustomProjectionEnabled) {
+                ImGui::TextDisabled("Unavailable (ExperimentalCustomProjectionEnabled=0)");
+            } else {
+                ImGui::TextDisabled("Unavailable (projection mode or inputs invalid)");
+            }
+            DrawMatrixWithTranspose("Custom projection matrix",
+                                    customProjectionPreview,
+                                    customProjectionAvailable,
+                                    g_showTransposedMatrices);
+
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Constants")) {
+        PushOverlayBoldFont();
+        bool shaderTabOpen = ImGui::BeginTabItem("Shaders");
+        PopOverlayBoldFont();
+        if (shaderTabOpen) {
+            static char shaderFilter[64] = "";
+            static const char* kShaderListOrderModes[] = {"Insertion order", "Hash (ascending)"};
+            static const char* kShaderSearchScopeModes[] = {
+                "List labels",
+                "All shader assemblies",
+                "Selected shader assembly"
+            };
+            ImGui::InputText("Filter", shaderFilter, sizeof(shaderFilter));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(220.0f);
+            ImGui::Combo("Search scope", &g_shaderSearchScopeMode, kShaderSearchScopeModes, IM_ARRAYSIZE(kShaderSearchScopeModes));
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(180.0f);
+            ImGui::Combo("Order", &g_shaderListOrderMode, kShaderListOrderModes, IM_ARRAYSIZE(kShaderListOrderModes));
+
+            std::vector<ShaderRecord*> shaderSnapshot = g_stableShaderList;
+            if (g_shaderListOrderMode == ShaderListOrder_HashAsc) {
+                std::sort(shaderSnapshot.begin(), shaderSnapshot.end(), [](const ShaderRecord* a, const ShaderRecord* b) {
+                    if (!a || !b) return a < b;
+                    if (a->hash != b->hash) return a->hash < b->hash;
+                    return a->shaderKey < b->shaderKey;
+                });
+            }
+
+            auto selectedByKeyIt = g_shaderRecords.find(g_selectedShaderKey);
+            if (selectedByKeyIt != g_shaderRecords.end()) {
+                g_selectedShaderHash = static_cast<uint64_t>(selectedByKeyIt->second.hash);
+            } else if (g_selectedShaderHash != 0) {
+                auto selectedIt = g_shaderHashToKey.find(static_cast<uint32_t>(g_selectedShaderHash));
+                if (selectedIt != g_shaderHashToKey.end()) g_selectedShaderKey = selectedIt->second;
+            }
+            if (g_selectedShaderHash == 0 && !shaderSnapshot.empty() && shaderSnapshot.front()) {
+                g_selectedShaderHash = static_cast<uint64_t>(shaderSnapshot.front()->hash);
+                g_selectedShaderKey = shaderSnapshot.front()->shaderKey;
+            }
+
+            ImGui::Columns(3, "ShaderCols", true);
+            ImGui::BeginChild("ShaderBrowserTools", ImVec2(0, 72), true);
+            ImGui::TextUnformatted("Shader dump tools");
+            ImGui::Spacing();
+            const float dumpButtonWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x);
+            const float halfDumpButtonWidth = dumpButtonWidth > 0.0f ? dumpButtonWidth * 0.5f : 0.0f;
+            if (ImGui::Button("Dump all assembly", ImVec2(halfDumpButtonWidth, 0))) {
+                std::filesystem::create_directories("Shader_dump");
+                for (ShaderRecord* recPtr : shaderSnapshot) {
+                    if (!recPtr) continue;
+                    char path[128];
+                    snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", recPtr->hash);
+                    std::ofstream(path) << recPtr->editableAssembly;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Dump all bytecode", ImVec2(halfDumpButtonWidth, 0))) {
+                std::filesystem::create_directories("Shader_dump");
+                for (ShaderRecord* recPtr : shaderSnapshot) {
+                    if (!recPtr) continue;
+                    char path[128];
+                    snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", recPtr->hash);
+                    std::ofstream f(path, std::ios::binary);
+                    const std::vector<uint32_t>& data = recPtr->replacementEnabled && !recPtr->modifiedBytecode.empty()
+                                                             ? recPtr->modifiedBytecode
+                                                             : recPtr->originalBytecode;
+                    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint32_t));
+                }
+            }
+            ImGui::EndChild();
+            ImGui::Spacing();
+            ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
+            for (ShaderRecord* recPtr : shaderSnapshot) {
+                if (!recPtr) continue;
+                ShaderRecord& rec = *recPtr;
+                const uintptr_t shaderKey = rec.shaderKey;
+                char visibleLabel[256];
+                snprintf(visibleLabel, sizeof(visibleLabel), "0x%08X %s %s inst:%d use:%llu%s", rec.hash,
+                         rec.stage == ShaderStage_Vertex ? "VS" : "PS", rec.shaderModel.c_str(),
+                         static_cast<int>(rec.ir.size()), rec.usageCount,
+                         (shaderKey == g_activeVertexShaderKey || shaderKey == g_activePixelShaderKey) ? " *" : "");
+                if (shaderFilter[0]) {
+                    bool matchesFilter = ContainsCaseInsensitive(visibleLabel, shaderFilter);
+                    if (g_shaderSearchScopeMode == ShaderSearchScope_AllAssemblies) {
+                        if (!matchesFilter) {
+                            matchesFilter = ContainsCaseInsensitive(rec.cachedDisassembly, shaderFilter) ||
+                                            ContainsCaseInsensitive(rec.editableAssembly, shaderFilter);
+                        }
+                    } else if (g_shaderSearchScopeMode == ShaderSearchScope_SelectedAssembly) {
+                        if (shaderKey != g_selectedShaderKey) {
+                            matchesFilter = false;
+                        } else if (!matchesFilter) {
+                            matchesFilter = ContainsCaseInsensitive(rec.cachedDisassembly, shaderFilter) ||
+                                            ContainsCaseInsensitive(rec.editableAssembly, shaderFilter);
+                        }
+                    }
+                    if (!matchesFilter) continue;
+                }
+                bool selected = (shaderKey == g_selectedShaderKey);
+                char selectableLabel[320];
+                snprintf(selectableLabel, sizeof(selectableLabel), "%s###shader_row_%p", visibleLabel,
+                         reinterpret_cast<void*>(shaderKey));
+                if (ImGui::Selectable(selectableLabel, selected)) {
+                    g_selectedShaderHash = static_cast<uint64_t>(rec.hash);
+                    g_selectedShaderKey = shaderKey;
+                    g_selectedRegister = -1;
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::NextColumn();
+            ImGui::BeginChild("ShaderInspect", ImVec2(0, 420), true);
+            auto it = g_shaderRecords.find(g_selectedShaderKey);
+            if (it != g_shaderRecords.end() && static_cast<uint64_t>(it->second.hash) == g_selectedShaderHash) {
+                ShaderRecord& rec = it->second;
+                ImGui::Text("Hash: 0x%08X", rec.hash);
+                ImGui::Text("Type: %s", rec.stage == ShaderStage_Vertex ? "VS" : "PS");
+                ImGui::Text("Model: %s", rec.shaderModel.c_str());
+
+                bool replacementEnabled = rec.replacementEnabled && rec.replacementShader != nullptr;
+                if (ImGui::Checkbox("Enable replacement", &replacementEnabled)) {
+                    rec.replacementEnabled = replacementEnabled && rec.replacementShader != nullptr;
+                    if (replacementEnabled && !rec.replacementShader) {
+                        rec.replacementStatus = "No replacement object yet. Use Replace shader first.";
+                    }
+                }
+
+                if (ImGui::Button("Dump assembly")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", rec.hash);
+                    std::ofstream(path) << rec.editableAssembly;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Dump bytecode")) {
+                    std::filesystem::create_directories("Shader_dump");
+                    char path[128]; snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", rec.hash);
+                    std::ofstream f(path, std::ios::binary);
+                    const std::vector<uint32_t>& data = rec.replacementEnabled && !rec.modifiedBytecode.empty()
+                                                         ? rec.modifiedBytecode : rec.originalBytecode;
+                    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint32_t));
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Assembly editor");
+                if (g_shaderEditorKey != rec.shaderKey) {
+                    g_shaderEditorKey = rec.shaderKey;
+                    memset(g_shaderEditorBuffer.data(), 0, g_shaderEditorBuffer.size());
+                    strncpy_s(g_shaderEditorBuffer.data(), g_shaderEditorBuffer.size(), rec.editableAssembly.c_str(), _TRUNCATE);
+                }
+                ImGuiInputTextFlags flags = ImGuiInputTextFlags_AllowTabInput;
+                if (ImGui::InputTextMultiline("##ShaderAssemblyEditor", g_shaderEditorBuffer.data(), g_shaderEditorBuffer.size(), ImVec2(-1, 180), flags)) {
+                    rec.editableAssembly = g_shaderEditorBuffer.data();
+                }
+                if (ImGui::Button("Replace shader")) {
+                    rec.editableAssembly = g_shaderEditorBuffer.data();
+                    std::string err;
+                    if (BuildShaderReplacementFromAssembly(device, &rec, &err)) {
+                        rec.replacementEnabled = true;
+                        rec.replacementStatus = "Replacement shader created and active for runtime binding.";
+                    } else {
+                        rec.replacementStatus = err.empty() ? "Failed to build replacement shader." : err;
+                    }
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Reset assembly")) {
+                    rec.editableAssembly = rec.cachedDisassembly;
+                    g_shaderEditorKey = 0;
+                    rec.modifiedBytecode.clear();
+                    rec.replacementEnabled = false;
+                    if (rec.replacementShader) {
+                        rec.replacementShader->Release();
+                        rec.replacementShader = nullptr;
+                    }
+                    rec.replacementStatus = "Assembly reset to original and replacement shader released.";
+                }
+                if (!rec.replacementStatus.empty()) {
+                    ImGui::TextWrapped("%s", rec.replacementStatus.c_str());
+                }
+            }
+            ImGui::EndChild();
+
+            ImGui::NextColumn();
+            ImGui::BeginChild("ShaderAnalysis", ImVec2(0, 420), true, ImGuiWindowFlags_AlwaysVerticalScrollbar);
+            auto ai = g_shaderRecords.find(g_selectedShaderKey);
+            if (ai != g_shaderRecords.end() && static_cast<uint64_t>(ai->second.hash) == g_selectedShaderHash) {
+                ShaderRecord& rec = ai->second;
+                int usedMin = -1;
+                int usedMax = -1;
+                for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
+                    if (!rec.constantUsage[reg]) continue;
+                    if (usedMin < 0) usedMin = reg;
+                    usedMax = reg;
+                }
+
+                const int effectiveTransformBase = g_manualTransformBaseOverride >= 0 ? g_manualTransformBaseOverride : rec.transformConstantBase;
+                const int effectiveLightingBase = g_manualLightingBaseOverride >= 0 ? g_manualLightingBaseOverride : rec.lightingConstantBase;
+                ImGui::Text("Transform: %s", rec.isFFPTransform ? "Yes" : "No");
+                ImGui::Text("Transform base: c%d", effectiveTransformBase);
+                ImGui::Text("Lighting: %s", rec.isFFPLighting ? "Yes" : "No");
+                ImGui::Text("Skinning: %s", rec.usesSkinning ? "Yes" : "No");
+                ImGui::Text("Flow control: %s", rec.usesFlowControl ? "Yes" : "No");
+                ImGui::Text("Remix safe: %s", rec.isRemixSafe ? "Yes" : "No");
+                ImGui::Text("Lighting base: c%d", effectiveLightingBase);
+
+                ImGui::Separator();
+                ImGui::Text("Vertex input");
+                ImGui::Text("POSITION: %s", g_activeVertexDeclInfo.hasPosition ? "Yes" : "No");
+                ImGui::Text("NORMAL: %s", g_activeVertexDeclInfo.hasNormal ? "Yes" : "No");
+                ImGui::Text("TEXCOORDS: %d", g_activeVertexDeclInfo.texcoordCount);
+                ImGui::Text("TANGENT: %s", g_activeVertexDeclInfo.hasTangent ? "Yes" : "No");
+                ImGui::Text("BINORMAL: %s", g_activeVertexDeclInfo.hasBinormal ? "Yes" : "No");
+
+                ImGui::Separator();
+                ImGui::Text("Used const range: %s", usedMin >= 0 ? "captured" : "none");
+                if (usedMin >= 0) {
+                    ImGui::SameLine();
+                    ImGui::Text("(c%d-c%d)", usedMin, usedMax);
+                }
+                if (ImGui::Button("Jump to transform register") && effectiveTransformBase >= 0) {
+                    g_selectedRegister = effectiveTransformBase;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Jump to lighting register") && effectiveLightingBase >= 0) {
+                    g_selectedRegister = effectiveLightingBase;
+                }
+                ImGui::Separator();
+                ImGui::Checkbox("Force FFP transform emission", &g_forceFfpTransform);
+                ImGui::InputInt("Manual transform base", &g_manualTransformBaseOverride);
+                ImGui::InputInt("Manual lighting base", &g_manualLightingBaseOverride);
+                if (rec.isFFPLighting) {
+                    ImGui::Separator();
+                    ImGui::Text("Lighting register overrides (-1 = use auto-detected)");
+                    ImGui::TextDisabled("Auto: dir=c%d  color=c%d  pos=c%d  atten=c%d  cone=c%d",
+                                        rec.lightDirectionRegister,
+                                        rec.lightColorRegister,
+                                        rec.positionRegister,
+                                        rec.attenuationRegister,
+                                        rec.coneAngleRegister);
+
+                    ImGui::InputInt("Direction register##ldir", &rec.lightDirectionRegisterOverride);
+                    ImGui::InputInt("Color register##lcol", &rec.lightColorRegisterOverride);
+                    ImGui::InputInt("Material color reg##lmat", &rec.materialColorRegisterOverride);
+                    ImGui::InputInt("Position register##lpos", &rec.positionRegisterOverride);
+                    ImGui::InputInt("Attenuation register##latten", &rec.attenuationRegisterOverride);
+                    ImGui::InputInt("Cone angle register##lcone", &rec.coneAngleRegisterOverride);
+                    ImGui::InputInt("Light count override##lcnt", &rec.lightCountOverride);
+                    ImGui::TextDisabled("Light count: -1 = default (1)");
+
+                    ImGui::Text("Light space override:");
+                    const char* spaceLabels[] = { "Auto (use detected)", "World", "View", "Object" };
+                    int spaceIdx = static_cast<int>(rec.lightSpaceOverride) + 1;
+                    if (ImGui::Combo("##lspace", &spaceIdx, spaceLabels, 4)) {
+                        rec.lightSpaceOverride = static_cast<LightingSpace>(spaceIdx - 1);
+                    }
+
+                    if (rec.lightDirectionRegister >= 0) {
+                        int dr = (rec.lightDirectionRegisterOverride >= 0)
+                                     ? rec.lightDirectionRegisterOverride
+                                     : rec.lightDirectionRegister;
+                        int cr = (rec.lightColorRegisterOverride >= 0)
+                                     ? rec.lightColorRegisterOverride
+                                     : rec.lightColorRegister;
+                        ImGui::TextDisabled("Live dir  c%d: [%.3f %.3f %.3f]", dr,
+                                            g_vsConstants[dr][0], g_vsConstants[dr][1], g_vsConstants[dr][2]);
+                        ImGui::TextDisabled("Live color c%d: [%.3f %.3f %.3f]", cr,
+                                            g_vsConstants[cr][0], g_vsConstants[cr][1], g_vsConstants[cr][2]);
+                    }
+                }
+
+                ImGui::Separator();
+                ImGui::Text("Constant monitor (selected shader)");
+                ImGui::BeginChild("ShaderConstRange", ImVec2(-1, 145), true);
+                for (int reg = usedMin; reg >= 0 && reg <= usedMax; ++reg) {
+                    if (!rec.constantUsage[reg]) continue;
+                    bool isTransformReg = effectiveTransformBase >= 0 && reg >= effectiveTransformBase && reg < (effectiveTransformBase + 4);
+                    bool isLightingReg = (reg == effectiveLightingBase && effectiveLightingBase >= 0);
+                    if (isTransformReg) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.40f, 0.40f, 1.00f));
+                    } else if (isLightingReg) {
+                        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.98f, 0.72f, 0.42f, 1.00f));
+                    }
+                    if (ImGui::Selectable((std::string("c") + std::to_string(reg)).c_str(), g_selectedRegister == reg)) {
+                        g_selectedRegister = reg;
+                    }
+                    if (isTransformReg || isLightingReg) ImGui::PopStyleColor();
+                }
+                ImGui::EndChild();
+            }
+            ImGui::EndChild();
+            ImGui::Columns(1);
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
+        bool constantsTabOpen = ImGui::BeginTabItem("Constants");
+        PopOverlayBoldFont();
+        if (constantsTabOpen) {
+            g_constantUploadRecordingEnabled = true;
             ImGui::Text("Per-shader snapshots update every frame.");
             if (g_selectedShaderKey == 0) {
                 if (g_activeShaderKey != 0) {
@@ -1856,6 +3578,8 @@ static void RenderImGuiOverlay() {
                 ImGui::Text("<no shader constants captured yet>");
             }
 
+            ImGui::Checkbox("View all VS constant registers (all shaders)", &g_showAllConstantRegisters);
+
             ImGui::Checkbox("Group by 4-register matrices", &g_showConstantsAsMatrices);
             ImGui::SameLine();
             ImGui::Checkbox("Only show detected matrices", &g_filterDetectedMatrices);
@@ -1897,11 +3621,11 @@ static void RenderImGuiOverlay() {
                                sizeof(editState->overrideConstants[g_selectedRegister]));
                         editState->overrideValid[g_selectedRegister] = true;
                         if (g_overrideScopeMode == Override_OneFrame) {
-                            editState->overrideFramesRemaining[g_selectedRegister] = 1;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = g_frameCount + 1;
                         } else if (g_overrideScopeMode == Override_NFrames) {
-                            editState->overrideFramesRemaining[g_selectedRegister] = g_overrideNFrames;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = g_frameCount + g_overrideNFrames;
                         } else {
-                            editState->overrideFramesRemaining[g_selectedRegister] = -1;
+                            editState->overrideExpiresAtFrame[g_selectedRegister] = -1;
                         }
                     }
                     ImGui::SameLine();
@@ -1916,7 +3640,118 @@ static void RenderImGuiOverlay() {
 
             ImGui::BeginChild("ConstantsScroll", ImVec2(0, 270), true);
             ShaderConstantState* state = GetShaderState(g_selectedShaderKey, false);
-            if (state && state->snapshotReady) {
+            if (g_showAllConstantRegisters) {
+                bool anyShown = false;
+                ImGui::Text("All vertex shader constant registers (all shaders):");
+                if (g_showConstantsAsMatrices) {
+                    for (int base = 0; base < kMaxConstantRegisters; base += 4) {
+                        bool anyValid = false;
+                        for (int reg = base; reg < base + 4; reg++) {
+                            if (g_allVertexRegisters[reg].valid) {
+                                anyValid = true;
+                                break;
+                            }
+                        }
+                        if (!anyValid) {
+                            continue;
+                        }
+
+                        D3DMATRIX mat = {};
+                        bool hasMatrix = TryBuildMatrixFromGlobalRegisters(base, 4, false, &mat);
+                        bool looksLike = hasMatrix && LooksLikeMatrix(reinterpret_cast<const float*>(&mat));
+                        if (g_filterDetectedMatrices && (!hasMatrix || !looksLike)) {
+                            continue;
+                        }
+                        anyShown = true;
+
+                        char label[64] = {};
+                        snprintf(label, sizeof(label), "c%d-c%d%s", base, base + 3,
+                                 looksLike ? " (matrix)" : "");
+                        ImGuiTreeNodeFlags flags = ImGuiTreeNodeFlags_OpenOnArrow |
+                                                   ImGuiTreeNodeFlags_SpanAvailWidth;
+                        if (g_selectedRegister == base) {
+                            flags |= ImGuiTreeNodeFlags_Selected;
+                        }
+                        bool open = ImGui::TreeNodeEx(label, flags);
+                        if (ImGui::IsItemClicked()) {
+                            g_selectedRegister = base;
+                        }
+                        if (open) {
+                            for (int reg = base; reg < base + 4; reg++) {
+                                char rowLabel[192] = {};
+                                const GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
+                                if (globalState.valid) {
+                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]###all_reg_%d",
+                                             reg,
+                                             globalState.value[0], globalState.value[1],
+                                             globalState.value[2], globalState.value[3],
+                                             reg);
+                                } else {
+                                    snprintf(rowLabel, sizeof(rowLabel), "c%d: <unset>###all_reg_%d", reg, reg);
+                                }
+                                if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
+                                    if (globalState.lastShaderKey != 0) {
+                                        g_selectedShaderKey = globalState.lastShaderKey;
+                                    }
+                                    g_selectedRegister = reg;
+                                }
+                            }
+
+                            int selectedRows = g_manualAssignRows;
+                            bool canAssign = (selectedRows == 4)
+                                ? TryBuildMatrixFromGlobalRegisters(base, 4, false, &mat)
+                                : TryBuildMatrixFromGlobalRegisters(base, 3, false, &mat);
+                            if (canAssign) {
+                                uintptr_t sourceShaderKey = g_allVertexRegisters[base].lastShaderKey;
+                                ImGui::PushID(base + 5000);
+                                if (ImGui::Button("Use as World")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_World, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as View")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_View, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as Projection")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_Projection, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::SameLine();
+                                if (ImGui::Button("Use as MVP")) {
+                                    TryAssignManualMatrixFromSelection(MatrixSlot_MVP, sourceShaderKey,
+                                                                       base, selectedRows, mat);
+                                }
+                                ImGui::PopID();
+                            }
+                            ImGui::TreePop();
+                        }
+                    }
+                } else {
+                    for (int reg = 0; reg < kMaxConstantRegisters; ++reg) {
+                        const GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
+                        if (!globalState.valid) {
+                            continue;
+                        }
+                        anyShown = true;
+                        char rowLabel[192] = {};
+                        snprintf(rowLabel, sizeof(rowLabel), "c%d: [%.3f %.3f %.3f %.3f]###all_reg_%d",
+                                 reg,
+                                 globalState.value[0], globalState.value[1], globalState.value[2], globalState.value[3],
+                                 reg);
+                        if (ImGui::Selectable(rowLabel, g_selectedRegister == reg)) {
+                            if (globalState.lastShaderKey != 0) {
+                                g_selectedShaderKey = globalState.lastShaderKey;
+                            }
+                            g_selectedRegister = reg;
+                        }
+                    }
+                }
+                if (!anyShown) {
+                    ImGui::Text("<no vertex shader constants captured yet>");
+                }
+            } else if (state && state->snapshotReady) {
                 if (g_showConstantsAsMatrices) {
                     for (int base = 0; base < kMaxConstantRegisters; base += 4) {
                         D3DMATRIX mat = {};
@@ -2042,7 +3877,93 @@ static void RenderImGuiOverlay() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Memory Scanner")) {
+        PushOverlayBoldFont();
+        bool remixApiTabOpen = ImGui::BeginTabItem("Remix API");
+        PopOverlayBoldFont();
+        if (remixApiTabOpen) {
+            DrawRemixApiStatusLine(g_remixLightingManager, g_customLightsManager);
+            PushOverlayBoldFont();
+            if (ImGui::BeginTabBar("RemixApiSubTabs")) {
+                if (ImGui::BeginTabItem("Shader Lights")) {
+                    PopOverlayBoldFont();
+                    DrawRemixLightsTab(g_remixLightingManager, false);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                if (ImGui::BeginTabItem("Custom Lights")) {
+                    PopOverlayBoldFont();
+                    DrawCustomLightsTab(g_customLightsManager);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                if (ImGui::BeginTabItem("Blend Mode")) {
+                    PopOverlayBoldFont();
+                    bool configDirty = false;
+                    if (ImGui::Checkbox("Enable Raster Blend", &g_config.rasterBlendEnabled)) {
+                        configDirty |= SaveConfigBoolValueInSection("RasterBlend", "Enabled", g_config.rasterBlendEnabled);
+                    }
+                    if (g_config.rasterBlendEnabled && !remix_api::g_initialized) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.25f, 1.0f), "Raster Blend requires RTX Remix to be running.");
+                    }
+                    if (g_config.rasterBlendEnabled) {
+                        static const char* kBlendModes[] = {
+                            "Multiply (raster × remix)",
+                            "Additive (remix + raster)",
+                            "Lerp (mix ratio)"
+                        };
+                        if (ImGui::Combo("Blend Mode", &g_config.rasterBlendMode, kBlendModes, IM_ARRAYSIZE(kBlendModes))) {
+                            g_config.rasterBlendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+                            configDirty |= SaveConfigRegisterValueInSection("RasterBlend", "Mode", g_config.rasterBlendMode);
+                        }
+                        if (ImGui::SliderFloat("Mix Strength", &g_config.rasterBlendMixStrength, 0.0f, 1.0f, "%.2f")) {
+                            configDirty |= SaveConfigFloatValueInSection("RasterBlend", "MixStrength", g_config.rasterBlendMixStrength);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            if (g_config.rasterBlendMode == RasterBlendMode_Multiply) {
+                                ImGui::SetTooltip("1.0 = full multiply, 0.0 = pure Remix");
+                            } else if (g_config.rasterBlendMode == RasterBlendMode_Additive) {
+                                ImGui::SetTooltip("amount of rasterized image added over Remix");
+                            } else {
+                                ImGui::SetTooltip("0.0 = pure Remix, 1.0 = pure rasterizer");
+                            }
+                        }
+                        if (ImGui::Checkbox("White Materials in Remix", &g_config.rasterBlendWhiteMaterials)) {
+                            configDirty |= SaveConfigBoolValueInSection("RasterBlend", "WhiteMaterials", g_config.rasterBlendWhiteMaterials);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Enables rtx.whiteMaterialModeEnabled so multiply mode restores original textures over Remix lighting.");
+                        }
+
+                        ImGui::Separator();
+                        ImGui::Text("Status:");
+                        ImGui::TextColored(g_rasterBlendResourcesFailed ? ImVec4(0.95f, 0.35f, 0.35f, 1.0f) : ImVec4(0.35f, 0.95f, 0.35f, 1.0f),
+                                           "Resources: %s", g_rasterBlendResourcesFailed ? "failed" : "ready / pending");
+                        ImGui::TextColored(g_rasterBlendLastRasterCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                                           "Raster capture: %s", g_rasterBlendLastRasterCapture ? "ok" : "missing");
+                        ImGui::TextColored(g_rasterBlendLastRemixCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                                           "Remix capture: %s", g_rasterBlendLastRemixCapture ? "ok" : "missing");
+
+                        if (ImGui::CollapsingHeader("Known Limitations")) {
+                            ImGui::TextWrapped("Games that finish to offscreen render targets can produce a blank backbuffer capture at EndScene.");
+                            ImGui::TextWrapped("Raster post-processing (bloom, tone mapping, grading, UI) is captured and can be double-applied with Remix.");
+                            ImGui::TextWrapped("Multiply mode is designed for neutral/white Remix materials; enable White Materials for best results.");
+                            ImGui::TextWrapped("Feature is inactive while Remix is not running.");
+                        }
+                    }
+                    (void)configDirty;
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                ImGui::EndTabBar();
+            }
+            PopOverlayBoldFont();
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
+        bool memoryscannerTabOpen = ImGui::BeginTabItem("Memory Scanner");
+        PopOverlayBoldFont();
+        if (memoryscannerTabOpen) {
             if (ImGui::Button("Start memory scan")) {
                 StartMemoryScanner();
             }
@@ -2069,14 +3990,14 @@ static void RenderImGuiOverlay() {
                         if (ImGui::Button("Use as View")) {
                             StoreViewMatrix(hit.matrix, 0, -1, 4, false, true, "memory scanner");
                             snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-                                     "Assigned VIEW from memory scan @ 0x%p (hash 0x%08X).",
+                                     "Assigned VIEW from memory scan @ %p (hash 0x%08X).",
                                      reinterpret_cast<void*>(hit.address), hit.hash);
                         }
                         ImGui::SameLine();
                         if (ImGui::Button("Use as Projection")) {
                             StoreProjectionMatrix(hit.matrix, 0, -1, 4, false, true, "memory scanner");
                             snprintf(g_matrixAssignStatus, sizeof(g_matrixAssignStatus),
-                                     "Assigned PROJECTION from memory scan @ 0x%p (hash 0x%08X).",
+                                     "Assigned PROJECTION from memory scan @ %p (hash 0x%08X).",
                                      reinterpret_cast<void*>(hit.address), hit.hash);
                         }
                         ImGui::PopID();
@@ -2088,7 +4009,10 @@ static void RenderImGuiOverlay() {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Logs")) {
+        PushOverlayBoldFont();
+        bool logsTabOpen = ImGui::BeginTabItem("Logs");
+        PopOverlayBoldFont();
+        if (logsTabOpen) {
             ImGui::Checkbox("Live update", &g_logsLiveUpdate);
             ImGui::SameLine();
             if (ImGui::Button("Refresh")) {
@@ -2185,12 +4109,18 @@ void LogMsg(const char* fmt, ...) {
 
 // Check if matrix values are valid
 bool LooksLikeMatrix(const float* data) {
-    float sum = 0;
+    float sum = 0.0f;
+    bool hasNearUnitValue = false;
     for (int i = 0; i < 16; i++) {
-        if (!std::isfinite(data[i])) return false;
-        sum += fabsf(data[i]);
+        const float v = data[i];
+        if (!std::isfinite(v)) return false;
+        const float a = fabsf(v);
+        if (a >= 1e5f) return false;
+        if (a > 0.5f && a < 2.0f) hasNearUnitValue = true;
+        sum += a;
     }
-    if (sum < 0.001f || sum > 10000.0f) return false;
+    if (!hasNearUnitValue) return false;
+    if (sum <= 0.5f || sum >= 5000.0f) return false;
     return true;
 }
 
@@ -2233,6 +4163,9 @@ static bool LooksLikeProjectionStrict(const D3DMATRIX& m) {
 static bool IsTypicalProjectionMatrix(const D3DMATRIX& m) {
     ProjectionAnalysis analysis = {};
     if (!AnalyzeProjectionMatrixNumeric(m, &analysis) || !analysis.valid) {
+        return false;
+    }
+    if (analysis.fovRadians < g_config.minFOV || analysis.fovRadians > g_config.maxFOV) {
         return false;
     }
 
@@ -2281,7 +4214,7 @@ static bool AnalyzeProjectionMatrixNumeric(const D3DMATRIX& m, ProjectionAnalysi
     }
 
     const float fov = 2.0f * atanf(1.0f / fabsf(m._22));
-    if (!std::isfinite(fov) || fov < g_config.minFOV || fov > g_config.maxFOV) {
+    if (!std::isfinite(fov) || fov < 0.01f || fov > 3.13f) {
         return false;
     }
 
@@ -2298,20 +4231,6 @@ static const char* ProjectionHandednessLabel(ProjectionHandedness handedness) {
         case ProjectionHandedness_Left: return "LH";
         case ProjectionHandedness_Right: return "RH";
         default: return "Unknown";
-    }
-}
-
-static const char* CombinedMVPStrategyLabel(CombinedMVPStrategy strategy) {
-    switch (strategy) {
-        case CombinedMVPStrategy_WorldAndMVP: return "Strategy 1 (World + MVP)";
-        case CombinedMVPStrategy_MVPOnly: return "Strategy 2 (MVP only)";
-        case CombinedMVPStrategy_WorldRequiredNoWorld: return "Strategy 3 (world required, missing)";
-        case CombinedMVPStrategy_Disabled: return "Disabled";
-        case CombinedMVPStrategy_SkippedFullWVP: return "Skipped (full W/V/P already present)";
-        case CombinedMVPStrategy_Failed: return "Failed";
-        case CombinedMVPStrategy_None:
-        default:
-            return "None";
     }
 }
 
@@ -2332,21 +4251,17 @@ static bool IsLikelyBoneTransform(const D3DMATRIX& m,
         return false;
     }
 
-    const float tx = m._41;
-    const float ty = m._42;
-    const float tz = m._43;
-    const float translationLen = sqrtf(tx * tx + ty * ty + tz * tz);
-
     const float r0 = sqrtf(Dot3(m._11, m._12, m._13, m._11, m._12, m._13));
     const float r1 = sqrtf(Dot3(m._21, m._22, m._23, m._21, m._22, m._23));
     const float r2 = sqrtf(Dot3(m._31, m._32, m._33, m._31, m._32, m._33));
     const bool nearUnitRows = fabsf(r0 - 1.0f) < 0.25f && fabsf(r1 - 1.0f) < 0.25f && fabsf(r2 - 1.0f) < 0.25f;
 
-    const bool appearsInLargePaletteUpload =
-        rows == 3 && vectorCountInUpload >= 12 && candidateBaseReg >= uploadStartReg &&
-        candidateBaseReg + 2 < uploadStartReg + vectorCountInUpload;
+    const bool appearsInPaletteUpload =
+        vectorCountInUpload >= 8 &&
+        candidateBaseReg >= uploadStartReg &&
+        (candidateBaseReg + static_cast<UINT>(rows)) <= (uploadStartReg + vectorCountInUpload);
 
-    return nearUnitRows && translationLen < 50.0f && appearsInLargePaletteUpload;
+    return nearUnitRows && appearsInPaletteUpload;
 }
 
 static bool LooksLikeWorldStrict(const D3DMATRIX& m,
@@ -2394,6 +4309,102 @@ static MatrixClassification ClassifyMatrixDeterministic(const D3DMATRIX& m,
     return MatrixClass_None;
 }
 
+static bool IsThreeRowPrefixOfPerspectiveMatrix(const float* data,
+                                                UINT startReg,
+                                                UINT vectorCount,
+                                                UINT candidateBaseReg,
+                                                bool transposedLayout);
+
+static int CountStridedCandidates(const float* data,
+                                  UINT startReg,
+                                  UINT vectorCount,
+                                  UINT strideRows,
+                                  MatrixClassification targetClass) {
+    int count = 0;
+    for (UINT offset = 0; offset + strideRows <= vectorCount; offset += strideRows) {
+        D3DMATRIX candidate = {};
+        if (!TryBuildMatrixFromConstantUpdate(data + offset * 4,
+                                              startReg + offset,
+                                              strideRows,
+                                              static_cast<int>(startReg + offset),
+                                              static_cast<int>(strideRows),
+                                              false,
+                                              &candidate)) {
+            continue;
+        }
+        MatrixClassification cls = ClassifyMatrixDeterministic(
+            candidate,
+            static_cast<int>(strideRows),
+            vectorCount,
+            startReg,
+            startReg + offset);
+
+        if (strideRows == 3u &&
+            (cls == MatrixClass_View || cls == MatrixClass_World) &&
+            IsThreeRowPrefixOfPerspectiveMatrix(data,
+                                                startReg,
+                                                vectorCount,
+                                                startReg + offset,
+                                                false)) {
+            continue;
+        }
+
+        if (cls == targetClass && ++count > 1) {
+            return count;
+        }
+    }
+    return count;
+}
+
+static bool IsThreeRowPrefixOfPerspectiveMatrix(const float* data,
+                                                UINT startReg,
+                                                UINT vectorCount,
+                                                UINT candidateBaseReg,
+                                                bool transposedLayout) {
+    if (!data || vectorCount < 4) {
+        return false;
+    }
+    if (candidateBaseReg < startReg) {
+        return false;
+    }
+
+    const UINT offset = candidateBaseReg - startReg;
+    if (offset + 4 > vectorCount) {
+        return false;
+    }
+
+    D3DMATRIX candidate4x4 = {};
+    if (!TryBuildMatrixFromConstantUpdate(data + offset * 4,
+                                          candidateBaseReg,
+                                          4u,
+                                          static_cast<int>(candidateBaseReg),
+                                          4,
+                                          transposedLayout,
+                                          &candidate4x4)) {
+        return false;
+    }
+
+    const MatrixClassification directClass = ClassifyMatrixDeterministic(
+        candidate4x4,
+        4,
+        vectorCount,
+        startReg,
+        candidateBaseReg);
+    if (directClass == MatrixClass_Projection || directClass == MatrixClass_CombinedPerspective) {
+        return true;
+    }
+
+    const D3DMATRIX transposed = TransposeMatrix(candidate4x4);
+    const MatrixClassification transposedClass = ClassifyMatrixDeterministic(
+        transposed,
+        4,
+        vectorCount,
+        startReg,
+        candidateBaseReg);
+    return transposedClass == MatrixClass_Projection ||
+           transposedClass == MatrixClass_CombinedPerspective;
+}
+
 static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     D3DMATRIX out = {};
     out._11 = a._11*b._11 + a._12*b._21 + a._13*b._31 + a._14*b._41;
@@ -2416,6 +4427,116 @@ static D3DMATRIX MultiplyMatrix(const D3DMATRIX& a, const D3DMATRIX& b) {
     out._43 = a._41*b._13 + a._42*b._23 + a._43*b._33 + a._44*b._43;
     out._44 = a._41*b._14 + a._42*b._24 + a._43*b._34 + a._44*b._44;
     return out;
+}
+
+
+// Returns true if candidateView is consistent with being a pure orthonormal
+// view matrix relative to knownProjection.
+static bool CrossValidateViewAgainstProjection(const D3DMATRIX& candidateView,
+                                               const D3DMATRIX& knownProjection) {
+    D3DMATRIX vp = MultiplyMatrix(candidateView, knownProjection);
+
+    const float p_c0 = sqrtf(
+        knownProjection._11 * knownProjection._11 +
+        knownProjection._21 * knownProjection._21 +
+        knownProjection._31 * knownProjection._31);
+    const float p_c1 = sqrtf(
+        knownProjection._12 * knownProjection._12 +
+        knownProjection._22 * knownProjection._22 +
+        knownProjection._32 * knownProjection._32);
+    const float vp_c0 = sqrtf(
+        vp._11 * vp._11 + vp._21 * vp._21 + vp._31 * vp._31);
+    const float vp_c1 = sqrtf(
+        vp._12 * vp._12 + vp._22 * vp._22 + vp._32 * vp._32);
+
+    if (p_c0 < 1e-6f || p_c1 < 1e-6f) {
+        return true;
+    }
+
+    constexpr float kTol = 0.15f;
+    return (fabsf(vp_c0 - p_c0) / p_c0 < kTol) &&
+           (fabsf(vp_c1 - p_c1) / p_c1 < kTol);
+}
+
+static float MatrixMaxAbsDiff(const D3DMATRIX& a, const D3DMATRIX& b) {
+    const float* pa = reinterpret_cast<const float*>(&a);
+    const float* pb = reinterpret_cast<const float*>(&b);
+    float maxErr = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        maxErr = (std::max)(maxErr, fabsf(pa[i] - pb[i]));
+    }
+    return maxErr;
+}
+
+enum ViewCandidateConsistency {
+    ViewCandidateConsistency_None,
+    ViewCandidateConsistency_Original,
+    ViewCandidateConsistency_Inverse,
+    ViewCandidateConsistency_Ambiguous
+};
+
+static ViewCandidateConsistency ResolveViewInverseConsistency(const D3DMATRIX& originalView,
+                                                              const D3DMATRIX& inverseView,
+                                                              const D3DMATRIX* knownProjection,
+                                                              bool hasProjection,
+                                                              const D3DMATRIX* knownWorld,
+                                                              bool hasWorld,
+                                                              const D3DMATRIX* knownVP,
+                                                              bool hasVP,
+                                                              const D3DMATRIX* knownWV,
+                                                              bool hasWV,
+                                                              const D3DMATRIX* knownMVP,
+                                                              bool hasMVP) {
+    constexpr float kTolerance = 0.08f;
+    constexpr float kEdge = 0.02f;
+
+    int originalVotes = 0;
+    int inverseVotes = 0;
+    int checks = 0;
+
+    auto voteForLowerError = [&](float originalErr, float inverseErr) {
+        ++checks;
+        const bool originalGood = originalErr <= kTolerance;
+        const bool inverseGood = inverseErr <= kTolerance;
+        if (originalGood && !inverseGood) {
+            ++originalVotes;
+        } else if (inverseGood && !originalGood) {
+            ++inverseVotes;
+        } else if ((std::max)(0.0f, inverseErr - originalErr) > kEdge) {
+            ++originalVotes;
+        } else if ((std::max)(0.0f, originalErr - inverseErr) > kEdge) {
+            ++inverseVotes;
+        }
+    };
+
+    if (hasProjection && hasVP && knownProjection && knownVP) {
+        const D3DMATRIX originalVP = MultiplyMatrix(originalView, *knownProjection);
+        const D3DMATRIX inverseVP = MultiplyMatrix(inverseView, *knownProjection);
+        voteForLowerError(MatrixMaxAbsDiff(originalVP, *knownVP),
+                         MatrixMaxAbsDiff(inverseVP, *knownVP));
+    }
+    if (hasWorld && hasWV && knownWorld && knownWV) {
+        const D3DMATRIX originalWV = MultiplyMatrix(*knownWorld, originalView);
+        const D3DMATRIX inverseWV = MultiplyMatrix(*knownWorld, inverseView);
+        voteForLowerError(MatrixMaxAbsDiff(originalWV, *knownWV),
+                         MatrixMaxAbsDiff(inverseWV, *knownWV));
+    }
+    if (hasWorld && hasProjection && hasMVP && knownWorld && knownProjection && knownMVP) {
+        const D3DMATRIX originalMVP = MultiplyMatrix(MultiplyMatrix(*knownWorld, originalView), *knownProjection);
+        const D3DMATRIX inverseMVP = MultiplyMatrix(MultiplyMatrix(*knownWorld, inverseView), *knownProjection);
+        voteForLowerError(MatrixMaxAbsDiff(originalMVP, *knownMVP),
+                         MatrixMaxAbsDiff(inverseMVP, *knownMVP));
+    }
+
+    if (checks == 0 || originalVotes == inverseVotes) {
+        if (checks > 0 && originalVotes > 0 && inverseVotes > 0) {
+            return ViewCandidateConsistency_Ambiguous;
+        }
+        return ViewCandidateConsistency_None;
+    }
+    return (inverseVotes > originalVotes)
+        ? ViewCandidateConsistency_Inverse
+        : ViewCandidateConsistency_Original;
 }
 
 static bool IsIdentityMatrix(const D3DMATRIX& m, float tolerance) {
@@ -2554,8 +4675,8 @@ static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
         return false;
     }
 
-    const int mode = g_config.experimentalCustomProjectionMode;
-    if (mode == 1) {
+    const CustomProjectionMode mode = g_config.experimentalCustomProjectionMode;
+    if (mode == CustomProjectionMode_Manual) {
         *outProjection = g_config.experimentalCustomProjectionManualMatrix;
         if (outUsedAuto) {
             *outUsedAuto = false;
@@ -2563,7 +4684,7 @@ static bool BuildExperimentalCustomProjectionMatrix(IDirect3DDevice9* device,
         return true;
     }
 
-    if (mode != 2) {
+    if (mode != CustomProjectionMode_Auto) {
         return false;
     }
 
@@ -2608,6 +4729,10 @@ static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
         return;
     }
 
+    const float origTx = view->_41;
+    const float origTy = view->_42;
+    const float origTz = view->_43;
+
     float r0x = view->_11, r0y = view->_12, r0z = view->_13;
     float r1x = view->_21, r1y = view->_22, r1z = view->_23;
 
@@ -2633,101 +4758,248 @@ static void OrthonormalizeViewMatrix(D3DMATRIX* view) {
     view->_11 = r0x; view->_12 = r0y; view->_13 = r0z; view->_14 = 0.0f;
     view->_21 = r1x; view->_22 = r1y; view->_23 = r1z; view->_24 = 0.0f;
     view->_31 = r2x; view->_32 = r2y; view->_33 = r2z; view->_34 = 0.0f;
+    view->_41 = Dot3(origTx, origTy, origTz, view->_11, view->_12, view->_13);
+    view->_42 = Dot3(origTx, origTy, origTz, view->_21, view->_22, view->_23);
+    view->_43 = Dot3(origTx, origTy, origTz, view->_31, view->_32, view->_33);
     view->_44 = 1.0f;
 }
 
+
 static bool TryExtractProjectionFromCombined(const D3DMATRIX& combined,
+                                             const D3DMATRIX* worldOptional,
+                                             bool worldAvailable,
                                              ProjectionAnalysis* outAnalysis,
                                              D3DMATRIX* outProjection,
-                                             bool forceDecomposition) {
-    if (!outProjection) {
+                                             bool /*forceDecomposition*/) {
+    if (!outProjection) return false;
+    D3DMATRIX candidate = combined;
+    if (worldAvailable && worldOptional) {
+        D3DMATRIX worldInv = {};
+        if (!InvertMatrix4x4Deterministic(*worldOptional, &worldInv, nullptr)) return false;
+        candidate = MultiplyMatrix(worldInv, combined);
+    }
+    if (!AnalyzeProjectionMatrixNumeric(candidate, outAnalysis)) return false;
+    *outProjection = candidate;
+    return true;
+}
+
+static bool TrySolveFromInverseLeftMultiply(const D3DMATRIX& known,
+                                          const D3DMATRIX& combined,
+                                          D3DMATRIX* out) {
+    if (!out) return false;
+    D3DMATRIX inv = {};
+    if (!InvertMatrix4x4Deterministic(known, &inv, nullptr)) {
         return false;
     }
+    *out = MultiplyMatrix(inv, combined);
+    return true;
+}
 
-    const float sx = sqrtf(Dot3(combined._11, combined._12, combined._13,
-                                combined._11, combined._12, combined._13));
-    const float sy = sqrtf(Dot3(combined._21, combined._22, combined._23,
-                                combined._21, combined._22, combined._23));
-    if (!std::isfinite(sx) || !std::isfinite(sy) || sx < 1e-5f || sy < 1e-5f) {
+static bool TrySolveFromInverseRightMultiply(const D3DMATRIX& combined,
+                                             const D3DMATRIX& knownRight,
+                                             D3DMATRIX* out) {
+    if (!out) return false;
+    D3DMATRIX inv = {};
+    if (!InvertMatrix4x4Deterministic(knownRight, &inv, nullptr)) {
         return false;
     }
+    *out = MultiplyMatrix(combined, inv);
+    return true;
+}
 
-    const float fov = 2.0f * atanf(1.0f / sy);
-    const float aspect = sy / sx;
-    if (!forceDecomposition) {
-        if (!std::isfinite(fov) || fov < g_config.minFOV || fov > g_config.maxFOV) {
-            return false;
-        }
-    }
-
-    const float det = Determinant3x3(combined);
-    ProjectionHandedness handedness = ProjectionHandedness_Unknown;
-    if (std::isfinite(det)) {
-        handedness = (det < 0.0f) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
-    }
-
-    CreateProjectionMatrixWithHandedness(outProjection,
-                                         fov,
-                                         (std::max)(0.1f, aspect),
-                                         0.1f,
-                                         1000.0f,
-                                         handedness);
-
-    if (outAnalysis) {
-        outAnalysis->valid = true;
-        outAnalysis->fovRadians = fov;
-        outAnalysis->handedness = handedness;
+static bool IsFiniteMatrix(const D3DMATRIX& m) {
+    const float* v = reinterpret_cast<const float*>(&m);
+    for (int i = 0; i < 16; ++i) {
+        if (!std::isfinite(v[i])) return false;
     }
     return true;
 }
 
-static bool TryDecomposeCombinedMVP(const D3DMATRIX& mvp,
-                                    const D3DMATRIX* worldOptional,
-                                    bool worldAvailable,
-                                    D3DMATRIX* outWorld,
-                                    D3DMATRIX* outView,
-                                    D3DMATRIX* outProjection,
-                                    ProjectionAnalysis* outProjectionAnalysis) {
-    if (!outWorld || !outView || !outProjection) {
-        return false;
+static bool IsWorldCandidateForDecomposition(const D3DMATRIX& m) {
+    if (!IsFiniteMatrix(m) || !IsAffineMatrixNoPerspective(m)) return false;
+    const float det = Determinant3x3(m);
+    return std::isfinite(det) && fabsf(det) > 0.0001f;
+}
+
+static bool IsViewCandidateForDecomposition(const D3DMATRIX& m) {
+    return IsFiniteMatrix(m) && LooksLikeViewStrict(m);
+}
+
+static bool IsProjectionCandidateForDecomposition(const D3DMATRIX& m) {
+    return IsFiniteMatrix(m) && LooksLikeProjectionStrict(m);
+}
+
+static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
+                                                      bool* hasWorld,
+                                                      D3DMATRIX* view,
+                                                      bool* hasView,
+                                                      D3DMATRIX* projection,
+                                                      bool* hasProjection,
+                                                      const D3DMATRIX* mvp,
+                                                      bool hasMvp,
+                                                      const D3DMATRIX* mv,
+                                                      bool hasMv,
+                                                      const D3DMATRIX* vp,
+                                                      bool hasVp,
+                                                      const D3DMATRIX* generatedProjection,
+                                                      bool hasGeneratedProjection) {
+    if (!world || !hasWorld || !view || !hasView || !projection || !hasProjection) return;
+
+    g_combinedDecompDebug = {};
+    g_combinedDecompDebug.attempted = hasMvp || hasMv || hasVp;
+    if (!g_config.enableCombinedDecomposition || !g_combinedDecompDebug.attempted) {
+        return;
     }
 
-    D3DMATRIX world = {};
-    D3DMATRIX viewProjection = {};
+    bool changed = true;
+    D3DMATRIX knownMvp = {};
+    D3DMATRIX knownMv = {};
+    D3DMATRIX knownVp = {};
+    bool knownHasMvp = hasMvp;
+    bool knownHasMv = hasMv;
+    bool knownHasVp = hasVp;
+    if (knownHasMvp && mvp) knownMvp = *mvp;
+    if (knownHasMv && mv) knownMv = *mv;
+    if (knownHasVp && vp) knownVp = *vp;
 
-    if (worldAvailable && worldOptional) {
-        world = *worldOptional;
-        D3DMATRIX worldInv = {};
-        if (!InvertMatrix4x4Deterministic(world, &worldInv, nullptr)) {
-            return false;
+    auto solveWorld = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasWorld || !IsWorldCandidateForDecomposition(candidate)) return false;
+        *world = candidate;
+        *hasWorld = true;
+        g_combinedDecompDebug.solvedWorld = true;
+        snprintf(g_combinedDecompDebug.worldFormula, sizeof(g_combinedDecompDebug.worldFormula), "%s", formula);
+        return true;
+    };
+
+    auto solveView = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasView || !IsViewCandidateForDecomposition(candidate)) return false;
+        *view = candidate;
+        *hasView = true;
+        g_combinedDecompDebug.solvedView = true;
+        snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula), "%s", formula);
+        return true;
+    };
+
+    auto solveProjection = [&](const D3DMATRIX& candidate, const char* formula) {
+        if (*hasProjection || !IsProjectionCandidateForDecomposition(candidate)) return false;
+        *projection = candidate;
+        *hasProjection = true;
+        g_combinedDecompDebug.solvedProjection = true;
+        snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula), "%s", formula);
+        return true;
+    };
+
+    for (int pass = 0; pass < 8 && changed; ++pass) {
+        changed = false;
+
+        if (!knownHasMv && *hasView && *hasWorld) {
+            knownMv = MultiplyMatrix(*world, *view);
+            knownHasMv = true;
+            changed = true;
         }
-        viewProjection = MultiplyMatrix(mvp, worldInv);
-    } else {
-        CreateIdentityMatrix(&world);
-        viewProjection = mvp;
+        if (!knownHasVp && *hasView && *hasProjection) {
+            knownVp = MultiplyMatrix(*view, *projection);
+            knownHasVp = true;
+            changed = true;
+        }
+        if (!knownHasMvp && knownHasMv && *hasProjection) {
+            knownMvp = MultiplyMatrix(knownMv, *projection);
+            knownHasMvp = true;
+            changed = true;
+        }
+        if (!knownHasMvp && knownHasVp && *hasWorld) {
+            knownMvp = MultiplyMatrix(*world, knownVp);
+            knownHasMvp = true;
+            changed = true;
+        }
+
+        if (knownHasMvp && *hasWorld && !knownHasVp) {
+            D3DMATRIX solvedVp = {};
+            if (TrySolveFromInverseLeftMultiply(*world, knownMvp, &solvedVp)) {
+                knownVp = solvedVp;
+                knownHasVp = true;
+                changed = true;
+            }
+        }
+        if (knownHasMvp && *hasProjection && !knownHasMv) {
+            D3DMATRIX solvedMv = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, *projection, &solvedMv)) {
+                knownMv = solvedMv;
+                knownHasMv = true;
+                changed = true;
+            }
+        }
+
+        if (knownHasMv && !*hasWorld && *hasView) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseRightMultiply(knownMv, *view, &solved) &&
+                solveWorld(solved, "World = MV * inv(View)")) {
+                changed = true;
+            }
+        }
+        if (knownHasMv && !*hasView && *hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*world, knownMv, &solved) &&
+                solveView(solved, "View = inv(World) * MV")) {
+                changed = true;
+            }
+        }
+
+        if (knownHasVp && !*hasView && *hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseRightMultiply(knownVp, *projection, &solved) &&
+                solveView(solved, "View = VP * inv(Projection)")) {
+                changed = true;
+            }
+        }
+        if (knownHasVp && !*hasProjection && *hasView) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*view, knownVp, &solved) &&
+                solveProjection(solved, "Projection = inv(View) * VP")) {
+                changed = true;
+            }
+        }
+
+        if (knownHasMvp && knownHasVp && !*hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, knownVp, &solved) &&
+                solveWorld(solved, "World = MVP * inv(VP)")) {
+                changed = true;
+            }
+        }
+        if (knownHasMvp && knownHasMv && !*hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(knownMv, knownMvp, &solved) &&
+                solveProjection(solved, "Projection = inv(MV) * MVP")) {
+                changed = true;
+            }
+        }
+        if (knownHasVp && !*hasProjection && !*hasView && hasGeneratedProjection && g_config.allowGeneratedProjectionForVPDecomposition) {
+            D3DMATRIX solvedView = {};
+            if (TrySolveFromInverseRightMultiply(knownVp, *generatedProjection, &solvedView) &&
+                IsProjectionCandidateForDecomposition(*generatedProjection) &&
+                IsViewCandidateForDecomposition(solvedView)) {
+                *projection = *generatedProjection;
+                *hasProjection = true;
+                *view = solvedView;
+                *hasView = true;
+                g_combinedDecompDebug.solvedProjection = true;
+                g_combinedDecompDebug.solvedView = true;
+                snprintf(g_combinedDecompDebug.projectionFormula, sizeof(g_combinedDecompDebug.projectionFormula),
+                         "Projection = Generated manual/auto matrix (config-enabled)");
+                snprintf(g_combinedDecompDebug.viewFormula, sizeof(g_combinedDecompDebug.viewFormula),
+                         "View = VP * inv(GeneratedProjection)");
+                changed = true;
+            }
+        }
     }
 
-    ProjectionAnalysis analysis = {};
-    D3DMATRIX projection = {};
-    if (!TryExtractProjectionFromCombined(viewProjection, &analysis, &projection, g_config.combinedMVPForceDecomposition)) {
-        return false;
+    if (g_config.combinedDecompositionLog && g_combinedDecompDebug.attempted) {
+        LogMsg("Combined decomposition result: world=%s view=%s projection=%s.",
+               *hasWorld ? "yes" : "no",
+               *hasView ? "yes" : "no",
+               *hasProjection ? "yes" : "no");
     }
-
-    D3DMATRIX projectionInv = {};
-    if (!InvertMatrix4x4Deterministic(projection, &projectionInv, nullptr)) {
-        return false;
-    }
-
-    D3DMATRIX view = MultiplyMatrix(projectionInv, viewProjection);
-    OrthonormalizeViewMatrix(&view);
-
-    *outWorld = world;
-    *outView = view;
-    *outProjection = projection;
-    if (outProjectionAnalysis) {
-        *outProjectionAnalysis = analysis;
-    }
-    return true;
 }
 
 // Create an identity matrix
@@ -2780,28 +5052,278 @@ bool LooksLikeView(const D3DMATRIX& m) {
 class WrappedD3D9Device;
 class WrappedD3D9;
 
+class WrappedPixelShader9 : public IDirect3DPixelShader9 {
+private:
+    IDirect3DPixelShader9* m_real;
+    uintptr_t m_key;
+public:
+    explicit WrappedPixelShader9(IDirect3DPixelShader9* real)
+        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {}
+
+    IDirect3DPixelShader9* GetReal() const { return m_real; }
+    uintptr_t GetKey() const { return m_key; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override { return m_real->QueryInterface(riid, ppv); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = m_real->Release();
+        if (count == 0) {
+            OnVertexShaderReleased(m_key);
+            delete this;
+        }
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9** ppDevice) override { return m_real->GetDevice(ppDevice); }
+    HRESULT STDMETHODCALLTYPE GetFunction(void* pData, UINT* pSizeOfData) override { return m_real->GetFunction(pData, pSizeOfData); }
+};
+
+class WrappedVertexShader9 : public IDirect3DVertexShader9 {
+private:
+    IDirect3DVertexShader9* m_real;
+    uintptr_t m_key;
+public:
+    explicit WrappedVertexShader9(IDirect3DVertexShader9* real)
+        : m_real(real), m_key(reinterpret_cast<uintptr_t>(this)) {}
+
+    IDirect3DVertexShader9* GetReal() const { return m_real; }
+    uintptr_t GetKey() const { return m_key; }
+
+    HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppv) override { return m_real->QueryInterface(riid, ppv); }
+    ULONG STDMETHODCALLTYPE AddRef() override { return m_real->AddRef(); }
+    ULONG STDMETHODCALLTYPE Release() override {
+        ULONG count = m_real->Release();
+        if (count == 0) {
+            OnVertexShaderReleased(m_key);
+            delete this;
+        }
+        return count;
+    }
+    HRESULT STDMETHODCALLTYPE GetDevice(IDirect3DDevice9** ppDevice) override { return m_real->GetDevice(ppDevice); }
+    HRESULT STDMETHODCALLTYPE GetFunction(void* pData, UINT* pSizeOfData) override { return m_real->GetFunction(pData, pSizeOfData); }
+};
+
 /**
  * Wrapped IDirect3DDevice9 - intercepts SetVertexShaderConstantF
  */
-class WrappedD3D9Device : public IDirect3DDevice9 {
+class WrappedD3D9Device : public IDirect3DDevice9Ex {
 private:
     IDirect3DDevice9* m_real;
+    IDirect3DDevice9Ex* m_realEx = nullptr;
     D3DMATRIX m_currentView;
     D3DMATRIX m_currentProj;
     D3DMATRIX m_currentWorld;
     HWND m_hwnd = nullptr;
     IDirect3DVertexShader9* m_currentVertexShader = nullptr;
+    IDirect3DPixelShader9* m_currentPixelShader = nullptr;
     bool m_hasView = false;
     bool m_hasProj = false;
     bool m_hasWorld = false;
+    bool m_everHadView  = false;
+    bool m_everHadProj  = false;
+    bool m_everHadWorld = false;
     bool m_mgrrUseAutoProjection = false;
     int m_constantLogThrottle = 0;
+    int m_viewLastFrame = -1;
+    int m_projLastFrame = -1;
+    int m_projDetectedFrame = -1;
+    int m_worldLastFrame = -1;
+    uintptr_t m_viewLockedShader = 0;
+    int m_viewLockedRegister = -1;
+    uintptr_t m_projLockedShader = 0;
+    int m_projLockedRegister = -1;
+    bool m_remixFrameOpen = false;
+    IDirect3DSurface9* m_rasterCaptureSurface = nullptr;
+    IDirect3DSurface9* m_remixOutputSurface = nullptr;
+    IDirect3DTexture9* m_rasterCaptureTexture = nullptr;
+    IDirect3DTexture9* m_remixOutputTexture = nullptr;
+    IDirect3DVertexBuffer9* m_blendQuadVB = nullptr;
+    bool m_blendResourceCreationFailed = false;
+    bool m_lastWhiteMaterialApplied = false;
+    bool m_rasterCaptureTakenThisFrame = false;
+    bool m_lastRasterCaptureSucceeded = false;
+    bool m_lastRemixCaptureSucceeded = false;
+    bool m_lastBlendEnabledState = false;
+
+    void ReleaseBlendResources() {
+        if (m_blendQuadVB) { m_blendQuadVB->Release(); m_blendQuadVB = nullptr; }
+        if (m_rasterCaptureSurface) { m_rasterCaptureSurface->Release(); m_rasterCaptureSurface = nullptr; }
+        if (m_remixOutputSurface) { m_remixOutputSurface->Release(); m_remixOutputSurface = nullptr; }
+        if (m_rasterCaptureTexture) { m_rasterCaptureTexture->Release(); m_rasterCaptureTexture = nullptr; }
+        if (m_remixOutputTexture) { m_remixOutputTexture->Release(); m_remixOutputTexture = nullptr; }
+    }
+
+    bool EnsureBlendResources() {
+        if (m_blendResourceCreationFailed) {
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        if (m_rasterCaptureSurface && m_remixOutputSurface && m_blendQuadVB && m_rasterCaptureTexture && m_remixOutputTexture) {
+            return true;
+        }
+
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (FAILED(m_real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer) {
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        D3DSURFACE_DESC bbDesc = {};
+        HRESULT descHr = backBuffer->GetDesc(&bbDesc);
+        backBuffer->Release();
+        if (FAILED(descHr)) {
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        ReleaseBlendResources();
+        HRESULT hr = m_real->CreateTexture(bbDesc.Width, bbDesc.Height, 1, D3DUSAGE_RENDERTARGET, bbDesc.Format,
+                                           D3DPOOL_DEFAULT, &m_rasterCaptureTexture, nullptr);
+        if (FAILED(hr) || !m_rasterCaptureTexture ||
+            FAILED(m_rasterCaptureTexture->GetSurfaceLevel(0, &m_rasterCaptureSurface)) || !m_rasterCaptureSurface) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        hr = m_real->CreateTexture(bbDesc.Width, bbDesc.Height, 1, D3DUSAGE_RENDERTARGET, bbDesc.Format,
+                                   D3DPOOL_DEFAULT, &m_remixOutputTexture, nullptr);
+        if (FAILED(hr) || !m_remixOutputTexture ||
+            FAILED(m_remixOutputTexture->GetSurfaceLevel(0, &m_remixOutputSurface)) || !m_remixOutputSurface) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        hr = m_real->CreateVertexBuffer(sizeof(RasterBlendVertex) * 4, 0, kRasterBlendFVF, D3DPOOL_DEFAULT, &m_blendQuadVB, nullptr);
+        if (FAILED(hr) || !m_blendQuadVB) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        RasterBlendVertex* vbData = nullptr;
+        if (FAILED(m_blendQuadVB->Lock(0, 0, reinterpret_cast<void**>(&vbData), 0)) || !vbData) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        vbData[0] = { -0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        vbData[1] = { static_cast<float>(bbDesc.Width) - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f };
+        vbData[2] = { static_cast<float>(bbDesc.Width) - 0.5f, static_cast<float>(bbDesc.Height) - 0.5f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        vbData[3] = { -0.5f, static_cast<float>(bbDesc.Height) - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f };
+        m_blendQuadVB->Unlock();
+        g_rasterBlendResourcesFailed = false;
+        return true;
+    }
+
+    void ExecuteRasterBlendPass() {
+        if (!m_rasterCaptureTexture || !m_remixOutputTexture || !m_blendQuadVB) {
+            return;
+        }
+        DWORD zEnable = FALSE, zWrite = FALSE, alphaBlend = FALSE, alphaTest = FALSE, cullMode = D3DCULL_NONE, lighting = FALSE;
+        m_real->GetRenderState(D3DRS_ZENABLE, &zEnable);
+        m_real->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+        m_real->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend);
+        m_real->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest);
+        m_real->GetRenderState(D3DRS_CULLMODE, &cullMode);
+        m_real->GetRenderState(D3DRS_LIGHTING, &lighting);
+
+        IDirect3DVertexShader9* oldVS = nullptr;
+        IDirect3DPixelShader9* oldPS = nullptr;
+        IDirect3DBaseTexture9* oldT0 = nullptr;
+        IDirect3DBaseTexture9* oldT1 = nullptr;
+        IDirect3DVertexBuffer9* oldVB = nullptr;
+        UINT oldOffset = 0, oldStride = 0;
+        DWORD oldFVF = 0;
+        m_real->GetVertexShader(&oldVS);
+        m_real->GetPixelShader(&oldPS);
+        m_real->GetTexture(0, &oldT0);
+        m_real->GetTexture(1, &oldT1);
+        m_real->GetStreamSource(0, &oldVB, &oldOffset, &oldStride);
+        m_real->GetFVF(&oldFVF);
+
+        m_real->SetVertexShader(nullptr);
+        m_real->SetPixelShader(nullptr);
+        m_real->SetRenderState(D3DRS_ZENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_LIGHTING, FALSE);
+        m_real->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        m_real->SetFVF(kRasterBlendFVF);
+        m_real->SetTexture(0, m_rasterCaptureTexture);
+        m_real->SetTexture(1, m_remixOutputTexture);
+
+        const int blendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+        DWORD tfactor = D3DCOLOR_COLORVALUE(g_config.rasterBlendMixStrength, g_config.rasterBlendMixStrength,
+                                            g_config.rasterBlendMixStrength, g_config.rasterBlendMixStrength);
+        m_real->SetRenderState(D3DRS_TEXTUREFACTOR, tfactor);
+        if (blendMode == RasterBlendMode_Multiply) {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_LERP);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+        } else if (blendMode == RasterBlendMode_Additive) {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_ADD);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TEMP);
+        } else {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_LERP);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        }
+        m_real->SetTextureStageState(3, D3DTSS_COLOROP, D3DTOP_DISABLE);
+
+        m_real->SetStreamSource(0, m_blendQuadVB, 0, sizeof(RasterBlendVertex));
+        m_real->DrawPrimitive(D3DPT_TRIANGLEFAN, 0, 2);
+
+        m_real->SetTexture(0, oldT0);
+        m_real->SetTexture(1, oldT1);
+        m_real->SetStreamSource(0, oldVB, oldOffset, oldStride);
+        m_real->SetFVF(oldFVF);
+        m_real->SetVertexShader(oldVS);
+        m_real->SetPixelShader(oldPS);
+        m_real->SetRenderState(D3DRS_ZENABLE, zEnable);
+        m_real->SetRenderState(D3DRS_ZWRITEENABLE, zWrite);
+        m_real->SetRenderState(D3DRS_ALPHABLENDENABLE, alphaBlend);
+        m_real->SetRenderState(D3DRS_ALPHATESTENABLE, alphaTest);
+        m_real->SetRenderState(D3DRS_CULLMODE, cullMode);
+        m_real->SetRenderState(D3DRS_LIGHTING, lighting);
+
+        if (oldVB) oldVB->Release();
+        if (oldT1) oldT1->Release();
+        if (oldT0) oldT0->Release();
+        if (oldPS) oldPS->Release();
+        if (oldVS) oldVS->Release();
+    }
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
+        if (m_real) {
+            m_real->QueryInterface(__uuidof(IDirect3DDevice9Ex), reinterpret_cast<void**>(&m_realEx));
+        }
         CreateIdentityMatrix(&m_currentView);
         CreateIdentityMatrix(&m_currentProj);
         CreateIdentityMatrix(&m_currentWorld);
+        m_projDetectedFrame = -1;
         m_mgrrUseAutoProjection = g_config.mgrrUseAutoProjectionWhenC4Invalid;
         D3DDEVICE_CREATION_PARAMETERS params = {};
         if (SUCCEEDED(m_real->GetCreationParameters(&params))) {
@@ -2810,29 +5332,63 @@ public:
         if (!m_hwnd) {
             m_hwnd = GetForegroundWindow();
         }
+		
         LogMsg("WrappedD3D9Device created, wrapping device at %p", real);
     }
 
     ~WrappedD3D9Device() {
+        if (m_lastWhiteMaterialApplied && remix_api::g_initialized && remix_api::g_api.SetConfigVariable) {
+            remix_api::g_api.SetConfigVariable("rtx.whiteMaterialModeEnabled", "0");
+            m_lastWhiteMaterialApplied = false;
+        }
+        ReleaseBlendResources();
+        if (m_realEx) {
+            m_realEx->Release();
+            m_realEx = nullptr;
+        }
         LogMsg("WrappedD3D9Device destroyed");
+    }
+
+    void SubmitLightingFromCurrentDraw() {
+        ShaderLightingMetadata meta = BuildLightingMetadataForShader(g_activeVertexShaderKey);
+        g_remixLightingManager.ProcessDrawCall(meta, g_vsConstants, m_currentWorld, m_currentView, m_hasWorld, m_hasView);
     }
 
     void EmitFixedFunctionTransforms() {
         if (!g_config.emitFixedFunctionTransforms) {
             return;
         }
+        if (g_forceFfpTransform) {
+            uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
+            auto it = g_shaderRecords.find(shaderKey);
+            if (it != g_shaderRecords.end() && it->second.isFFPTransform) {
+                const int base = g_manualTransformBaseOverride >= 0 ? g_manualTransformBaseOverride : it->second.transformConstantBase;
+                ShaderConstantState* state = GetShaderState(shaderKey, false);
+                D3DMATRIX m = {};
+                if (state && TryBuildMatrixSnapshot(*state, base, 4, false, &m)) {
+                    m_currentWorld = m;
+                    m_hasWorld = true; m_everHadWorld = true;
+                }
+            }
+        }
+        // Keep strict game profiles deterministic even if generic SetTransform compatibility is enabled.
+        if (g_activeGameProfile == GameProfile_None &&
+            g_config.setTransformBypassProxyWhenGameProvides && g_gameSetTransformAnySeen) {
+            return;
+        }
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR profile is strict: only emit transforms when all three known registers
             // have been captured. Never emit identity/fallback transforms in this mode.
-            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+            if (!(m_everHadWorld && m_everHadView && m_everHadProj)) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "MGR draw skipped: missing matrix/matrices (Proj=%s View=%s World=%s).",
-                         m_hasProj ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasWorld ? "ready" : "missing");
+                         "MGR draw skipped: no valid matrices ever captured (Proj=%s View=%s World=%s).",
+                         m_everHadProj  ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadWorld ? "ready" : "never seen");
                 return;
             }
 
+            // Keep MGR strict and deterministic: WORLD always comes from c16-c19.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
@@ -2840,26 +5396,51 @@ public:
         }
 
         if (g_activeGameProfile == GameProfile_DevilMayCry4) {
-            if (!(m_hasWorld && m_hasView && m_hasProj)) {
+            if (!(m_everHadWorld && m_everHadView && m_everHadProj)) {
                 snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
-                         "DMC4 draw skipped: missing matrix/matrices (World=%s View=%s Proj=%s).",
-                         m_hasWorld ? "ready" : "missing",
-                         m_hasView ? "ready" : "missing",
-                         m_hasProj ? "ready" : "missing");
+                         "DMC4 draw skipped: no valid matrices ever captured (World=%s View=%s Proj=%s).",
+                         m_everHadWorld ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadProj  ? "ready" : "never seen");
                 return;
             }
 
+            // Keep DMC4 strict and deterministic: WORLD always comes from c0-c3.
             m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
             m_real->SetTransform(D3DTS_VIEW, &m_currentView);
             m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
             return;
         }
 
+        if (g_activeGameProfile == GameProfile_Barnyard) {
+            const bool useGameViewProj = g_config.barnyardUseGameSetTransformsForViewProjection;
+            if (!m_everHadWorld || (useGameViewProj && (!m_everHadView || !m_everHadProj))) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard draw skipped: no valid matrices ever captured (World=%s View=%s Proj=%s).",
+                         m_everHadWorld ? "ready" : "never seen",
+                         m_everHadView  ? "ready" : "never seen",
+                         m_everHadProj  ? "ready" : "never seen");
+                return;
+            }
+
+            // Keep Barnyard profile semantics deterministic: WORLD comes from shader constants.
+            m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
+            if (useGameViewProj) {
+                m_real->SetTransform(D3DTS_VIEW, &m_currentView);
+                m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
+            }
+            return;
+        }
+
         bool shouldApplyCustomProjection = false;
-        if (g_config.experimentalCustomProjectionEnabled) {
+        const bool strictMgrProfileActive = (g_activeGameProfile == GameProfile_MetalGearRising);
+
+        if (g_config.experimentalCustomProjectionEnabled && !strictMgrProfileActive) {
             const bool projectionMissing = !m_hasProj;
             const bool projectionOverrideAllowed = g_config.experimentalCustomProjectionOverrideDetectedProjection;
-            const bool mvpBlocksProjection = g_cameraMatrices.hasMVP && !g_config.experimentalCustomProjectionOverrideCombinedMVP;
+            bool hasMvp = false;
+            { std::lock_guard<std::mutex> lock(g_cameraMatricesMutex); hasMvp = g_cameraMatrices.hasMVP; }
+            const bool mvpBlocksProjection = hasMvp && !g_config.experimentalCustomProjectionOverrideCombinedMVP;
             shouldApplyCustomProjection = (projectionMissing || projectionOverrideAllowed) && !mvpBlocksProjection;
         }
 
@@ -2873,7 +5454,8 @@ public:
                                                         &usedAuto, &resolvedAspect,
                                                         &width, &height)) {
                 m_currentProj = customProjection;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = -1;
                 g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
@@ -2896,22 +5478,29 @@ public:
             }
         }
 
-        D3DMATRIX identity = {};
-        CreateIdentityMatrix(&identity);
-        if (!m_hasWorld) m_currentWorld = identity;
-        if (!m_hasView) m_currentView = identity;
-        if (!m_hasProj) m_currentProj = identity;
-        m_real->SetTransform(D3DTS_WORLD, &m_currentWorld);
-        m_real->SetTransform(D3DTS_VIEW, &m_currentView);
-        m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
+        // Only emit slots that have ever had a valid capture.
+        // Never emit identity for uncaptured slots — leave Remix state untouched instead.
+        // Always use last-known-good for stale slots rather than poisoning with identity.
+        if (m_everHadWorld) m_real->SetTransform(D3DTS_WORLD,      &m_currentWorld);
+        if (m_everHadView)  m_real->SetTransform(D3DTS_VIEW,       &m_currentView);
+        if (m_everHadProj)  m_real->SetTransform(D3DTS_PROJECTION, &m_currentProj);
     }
 
 
     // IUnknown
     HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObj) override {
-        HRESULT hr = m_real->QueryInterface(riid, ppvObj);
-        // Don't wrap QueryInterface results - could cause issues
-        return hr;
+        if (!ppvObj) return E_POINTER;
+        if (riid == IID_IUnknown || riid == __uuidof(IDirect3DDevice9)) {
+            *ppvObj = static_cast<IDirect3DDevice9*>(this);
+            AddRef();
+            return S_OK;
+        }
+        if (riid == __uuidof(IDirect3DDevice9Ex) && m_realEx) {
+            *ppvObj = static_cast<IDirect3DDevice9Ex*>(this);
+            AddRef();
+            return S_OK;
+        }
+        return m_real->QueryInterface(riid, ppvObj);
     }
 
     ULONG STDMETHODCALLTYPE AddRef() override {
@@ -2934,13 +5523,25 @@ public:
         UINT Vector4fCount) override
     {
         uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentVertexShader);
+        if (g_constantUploadRecordingEnabled) {
+            RecordConstantUpload(ConstantUploadStage_Vertex, shaderKey, StartRegister, Vector4fCount);
+        }
+        auto recIt = g_shaderRecords.find(shaderKey);
+        if (recIt != g_shaderRecords.end()) {
+            for (UINT i = 0; i < Vector4fCount; ++i) {
+                UINT reg = StartRegister + i;
+                if (reg >= kMaxConstantRegisters) break;
+                recIt->second.constantUsage[reg] = true;
+            }
+        }
         ShaderConstantState* state = GetShaderState(shaderKey, true);
         const bool profileIsMgr = g_activeGameProfile == GameProfile_MetalGearRising;
+        const bool profileIsBarnyard = g_activeGameProfile == GameProfile_Barnyard;
 
         std::vector<float> overrideScratch;
         const float* effectiveConstantData = pConstantData;
         // Keep MGR profile extraction isolated from manual/override paths.
-        if (!profileIsMgr && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
+        if (!profileIsMgr && !profileIsBarnyard && BuildOverriddenConstants(*state, StartRegister, Vector4fCount, pConstantData, overrideScratch)) {
             effectiveConstantData = overrideScratch.data();
         }
 
@@ -2960,6 +5561,13 @@ public:
             memcpy(state->constants[reg], effectiveConstantData + i * 4, sizeof(state->constants[reg]));
             state->valid[reg] = true;
             UpdateVariance(*state, static_cast<int>(reg), effectiveConstantData + i * 4);
+
+            GlobalVertexRegisterState& globalState = g_allVertexRegisters[reg];
+            memcpy(globalState.value, effectiveConstantData + i * 4, sizeof(globalState.value));
+            globalState.valid = true;
+            globalState.lastUploadSerial = g_constantUploadSerial;
+            globalState.lastShaderKey = shaderKey;
+            globalState.lastShaderHash = GetShaderHashForKey(shaderKey);
         }
         if (constantsChanged) {
             state->lastChangeSerial = ++g_constantChangeSerial;
@@ -2969,7 +5577,7 @@ public:
         bool slotResolvedByOverride[MatrixSlot_Count] = {};
         bool slotResolvedStructurally[MatrixSlot_Count] = {};
 
-        if (!profileIsMgr && shaderKey != 0) {
+        if (!profileIsMgr && !profileIsBarnyard && shaderKey != 0) {
             for (int slot = 0; slot < MatrixSlot_Count; slot++) {
                 const ManualMatrixBinding& binding = g_manualBindings[slot];
                 if (!binding.enabled || binding.shaderKey != shaderKey) {
@@ -2982,15 +5590,18 @@ public:
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = manualMat;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = manualMat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
+                m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = manualMat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = binding.baseRegister;
                     g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
@@ -2998,6 +5609,10 @@ public:
                     StoreProjectionMatrix(m_currentProj, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_MVP) {
                     StoreMVPMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_VP) {
+                    StoreVPMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
+                } else if (slot == MatrixSlot_WV) {
+                    StoreWVMatrix(manualMat, shaderKey, binding.baseRegister, binding.rows, false, true);
                 }
             }
         }
@@ -3033,7 +5648,8 @@ public:
                 g_profileCoreRegistersSeen[0] = true;
                 g_mgrProjectionRegisterValid = IsTypicalProjectionMatrix(mat);
                 m_currentProj = mat;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
                 g_mgrProjCapturedThisFrame = true;
                 if (g_mgrProjectionRegisterValid) {
                     g_projectionDetectedByNumericStructure = false;
@@ -3070,12 +5686,15 @@ public:
                     ProjectionAnalysis generatedProjectionInfo = {};
                     D3DMATRIX generatedProjection = {};
                     if (TryExtractProjectionFromCombined(mat,
+                                                         nullptr,
+                                                         false,
                                                          &generatedProjectionInfo,
                                                          &generatedProjection,
-                                                         g_config.combinedMVPForceDecomposition)) {
+                                                         true)) {
                         resolvedProjection = generatedProjection;
                         m_currentProj = generatedProjection;
-                        m_hasProj = true;
+                        m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
                         g_mgrProjCapturedThisFrame = true;
                         g_projectionDetectedByNumericStructure = true;
                         g_projectionDetectedRegister = 8;
@@ -3090,10 +5709,11 @@ public:
                 if (haveProjectionForViewDerivation) {
                     D3DMATRIX projectionInv = {};
                     if (InvertMatrix4x4Deterministic(resolvedProjection, &projectionInv, nullptr)) {
-                        D3DMATRIX derivedView = MultiplyMatrix(projectionInv, mat);
+                        D3DMATRIX derivedView = MultiplyMatrix(mat, projectionInv);
                         OrthonormalizeViewMatrix(&derivedView);
                         m_currentView = derivedView;
-                        m_hasView = true;
+                        m_hasView = true; m_everHadView = true;
+                m_viewLastFrame = g_frameCount;
                         g_mgrViewCapturedThisFrame = true;
                         g_profileViewDerivedFromInverse = true;
                         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
@@ -3114,7 +5734,8 @@ public:
 
             if (tryExtractMgrMatrix(16, &mat)) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
                 g_mgrWorldCapturedForDraw = true;
                 g_profileCoreRegistersSeen[2] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, 16, 4, false, true,
@@ -3124,8 +5745,89 @@ public:
             return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
         }
 
+        if (profileIsBarnyard) {
+            bool worldCaptured = false;
+            D3DMATRIX mat = {};
+
+            if (g_barnyardForceWorldFromC0 &&
+                TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                 0, 4, false, &mat)) {
+                m_currentWorld = mat;
+                m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
+                worldCaptured = true;
+                g_profileCoreRegistersSeen[2] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, 0, 4, false, true,
+                                 "Barnyard profile forced world (c0-c3)");
+            }
+
+            if (!worldCaptured && g_config.worldMatrixRegister >= 0 &&
+                TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                 g_config.worldMatrixRegister, 4, false, &mat)) {
+                m_currentWorld = mat;
+                m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
+                worldCaptured = true;
+                g_profileCoreRegistersSeen[2] = true;
+                StoreWorldMatrix(m_currentWorld, shaderKey, g_config.worldMatrixRegister, 4, false, true,
+                                 "Barnyard profile world (explicit register override)");
+            }
+
+            if (!worldCaptured && g_config.autoDetectMatrices && effectiveConstantData && Vector4fCount >= 3) {
+                for (UINT rows : {4u, 3u}) {
+                    if (Vector4fCount < rows || worldCaptured) {
+                        continue;
+                    }
+                    for (UINT offset = 0; offset + rows <= Vector4fCount; ++offset) {
+                        UINT baseReg = StartRegister + offset;
+                        D3DMATRIX candidate = {};
+                        if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData + offset * 4, baseReg, rows,
+                                                              static_cast<int>(baseReg), static_cast<int>(rows),
+                                                              false, &candidate)) {
+                            continue;
+                        }
+
+                        MatrixClassification cls = ClassifyMatrixDeterministic(candidate, static_cast<int>(rows),
+                                                                               Vector4fCount, StartRegister, baseReg);
+                        bool transposed = false;
+                        if (cls == MatrixClass_None && g_probeTransposedLayouts) {
+                            D3DMATRIX t = TransposeMatrix(candidate);
+                            cls = ClassifyMatrixDeterministic(t, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+                            if (cls != MatrixClass_None) {
+                                candidate = t;
+                                transposed = true;
+                            }
+                        }
+
+                        if (cls == MatrixClass_World) {
+                            m_currentWorld = candidate;
+                            m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
+                            worldCaptured = true;
+                            g_profileCoreRegistersSeen[2] = true;
+                            StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg),
+                                             static_cast<int>(rows), transposed, false,
+                                             "Barnyard profile structural world");
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (worldCaptured) {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard profile active: forwarding WORLD only; VIEW/PROJECTION SetTransform blocked.");
+            } else {
+                snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                         "Barnyard profile active: waiting for world matrix in shader constants.");
+            }
+
+            g_profileDisableStructuralDetection = true;
+            return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
+        }
+
         const bool profileIsDmc4 = g_activeGameProfile == GameProfile_DevilMayCry4;
-        const bool profileActive = profileIsMgr || profileIsDmc4;
+        const bool profileActive = profileIsMgr || profileIsDmc4 || profileIsBarnyard;
 
         auto tryExtractProfileMatrix = [&](int baseRegister, D3DMATRIX* outMat) -> bool {
             if (!outMat || !effectiveConstantData || baseRegister < 0) {
@@ -3141,12 +5843,11 @@ public:
 
             if (tryExtractProfileMatrix(g_profileLayout.combinedMvpBase, &mat)) {
                 anyCaptured = true;
-                g_cameraMatrices.mvp = mat;
-                g_cameraMatrices.hasMVP = true;
-                UpdateMatrixSource(MatrixSlot_MVP, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
-                                   "DevilMayCry4 profile combined MVP (c0-c3)");
+                StoreMVPMatrix(mat, shaderKey, g_profileLayout.combinedMvpBase, 4, false, true,
+                               "DevilMayCry4 profile combined MVP (c0-c3)");
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_World] = true;
                 g_profileCoreRegistersSeen[0] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, g_profileLayout.worldBase, 4, false, true,
@@ -3156,7 +5857,8 @@ public:
             if (tryExtractProfileMatrix(g_profileLayout.viewInverseBase, &mat)) {
                 anyCaptured = true;
                 m_currentView = mat;
-                m_hasView = true;
+                m_hasView = true; m_everHadView = true;
+                m_viewLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_View] = true;
                 g_profileCoreRegistersSeen[1] = true;
                 g_profileViewDerivedFromInverse = false;
@@ -3167,7 +5869,8 @@ public:
             if (tryExtractProfileMatrix(g_profileLayout.projectionBase, &mat)) {
                 anyCaptured = true;
                 m_currentProj = mat;
-                m_hasProj = true;
+                m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
                 slotResolvedByOverride[MatrixSlot_Projection] = true;
                 g_projectionDetectedByNumericStructure = false;
                 g_projectionDetectedRegister = g_profileLayout.projectionBase;
@@ -3209,23 +5912,35 @@ public:
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = mat;
-                    m_hasWorld = true;
+                    m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
                     StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                      "explicit register override");
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = mat;
-                    m_hasView = true;
+                    m_hasView = true; m_everHadView = true;
+                m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                     "explicit register override");
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = mat;
-                    m_hasProj = true;
+                    m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
                     g_projectionDetectedByNumericStructure = false;
                     g_projectionDetectedRegister = configuredRegister;
                     g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
                     g_projectionDetectedFovRadians = 0.0f;
                     StoreProjectionMatrix(m_currentProj, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
                                           "explicit register override");
+                } else if (slot == MatrixSlot_MVP) {
+                    StoreMVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                   "explicit register override");
+                } else if (slot == MatrixSlot_VP) {
+                    StoreVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                  "explicit register override");
+                } else if (slot == MatrixSlot_WV) {
+                    StoreWVMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                                  "explicit register override");
                 }
                 return;
             }
@@ -3234,138 +5949,134 @@ public:
         tryExplicitRegisterOverride(MatrixSlot_World, g_config.worldMatrixRegister);
         tryExplicitRegisterOverride(MatrixSlot_View, g_config.viewMatrixRegister);
         tryExplicitRegisterOverride(MatrixSlot_Projection, g_config.projMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_MVP, g_config.mvpMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_WV, g_config.mvMatrixRegister);
+        tryExplicitRegisterOverride(MatrixSlot_VP, g_config.vpMatrixRegister);
 
-        auto tryHandleCombinedMVP = [&](const D3DMATRIX& combinedMvp, UINT baseReg, int rows, bool transposed) {
-            StoreMVPMatrix(combinedMvp, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                           "deterministic structural combined MVP", static_cast<int>(baseReg));
-            g_combinedMvpDebug.registerBase = static_cast<int>(baseReg);
-            g_combinedMvpDebug.succeeded = false;
-            g_combinedMvpDebug.fovRadians = 0.0f;
-            g_combinedMvpDebug.handedness = ProjectionHandedness_Unknown;
-
-            if (!g_config.enableCombinedMVP) {
-                g_combinedMvpDebug.strategy = CombinedMVPStrategy_Disabled;
-                return;
-            }
-            if (m_hasWorld && m_hasView && m_hasProj) {
-                g_combinedMvpDebug.strategy = CombinedMVPStrategy_SkippedFullWVP;
-                return;
-            }
-
-            const bool worldAvailable = m_hasWorld;
-            CombinedMVPStrategy strategy = CombinedMVPStrategy_None;
-            if (worldAvailable) {
-                strategy = CombinedMVPStrategy_WorldAndMVP;
-            } else if (g_config.combinedMVPRequireWorld) {
-                strategy = CombinedMVPStrategy_WorldRequiredNoWorld;
-            } else if (g_config.combinedMVPAssumeIdentityWorld) {
-                strategy = CombinedMVPStrategy_MVPOnly;
-            } else {
-                strategy = CombinedMVPStrategy_Failed;
-            }
-            g_combinedMvpDebug.strategy = strategy;
-
-            if (strategy == CombinedMVPStrategy_WorldRequiredNoWorld) {
-                if (g_config.combinedMVPLogDecomposition) {
-                    LogMsg("Combined MVP ignored at c%d-c%d: world required but missing.",
-                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1);
-                }
-                return;
-            }
-
-            D3DMATRIX decompWorld = {};
-            D3DMATRIX decompView = {};
-            D3DMATRIX decompProj = {};
-            ProjectionAnalysis projectionInfo = {};
-            if (!TryDecomposeCombinedMVP(combinedMvp,
-                                         worldAvailable ? &m_currentWorld : nullptr,
-                                         worldAvailable,
-                                         &decompWorld,
-                                         &decompView,
-                                         &decompProj,
-                                         &projectionInfo)) {
-                g_combinedMvpDebug.strategy = CombinedMVPStrategy_Failed;
-                if (g_config.combinedMVPLogDecomposition) {
-                    LogMsg("Combined MVP decomposition failed at c%d-c%d.",
-                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1);
-                }
-                return;
-            }
-
-            m_currentWorld = decompWorld;
-            m_currentView = decompView;
-            m_currentProj = decompProj;
-            m_hasWorld = true;
-            m_hasView = true;
-            m_hasProj = true;
-            slotResolvedStructurally[MatrixSlot_World] = true;
-            slotResolvedStructurally[MatrixSlot_View] = true;
-            slotResolvedStructurally[MatrixSlot_Projection] = true;
-            g_projectionDetectedByNumericStructure = true;
-            g_projectionDetectedFovRadians = projectionInfo.fovRadians;
-            g_projectionDetectedRegister = static_cast<int>(baseReg);
-            g_projectionDetectedHandedness = projectionInfo.handedness;
-
-            StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                             "combined MVP decomposition world", static_cast<int>(baseReg));
-            StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                            "combined MVP decomposition view", static_cast<int>(baseReg));
-            StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false,
-                                  "combined MVP decomposition projection", static_cast<int>(baseReg));
-
-            g_combinedMvpDebug.succeeded = true;
-            g_combinedMvpDebug.fovRadians = projectionInfo.fovRadians;
-            g_combinedMvpDebug.handedness = projectionInfo.handedness;
-            if (g_config.combinedMVPLogDecomposition) {
-                LogMsg("Combined MVP decomposition success at c%d-c%d using %s, FOV=%.2f deg, handedness=%s.",
-                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
-                       CombinedMVPStrategyLabel(strategy),
-                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
-                       ProjectionHandednessLabel(projectionInfo.handedness));
-            }
-        };
+        bool suppressViewFromUpload = false;
+        bool suppressWorldFromUpload = false;
 
         auto updateFromClassification = [&](D3DMATRIX mat, UINT baseReg, int rows, bool transposed) {
             MatrixClassification cls = ClassifyMatrixDeterministic(mat, rows, Vector4fCount, StartRegister, baseReg);
 
-            if (cls == MatrixClass_Projection && g_config.projMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_Projection]) {
+            if (cls == MatrixClass_Projection &&
+                g_config.projMatrixRegister < 0 &&
+                !slotResolvedByOverride[MatrixSlot_Projection] &&
+                !slotResolvedStructurally[MatrixSlot_Projection]) {
                 ProjectionAnalysis projectionInfo = {};
-                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) {
-                    return;
+                if (!AnalyzeProjectionMatrixNumeric(mat, &projectionInfo)) return;
+                if (projectionInfo.fovRadians < g_config.minFOV ||
+                    projectionInfo.fovRadians > g_config.maxFOV) return;
+
+                const bool sameSource =
+                    (m_projLockedShader == 0) ||
+                    (shaderKey == m_projLockedShader &&
+                     static_cast<int>(baseReg) == m_projLockedRegister);
+                if (sameSource) {
+                    m_projLockedShader = shaderKey;
+                    m_projLockedRegister = static_cast<int>(baseReg);
+                    m_currentProj = mat;
+                    m_hasProj = true; m_everHadProj = true;
+                    m_projLastFrame = g_frameCount;
+                    m_projDetectedFrame = g_frameCount;
+                    slotResolvedStructurally[MatrixSlot_Projection] = true;
+                    g_projectionDetectedByNumericStructure = true;
+                    g_projectionDetectedFovRadians = projectionInfo.fovRadians;
+                    g_projectionDetectedRegister = static_cast<int>(baseReg);
+                    g_projectionDetectedHandedness = projectionInfo.handedness;
+                    StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg),
+                                          rows, transposed, false,
+                                          "deterministic structural projection");
+                    LogMsg("Projection accepted: c%d-c%d rows=%d fov=%.2f deg (%s)",
+                           static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1, rows,
+                           projectionInfo.fovRadians * 180.0f / 3.14159265f,
+                           ProjectionHandednessLabel(projectionInfo.handedness));
                 }
-                m_currentProj = mat;
-                m_hasProj = true;
-                slotResolvedStructurally[MatrixSlot_Projection] = true;
-                g_projectionDetectedByNumericStructure = true;
-                g_projectionDetectedFovRadians = projectionInfo.fovRadians;
-                g_projectionDetectedRegister = static_cast<int>(baseReg);
-                g_projectionDetectedHandedness = projectionInfo.handedness;
-                StoreProjectionMatrix(m_currentProj, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural projection");
-                LogMsg("Projection accepted via numeric structure: c%d-c%d rows=%d transpose=%d fov=%.2f deg (%s)",
-                       static_cast<int>(baseReg), static_cast<int>(baseReg) + rows - 1,
-                       rows, transposed ? 1 : 0,
-                       projectionInfo.fovRadians * 180.0f / 3.14159265f,
-                       ProjectionHandednessLabel(projectionInfo.handedness));
-            } else if (cls == MatrixClass_View && g_config.viewMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_View]) {
-                m_currentView = mat;
-                m_hasView = true;
-                slotResolvedStructurally[MatrixSlot_View] = true;
-                StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural view");
-            } else if (cls == MatrixClass_World && g_config.worldMatrixRegister < 0 && !slotResolvedByOverride[MatrixSlot_World]) {
+            } else if (cls == MatrixClass_View &&
+                       !suppressViewFromUpload &&
+                       g_config.viewMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_View] &&
+                       !slotResolvedStructurally[MatrixSlot_View]) {
+                const bool sameSource =
+                    (m_viewLockedShader == 0) ||
+                    (shaderKey == m_viewLockedShader &&
+                     static_cast<int>(baseReg) == m_viewLockedRegister);
+                if (sameSource) {
+                    if (m_hasProj && m_projDetectedFrame == g_frameCount &&
+                        !CrossValidateViewAgainstProjection(mat, m_currentProj)) {
+                        // Column norms of candidateView * P do not match column norms of P.
+                        // This is WV, VP, or some other combined form — not a pure view matrix.
+                        // Do not mark slotResolvedStructurally so detection can continue.
+                        return;
+                    }
+                    m_viewLockedShader = shaderKey;
+                    m_viewLockedRegister = static_cast<int>(baseReg);
+                    m_currentView = mat;
+                    m_hasView = true; m_everHadView = true;
+                    m_viewLastFrame = g_frameCount;
+                    slotResolvedStructurally[MatrixSlot_View] = true;
+                    StoreViewMatrix(m_currentView, shaderKey, static_cast<int>(baseReg),
+                                    rows, transposed, false,
+                                    "deterministic structural view");
+                }
+            } else if (cls == MatrixClass_World &&
+                       !suppressWorldFromUpload &&
+                       g_config.worldMatrixRegister < 0 &&
+                       !slotResolvedByOverride[MatrixSlot_World] &&
+                       !slotResolvedStructurally[MatrixSlot_World]) {
                 m_currentWorld = mat;
-                m_hasWorld = true;
+                m_hasWorld = true; m_everHadWorld = true;
+                m_worldLastFrame = g_frameCount;
                 slotResolvedStructurally[MatrixSlot_World] = true;
                 StoreWorldMatrix(m_currentWorld, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural world");
             } else if (cls == MatrixClass_CombinedPerspective &&
                        g_config.worldMatrixRegister < 0 && g_config.viewMatrixRegister < 0 && g_config.projMatrixRegister < 0 &&
                        !slotResolvedByOverride[MatrixSlot_World] && !slotResolvedByOverride[MatrixSlot_View] && !slotResolvedByOverride[MatrixSlot_Projection] &&
+                       !slotResolvedStructurally[MatrixSlot_World] && !slotResolvedStructurally[MatrixSlot_View] && !slotResolvedStructurally[MatrixSlot_Projection] &&
                        rows == 4) {
-                tryHandleCombinedMVP(mat, baseReg, rows, transposed);
+                StoreMVPMatrix(mat, shaderKey, static_cast<int>(baseReg), rows, transposed, false, "deterministic structural combined MVP", static_cast<int>(baseReg));
             }
         };
 
         g_profileDisableStructuralDetection = false;
         const bool allowStructuralDetection = !profileActive;
+
+        D3DMATRIX knownCombinedVp = {};
+        D3DMATRIX knownCombinedWv = {};
+        D3DMATRIX knownCombinedMvp = {};
+        bool hasKnownCombinedVp = false;
+        bool hasKnownCombinedWv = false;
+        bool hasKnownCombinedMvp = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+            knownCombinedVp = g_cameraMatrices.vp;
+            knownCombinedWv = g_cameraMatrices.wv;
+            knownCombinedMvp = g_cameraMatrices.mvp;
+            hasKnownCombinedVp = g_cameraMatrices.hasVP;
+            hasKnownCombinedWv = g_cameraMatrices.hasWV;
+            hasKnownCombinedMvp = g_cameraMatrices.hasMVP;
+        }
+
+        if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 12) {
+            if (CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 4u, MatrixClass_View) > 2) {
+                suppressViewFromUpload = true;
+            }
+            if (CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 4u, MatrixClass_World) > 2) {
+                suppressWorldFromUpload = true;
+            }
+            if (!suppressViewFromUpload &&
+                CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 3u, MatrixClass_View) > 2) {
+                suppressViewFromUpload = true;
+            }
+            if (!suppressWorldFromUpload &&
+                CountStridedCandidates(effectiveConstantData, StartRegister,
+                                      Vector4fCount, 3u, MatrixClass_World) > 2) {
+                suppressWorldFromUpload = true;
+            }
+        }
 
         bool anyStructuralMatch = false;
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 3) {
@@ -3394,21 +6105,77 @@ public:
                     }
 
                     MatrixClassification finalClass = ClassifyMatrixDeterministic(mat, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
-                    if (finalClass == MatrixClass_None && g_probeInverseView && rows == 4u) {
-                        D3DMATRIX inverseView = InvertSimpleRigidView(mat);
-                        MatrixClassification inverseClass = ClassifyMatrixDeterministic(inverseView, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
-                        if (inverseClass == MatrixClass_View) {
-                            mat = inverseView;
-                            finalClass = inverseClass;
+                    if (rows == 3u &&
+                        (finalClass == MatrixClass_View || finalClass == MatrixClass_World) &&
+                        IsThreeRowPrefixOfPerspectiveMatrix(effectiveConstantData,
+                                                            StartRegister,
+                                                            Vector4fCount,
+                                                            baseReg,
+                                                            transposed)) {
+                        finalClass = MatrixClass_None;
+                    }
+                    if (g_probeInverseView && rows == 4u &&
+                        (finalClass == MatrixClass_None || finalClass == MatrixClass_View)) {
+                        const float row0Len = sqrtf(Dot3(mat._11, mat._12, mat._13, mat._11, mat._12, mat._13));
+                        const float row1Len = sqrtf(Dot3(mat._21, mat._22, mat._23, mat._21, mat._22, mat._23));
+                        const float row2Len = sqrtf(Dot3(mat._31, mat._32, mat._33, mat._31, mat._32, mat._33));
+                        const bool orthonormal =
+                            fabsf(row0Len - 1.0f) < 0.05f &&
+                            fabsf(row1Len - 1.0f) < 0.05f &&
+                            fabsf(row2Len - 1.0f) < 0.05f &&
+                            fabsf(Dot3(mat._11, mat._12, mat._13, mat._21, mat._22, mat._23)) < 0.05f &&
+                            fabsf(Dot3(mat._11, mat._12, mat._13, mat._31, mat._32, mat._33)) < 0.05f &&
+                            fabsf(Dot3(mat._21, mat._22, mat._23, mat._31, mat._32, mat._33)) < 0.05f;
+                        if (orthonormal) {
+                            const D3DMATRIX originalMat = mat;
+                            const D3DMATRIX invCandidate = InvertSimpleRigidView(mat);
+                            MatrixClassification inverseClass = ClassifyMatrixDeterministic(invCandidate, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+
+                            if (finalClass == MatrixClass_None && inverseClass == MatrixClass_View) {
+                                mat = invCandidate;
+                                finalClass = inverseClass;
+                            }
+
+                            if (finalClass == MatrixClass_View) {
+                                const ViewCandidateConsistency viewConsistency = ResolveViewInverseConsistency(
+                                    originalMat,
+                                    invCandidate,
+                                    &m_currentProj,
+                                    m_hasProj,
+                                    &m_currentWorld,
+                                    m_hasWorld,
+                                    &knownCombinedVp,
+                                    hasKnownCombinedVp,
+                                    &knownCombinedWv,
+                                    hasKnownCombinedWv,
+                                    &knownCombinedMvp,
+                                    hasKnownCombinedMvp);
+                                if (viewConsistency == ViewCandidateConsistency_Inverse) {
+                                    mat = invCandidate;
+                                    LogMsg("Structural view disambiguation: c%d prefers inverse candidate using composition consistency",
+                                           static_cast<int>(baseReg));
+                                } else if (viewConsistency == ViewCandidateConsistency_Ambiguous ||
+                                           viewConsistency == ViewCandidateConsistency_None) {
+                                    LogMsg("Structural view disambiguation: c%d ambiguous/no consistency signal; keeping classified candidate",
+                                           static_cast<int>(baseReg));
+                                }
+                            }
                         }
                     }
                     if (finalClass != MatrixClass_None) {
                         anyStructuralMatch = true;
                         updateFromClassification(mat, baseReg, static_cast<int>(rows), transposed);
                     }
+
+                    const bool allSlotsResolved =
+                        (slotResolvedStructurally[MatrixSlot_View] || slotResolvedByOverride[MatrixSlot_View] || g_config.viewMatrixRegister >= 0) &&
+                        (slotResolvedStructurally[MatrixSlot_Projection] || slotResolvedByOverride[MatrixSlot_Projection] || g_config.projMatrixRegister >= 0) &&
+                        (slotResolvedStructurally[MatrixSlot_World] || slotResolvedByOverride[MatrixSlot_World] || g_config.worldMatrixRegister >= 0);
+                    if (allSlotsResolved) goto done_scanning;
                 }
             }
         }
+        done_scanning:
 
         if (g_config.logAllConstants && m_constantLogThrottle == 0 && Vector4fCount >= 4) {
             LogMsg("SetVertexShaderConstantF: c%d-%d (%d vectors)",
@@ -3421,6 +6188,55 @@ public:
             }
         }
 
+        D3DMATRIX combinedMvp = {};
+        D3DMATRIX combinedMv = {};
+        D3DMATRIX combinedVp = {};
+        bool hasMvp = false;
+        bool hasMv = false;
+        bool hasVp = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+            combinedMvp = g_cameraMatrices.mvp;
+            combinedMv = g_cameraMatrices.wv;
+            combinedVp = g_cameraMatrices.vp;
+            hasMvp = g_cameraMatrices.hasMVP;
+            hasMv = g_cameraMatrices.hasWV;
+            hasVp = g_cameraMatrices.hasVP;
+        }
+
+        D3DMATRIX generatedProjection = {};
+        bool hasGeneratedProjection = false;
+        if (g_config.allowGeneratedProjectionForVPDecomposition) {
+            hasGeneratedProjection = BuildExperimentalCustomProjectionMatrix(m_real, m_hwnd, &generatedProjection, nullptr, nullptr, nullptr, nullptr);
+        }
+
+        TryDecomposeCombinedMatricesDeterministic(&m_currentWorld, &m_hasWorld,
+                                                  &m_currentView, &m_hasView,
+                                                  &m_currentProj, &m_hasProj,
+                                                  &combinedMvp, hasMvp,
+                                                  &combinedMv, hasMv,
+                                                  &combinedVp, hasVp,
+                                                  &generatedProjection, hasGeneratedProjection);
+
+        if (g_combinedDecompDebug.solvedWorld) {
+            m_everHadWorld = true;
+            m_worldLastFrame = g_frameCount;
+            StoreWorldMatrix(m_currentWorld, shaderKey, -1, 4, false, false,
+                             "deterministic combined decomposition");
+        }
+        if (g_combinedDecompDebug.solvedView) {
+            m_everHadView = true;
+            m_viewLastFrame = g_frameCount;
+            StoreViewMatrix(m_currentView, shaderKey, -1, 4, false, false,
+                            "deterministic combined decomposition");
+        }
+        if (g_combinedDecompDebug.solvedProjection) {
+            m_everHadProj = true;
+            m_projLastFrame = g_frameCount;
+            StoreProjectionMatrix(m_currentProj, shaderKey, -1, 4, false, false,
+                                  "deterministic combined decomposition");
+        }
+
         return m_real->SetVertexShaderConstantF(StartRegister, effectiveConstantData, Vector4fCount);
     }
 
@@ -3428,6 +6244,17 @@ public:
     HRESULT STDMETHODCALLTYPE Present(const RECT* pSourceRect, const RECT* pDestRect,
                                        HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) override {
         g_frameCount++;
+
+        // Reset per-frame source locks. Locks set during SetVertexShaderConstantF calls
+        // this frame will be validated against these — after Present they reset for the
+        // next frame. This ensures correct behavior regardless of BeginScene call count.
+        if (g_activeGameProfile == GameProfile_None) {
+            m_viewLockedShader = 0;
+            m_viewLockedRegister = -1;
+            m_projLockedShader = 0;
+            m_projLockedRegister = -1;
+        }
+
         UpdateFrameTimeStats();
         // Throttle constant logging to every 60 frames
         if (g_config.logAllConstants) {
@@ -3456,15 +6283,74 @@ public:
             ImGui::GetIO().MouseDrawCursor = g_showImGui;
         }
         g_imguiMgrrUseAutoProjection = m_mgrrUseAutoProjection;
-        RenderImGuiOverlay();
+        g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
+        RenderImGuiOverlay(m_real);
         m_mgrrUseAutoProjection = g_imguiMgrrUseAutoProjection;
+        g_config.barnyardUseGameSetTransformsForViewProjection = g_imguiBarnyardUseGameSetTransformsForViewProjection;
         if (g_requestManualEmit) {
             EmitFixedFunctionTransforms();
             g_requestManualEmit = false;
-            snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
-                     "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
+            if (g_activeGameProfile == GameProfile_Barnyard) {
+                snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                         g_config.barnyardUseGameSetTransformsForViewProjection
+                             ? "Sent cached World/View/Projection matrices to RTX Remix via SetTransform()."
+                             : "Sent cached World matrix to RTX Remix via SetTransform().");
+            } else {
+                snprintf(g_manualEmitStatus, sizeof(g_manualEmitStatus),
+                         "Sent cached World/View/Projection matrices to RTX Remix via SetTransform().");
+            }
         }
 
+        if (m_remixFrameOpen) {
+            g_remixLightingManager.EndFrame();
+            {
+                CameraState cam = {};
+                if (m_everHadView) {
+                    D3DMATRIX vi = InvertSimpleRigidView(m_currentView);
+                    cam.valid = true;
+                    cam.row0[0] = vi._11; cam.row0[1] = vi._12; cam.row0[2] = vi._13;
+                    cam.row1[0] = vi._21; cam.row1[1] = vi._22; cam.row1[2] = vi._23;
+                    cam.row2[0] = vi._31; cam.row2[1] = vi._32; cam.row2[2] = vi._33;
+                    cam.position[0] = vi._41;
+                    cam.position[1] = vi._42;
+                    cam.position[2] = vi._43;
+                }
+                g_customLightsManager.EndFrame(cam);
+            }
+            m_remixFrameOpen = false;
+        }
+
+        if (m_lastBlendEnabledState && !g_config.rasterBlendEnabled) {
+            m_blendResourceCreationFailed = false;
+            g_rasterBlendResourcesFailed = false;
+            g_rasterBlendLastRasterCapture = false;
+            g_rasterBlendLastRemixCapture = false;
+        }
+        m_lastBlendEnabledState = g_config.rasterBlendEnabled;
+
+        if (remix_api::g_initialized && remix_api::g_api.SetConfigVariable) {
+            const bool desiredWhiteMode = g_config.rasterBlendEnabled && g_config.rasterBlendWhiteMaterials;
+            if (desiredWhiteMode != m_lastWhiteMaterialApplied) {
+                remix_api::g_api.SetConfigVariable("rtx.whiteMaterialModeEnabled", desiredWhiteMode ? "1" : "0");
+                m_lastWhiteMaterialApplied = desiredWhiteMode;
+            }
+        }
+
+        m_lastRemixCaptureSucceeded = false;
+        if (g_config.rasterBlendEnabled && remix_api::g_initialized && EnsureBlendResources() &&
+            remix_api::g_api.dxvk_CopyRenderingOutput) {
+            const remixapi_ErrorCode copyResult = remix_api::g_api.dxvk_CopyRenderingOutput(
+                m_remixOutputSurface, REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR);
+            m_lastRemixCaptureSucceeded = (copyResult == REMIXAPI_ERROR_CODE_SUCCESS);
+            g_rasterBlendLastRemixCapture = m_lastRemixCaptureSucceeded;
+            if (m_lastRemixCaptureSucceeded) {
+                ExecuteRasterBlendPass();
+            }
+        } else {
+            g_rasterBlendLastRemixCapture = false;
+        }
+
+        m_rasterCaptureTakenThisFrame = false;
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     }
 
@@ -3483,8 +6369,10 @@ public:
     HRESULT STDMETHODCALLTYPE GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) override { return m_real->GetSwapChain(iSwapChain, pSwapChain); }
     UINT STDMETHODCALLTYPE GetNumberOfSwapChains() override { return m_real->GetNumberOfSwapChains(); }
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
+        ReleaseBlendResources();
         if (g_imguiInitialized) {
             ImGui_ImplDX9_InvalidateDeviceObjects();
+            // Do NOT call ImGui_ImplWin32_Shutdown here.
         }
         HRESULT hr = m_real->Reset(pPresentationParameters);
         if (SUCCEEDED(hr) && g_imguiInitialized) {
@@ -3516,7 +6404,7 @@ public:
     HRESULT STDMETHODCALLTYPE SetDepthStencilSurface(IDirect3DSurface9* pNewZStencil) override { return m_real->SetDepthStencilSurface(pNewZStencil); }
     HRESULT STDMETHODCALLTYPE GetDepthStencilSurface(IDirect3DSurface9** ppZStencilSurface) override { return m_real->GetDepthStencilSurface(ppZStencilSurface); }
     HRESULT STDMETHODCALLTYPE BeginScene() override {
-        g_combinedMvpDebug = {};
+        g_combinedDecompDebug = {};
         if (g_activeGameProfile == GameProfile_MetalGearRising) {
             // MGR frame lifecycle: keep projection/view persistent across draws and frames,
             // but require a fresh world upload for each frame.
@@ -3526,12 +6414,149 @@ public:
             g_mgrProjCapturedThisFrame = false;
             g_mgrViewCapturedThisFrame = false;
             g_mgrProjectionRegisterValid = false;
+        } else if (g_activeGameProfile == GameProfile_None) {
+            m_viewLockedShader = 0;
+            m_viewLockedRegister = -1;
+            m_projLockedShader = 0;
+            m_projLockedRegister = -1;
         }
+        if (!m_remixFrameOpen) {
+            g_remixLightingManager.BeginFrame();
+			g_customLightsManager.BeginFrame(g_lastDeltaSec);
+            m_remixFrameOpen = true;
+        }
+        m_rasterCaptureTakenThisFrame = false;
         return m_real->BeginScene();
     }
-    HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
+    HRESULT STDMETHODCALLTYPE EndScene() override {
+        if (g_config.rasterBlendEnabled && remix_api::g_initialized && !m_rasterCaptureTakenThisFrame) {
+            if (EnsureBlendResources()) {
+                IDirect3DSurface9* currentRT = nullptr;
+                if (SUCCEEDED(m_real->GetRenderTarget(0, &currentRT)) && currentRT) {
+                    m_lastRasterCaptureSucceeded = SUCCEEDED(
+                        m_real->StretchRect(currentRT, nullptr, m_rasterCaptureSurface, nullptr, D3DTEXF_NONE));
+                    g_rasterBlendLastRasterCapture = m_lastRasterCaptureSucceeded;
+                    currentRT->Release();
+                    m_rasterCaptureTakenThisFrame = true;
+                } else {
+                    m_lastRasterCaptureSucceeded = false;
+                    g_rasterBlendLastRasterCapture = false;
+                }
+            }
+        }
+        return m_real->EndScene();
+    }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
-    HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override { return m_real->SetTransform(State, pMatrix); }
+    HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override {
+        int transformIdx = -1;
+        if (State == D3DTS_WORLD) transformIdx = 0;
+        if (State == D3DTS_VIEW) transformIdx = 1;
+        if (State == D3DTS_PROJECTION) transformIdx = 2;
+        if (transformIdx >= 0 && pMatrix) {
+            g_gameSetTransformSeen[transformIdx] = true;
+            g_gameSetTransformAnySeen = true;
+
+            const bool allowGenericSetTransformCompatibility = (g_activeGameProfile == GameProfile_None);
+            if (allowGenericSetTransformCompatibility && g_config.setTransformBypassProxyWhenGameProvides) {
+                if (State == D3DTS_WORLD) {
+                    m_currentWorld = *pMatrix;
+                    m_hasWorld = true; m_everHadWorld = true;
+                    m_worldLastFrame = g_frameCount;
+                    StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
+                                     "game SetTransform(World) direct passthrough");
+                } else if (State == D3DTS_VIEW) {
+                    m_currentView = *pMatrix;
+                    m_hasView = true; m_everHadView = true;
+                    m_viewLastFrame = g_frameCount;
+                    StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                    "game SetTransform(View) direct passthrough");
+                } else if (State == D3DTS_PROJECTION) {
+                    m_currentProj = *pMatrix;
+                    m_hasProj = true; m_everHadProj = true;
+                    m_projLastFrame = g_frameCount;
+                    StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                          "game SetTransform(Projection) direct passthrough");
+                }
+                return m_real->SetTransform(State, pMatrix);
+            }
+
+            if (allowGenericSetTransformCompatibility && g_config.setTransformRoundTripCompatibilityMode) {
+                const HRESULT setHr = m_real->SetTransform(State, pMatrix);
+                if (FAILED(setHr)) {
+                    return setHr;
+                }
+                D3DMATRIX roundTrip = *pMatrix;
+                if (SUCCEEDED(m_real->GetTransform(State, &roundTrip))) {
+                    m_real->SetTransform(State, &roundTrip);
+                }
+                if (State == D3DTS_WORLD) {
+                    m_currentWorld = roundTrip;
+                    m_hasWorld = true; m_everHadWorld = true;
+                    m_worldLastFrame = g_frameCount;
+                    StoreWorldMatrix(m_currentWorld, 0, -1, 4, false, true,
+                                     "game SetTransform(World)+GetTransform compatibility");
+                } else if (State == D3DTS_VIEW) {
+                    m_currentView = roundTrip;
+                    m_hasView = true; m_everHadView = true;
+                    m_viewLastFrame = g_frameCount;
+                    StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                    "game SetTransform(View)+GetTransform compatibility");
+                } else if (State == D3DTS_PROJECTION) {
+                    m_currentProj = roundTrip;
+                    m_hasProj = true; m_everHadProj = true;
+                    m_projLastFrame = g_frameCount;
+                    StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                          "game SetTransform(Projection)+GetTransform compatibility");
+                }
+                return setHr;
+            }
+        }
+
+        if (g_activeGameProfile == GameProfile_Barnyard &&
+            (State == D3DTS_VIEW || State == D3DTS_PROJECTION)) {
+            if (!g_config.barnyardUseGameSetTransformsForViewProjection || !pMatrix) {
+                return D3D_OK;
+            }
+
+            const HRESULT setHr = m_real->SetTransform(State, pMatrix);
+            D3DMATRIX captured = *pMatrix;
+            D3DMATRIX roundTrip = {};
+            const HRESULT getHr = m_real->GetTransform(State, &roundTrip);
+            if (SUCCEEDED(getHr)) {
+                captured = roundTrip;
+            }
+
+            if (State == D3DTS_VIEW) {
+                m_currentView = captured;
+                m_hasView = true; m_everHadView = true;
+                m_viewLastFrame = g_frameCount;
+                g_profileCoreRegistersSeen[0] = true;
+                StoreViewMatrix(m_currentView, 0, -1, 4, false, true,
+                                SUCCEEDED(getHr)
+                                    ? "Barnyard intercepted game SetTransform(View)+GetTransform"
+                                    : "Barnyard intercepted game SetTransform(View)");
+            } else {
+                m_currentProj = captured;
+                m_hasProj = true; m_everHadProj = true;
+                m_projLastFrame = g_frameCount;
+                g_profileCoreRegistersSeen[1] = true;
+                g_projectionDetectedByNumericStructure = false;
+                g_projectionDetectedRegister = -1;
+                g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
+                g_projectionDetectedFovRadians = ExtractFOV(captured);
+                StoreProjectionMatrix(m_currentProj, 0, -1, 4, false, true,
+                                      SUCCEEDED(getHr)
+                                          ? "Barnyard intercepted game SetTransform(Projection)+GetTransform"
+                                          : "Barnyard intercepted game SetTransform(Projection)");
+            }
+
+            snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
+                     "Barnyard intercepted game %s transform and cached for draw-time forwarding.",
+                     State == D3DTS_VIEW ? "VIEW" : "PROJECTION");
+            return setHr;
+        }
+        return m_real->SetTransform(State, pMatrix);
+    }
     HRESULT STDMETHODCALLTYPE GetTransform(D3DTRANSFORMSTATETYPE State, D3DMATRIX* pMatrix) override { return m_real->GetTransform(State, pMatrix); }
     HRESULT STDMETHODCALLTYPE MultiplyTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override { return m_real->MultiplyTransform(State, pMatrix); }
     HRESULT STDMETHODCALLTYPE SetViewport(const D3DVIEWPORT9* pViewport) override { return m_real->SetViewport(pViewport); }
@@ -3572,20 +6597,27 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
+        if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
+        if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
         return m_real->DrawPrimitive(PrimitiveType, StartVertex, PrimitiveCount);
     }
     HRESULT STDMETHODCALLTYPE DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT startIndex, UINT primCount) override {
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
+        if (g_shaderRecords.count(g_activeVertexShaderKey)) g_shaderRecords[g_activeVertexShaderKey].usageCount++;
+        if (g_shaderRecords.count(g_activePixelShaderKey)) g_shaderRecords[g_activePixelShaderKey].usageCount++;
         return m_real->DrawIndexedPrimitive(PrimitiveType, BaseVertexIndex, MinVertexIndex, NumVertices, startIndex, primCount);
     }
     HRESULT STDMETHODCALLTYPE DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveType, UINT PrimitiveCount, const void* pVertexStreamZeroData, UINT VertexStreamZeroStride) override {
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         return m_real->DrawPrimitiveUP(PrimitiveType, PrimitiveCount, pVertexStreamZeroData, VertexStreamZeroStride);
     }
@@ -3593,29 +6625,75 @@ public:
         if ((g_pauseRendering || IsCurrentShaderDrawDisabled(m_currentVertexShader)) && !g_isRenderingImGui) {
             return D3D_OK;
         }
+        SubmitLightingFromCurrentDraw();
         EmitFixedFunctionTransforms();
         return m_real->DrawIndexedPrimitiveUP(PrimitiveType, MinVertexIndex, NumVertices, PrimitiveCount, pIndexData, IndexDataFormat, pVertexStreamZeroData, VertexStreamZeroStride);
     }
     HRESULT STDMETHODCALLTYPE ProcessVertices(UINT SrcStartIndex, UINT DestIndex, UINT VertexCount, IDirect3DVertexBuffer9* pDestBuffer, IDirect3DVertexDeclaration9* pVertexDecl, DWORD Flags) override { return m_real->ProcessVertices(SrcStartIndex, DestIndex, VertexCount, pDestBuffer, pVertexDecl, Flags); }
     HRESULT STDMETHODCALLTYPE CreateVertexDeclaration(const D3DVERTEXELEMENT9* pVertexElements, IDirect3DVertexDeclaration9** ppDecl) override { return m_real->CreateVertexDeclaration(pVertexElements, ppDecl); }
-    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override { return m_real->SetVertexDeclaration(pDecl); }
+    HRESULT STDMETHODCALLTYPE SetVertexDeclaration(IDirect3DVertexDeclaration9* pDecl) override {
+        g_activeVertexDeclInfo = {};
+        if (pDecl) {
+            D3DVERTEXELEMENT9 elems[MAXD3DDECLLENGTH] = {};
+            UINT num = MAXD3DDECLLENGTH;
+            if (SUCCEEDED(pDecl->GetDeclaration(elems, &num))) {
+                for (UINT i = 0; i < num; ++i) {
+                    const D3DVERTEXELEMENT9& e = elems[i];
+                    if (e.Stream == 0xFF && e.Type == D3DDECLTYPE_UNUSED) break;
+                    if (e.Usage == D3DDECLUSAGE_POSITION) g_activeVertexDeclInfo.hasPosition = true;
+                    if (e.Usage == D3DDECLUSAGE_NORMAL) g_activeVertexDeclInfo.hasNormal = true;
+                    if (e.Usage == D3DDECLUSAGE_TANGENT) g_activeVertexDeclInfo.hasTangent = true;
+                    if (e.Usage == D3DDECLUSAGE_BINORMAL) g_activeVertexDeclInfo.hasBinormal = true;
+                    if (e.Usage == D3DDECLUSAGE_TEXCOORD) g_activeVertexDeclInfo.texcoordCount = (std::max)(g_activeVertexDeclInfo.texcoordCount, static_cast<int>(e.UsageIndex) + 1);
+                }
+            }
+        }
+        return m_real->SetVertexDeclaration(pDecl);
+    }
     HRESULT STDMETHODCALLTYPE GetVertexDeclaration(IDirect3DVertexDeclaration9** ppDecl) override { return m_real->GetVertexDeclaration(ppDecl); }
     HRESULT STDMETHODCALLTYPE SetFVF(DWORD FVF) override { return m_real->SetFVF(FVF); }
     HRESULT STDMETHODCALLTYPE GetFVF(DWORD* pFVF) override { return m_real->GetFVF(pFVF); }
-    HRESULT STDMETHODCALLTYPE CreateVertexShader(const DWORD* pFunction, IDirect3DVertexShader9** ppShader) override { return m_real->CreateVertexShader(pFunction, ppShader); }
+    HRESULT STDMETHODCALLTYPE CreateVertexShader(const DWORD* pFunction, IDirect3DVertexShader9** ppShader) override {
+        if (!ppShader) {
+            return D3DERR_INVALIDCALL;
+        }
+        IDirect3DVertexShader9* realShader = nullptr;
+        HRESULT hr = m_real->CreateVertexShader(pFunction, &realShader);
+        if (FAILED(hr) || !realShader) {
+            *ppShader = nullptr;
+            return hr;
+        }
+        *ppShader = new WrappedVertexShader9(realShader);
+        std::vector<uint32_t> data;
+        if (pFunction) {
+            for (size_t i = 0; i < 16384; ++i) {
+                data.push_back(static_cast<uint32_t>(pFunction[i]));
+                if ((pFunction[i] & D3DSI_OPCODE_MASK) == D3DSIO_END) break;
+            }
+        }
+        RegisterShaderBytecode(reinterpret_cast<WrappedVertexShader9*>(*ppShader)->GetKey(), ShaderStage_Vertex, data);
+        return hr;
+    }
     HRESULT STDMETHODCALLTYPE SetVertexShader(IDirect3DVertexShader9* pShader) override {
         m_currentVertexShader = pShader;
         g_activeShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        g_activeVertexShaderKey = g_activeShaderKey;
         GetShaderState(g_activeShaderKey, true);
 
+        IDirect3DVertexShader9* realShader = nullptr;
         if (pShader) {
-            uint32_t shaderHash = ComputeShaderBytecodeHash(pShader);
+            WrappedVertexShader9* wrapped = static_cast<WrappedVertexShader9*>(pShader);
+            realShader = wrapped->GetReal();
+            uint32_t shaderHash = ComputeShaderBytecodeHash(realShader);
             if (shaderHash != 0) {
                 g_shaderBytecodeHashes[g_activeShaderKey] = shaderHash;
             }
         }
 
-        return m_real->SetVertexShader(pShader);
+        if (pShader && g_shaderRecords.count(g_activeShaderKey) && g_shaderRecords[g_activeShaderKey].replacementEnabled && g_shaderRecords[g_activeShaderKey].replacementShader) {
+            realShader = reinterpret_cast<IDirect3DVertexShader9*>(g_shaderRecords[g_activeShaderKey].replacementShader);
+        }
+        return m_real->SetVertexShader(realShader);
     }
     HRESULT STDMETHODCALLTYPE GetVertexShader(IDirect3DVertexShader9** ppShader) override { return m_real->GetVertexShader(ppShader); }
     HRESULT STDMETHODCALLTYPE GetVertexShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) override { return m_real->GetVertexShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
@@ -3629,10 +6707,45 @@ public:
     HRESULT STDMETHODCALLTYPE GetStreamSourceFreq(UINT StreamNumber, UINT* pSetting) override { return m_real->GetStreamSourceFreq(StreamNumber, pSetting); }
     HRESULT STDMETHODCALLTYPE SetIndices(IDirect3DIndexBuffer9* pIndexData) override { return m_real->SetIndices(pIndexData); }
     HRESULT STDMETHODCALLTYPE GetIndices(IDirect3DIndexBuffer9** ppIndexData) override { return m_real->GetIndices(ppIndexData); }
-    HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override { return m_real->CreatePixelShader(pFunction, ppShader); }
-    HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override { return m_real->SetPixelShader(pShader); }
+    HRESULT STDMETHODCALLTYPE CreatePixelShader(const DWORD* pFunction, IDirect3DPixelShader9** ppShader) override {
+        if (!ppShader) return D3DERR_INVALIDCALL;
+        IDirect3DPixelShader9* realShader = nullptr;
+        HRESULT hr = m_real->CreatePixelShader(pFunction, &realShader);
+        if (FAILED(hr) || !realShader) {
+            *ppShader = nullptr;
+            return hr;
+        }
+        *ppShader = new WrappedPixelShader9(realShader);
+        std::vector<uint32_t> data;
+        if (pFunction) {
+            for (size_t i = 0; i < 16384; ++i) {
+                data.push_back(static_cast<uint32_t>(pFunction[i]));
+                if ((pFunction[i] & D3DSI_OPCODE_MASK) == D3DSIO_END) break;
+            }
+        }
+        RegisterShaderBytecode(reinterpret_cast<WrappedPixelShader9*>(*ppShader)->GetKey(), ShaderStage_Pixel, data);
+        return hr;
+    }
+    HRESULT STDMETHODCALLTYPE SetPixelShader(IDirect3DPixelShader9* pShader) override {
+        m_currentPixelShader = pShader;
+        g_activePixelShaderKey = reinterpret_cast<uintptr_t>(pShader);
+        IDirect3DPixelShader9* realShader = nullptr;
+        if (pShader) {
+            realShader = static_cast<WrappedPixelShader9*>(pShader)->GetReal();
+            if (g_shaderRecords.count(g_activePixelShaderKey) && g_shaderRecords[g_activePixelShaderKey].replacementEnabled && g_shaderRecords[g_activePixelShaderKey].replacementShader) {
+                realShader = reinterpret_cast<IDirect3DPixelShader9*>(g_shaderRecords[g_activePixelShaderKey].replacementShader);
+            }
+        }
+        return m_real->SetPixelShader(realShader);
+    }
     HRESULT STDMETHODCALLTYPE GetPixelShader(IDirect3DPixelShader9** ppShader) override { return m_real->GetPixelShader(ppShader); }
-    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override { return m_real->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
+    HRESULT STDMETHODCALLTYPE SetPixelShaderConstantF(UINT StartRegister, const float* pConstantData, UINT Vector4fCount) override {
+        uintptr_t shaderKey = reinterpret_cast<uintptr_t>(m_currentPixelShader);
+        if (g_constantUploadRecordingEnabled) {
+            RecordConstantUpload(ConstantUploadStage_Pixel, shaderKey, StartRegister, Vector4fCount);
+        }
+        return m_real->SetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount);
+    }
     HRESULT STDMETHODCALLTYPE GetPixelShaderConstantF(UINT StartRegister, float* pConstantData, UINT Vector4fCount) override { return m_real->GetPixelShaderConstantF(StartRegister, pConstantData, Vector4fCount); }
     HRESULT STDMETHODCALLTYPE SetPixelShaderConstantI(UINT StartRegister, const int* pConstantData, UINT Vector4iCount) override { return m_real->SetPixelShaderConstantI(StartRegister, pConstantData, Vector4iCount); }
     HRESULT STDMETHODCALLTYPE GetPixelShaderConstantI(UINT StartRegister, int* pConstantData, UINT Vector4iCount) override { return m_real->GetPixelShaderConstantI(StartRegister, pConstantData, Vector4iCount); }
@@ -3642,6 +6755,51 @@ public:
     HRESULT STDMETHODCALLTYPE DrawTriPatch(UINT Handle, const float* pNumSegs, const D3DTRIPATCH_INFO* pTriPatchInfo) override { return m_real->DrawTriPatch(Handle, pNumSegs, pTriPatchInfo); }
     HRESULT STDMETHODCALLTYPE DeletePatch(UINT Handle) override { return m_real->DeletePatch(Handle); }
     HRESULT STDMETHODCALLTYPE CreateQuery(D3DQUERYTYPE Type, IDirect3DQuery9** ppQuery) override { return m_real->CreateQuery(Type, ppQuery); }
+
+    HRESULT STDMETHODCALLTYPE SetConvolutionMonoKernel(UINT width, UINT height, float* rows, float* columns) override {
+        return m_realEx ? m_realEx->SetConvolutionMonoKernel(width, height, rows, columns) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE ComposeRects(IDirect3DSurface9* pSrc, IDirect3DSurface9* pDst, IDirect3DVertexBuffer9* pSrcRectDescs,
+                                           UINT numRects, IDirect3DVertexBuffer9* pDstRectDescs, D3DCOMPOSERECTSOP op, int xoffset, int yoffset) override {
+        return m_realEx ? m_realEx->ComposeRects(pSrc, pDst, pSrcRectDescs, numRects, pDstRectDescs, op, xoffset, yoffset) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE PresentEx(CONST RECT* pSourceRect, CONST RECT* pDestRect, HWND hDestWindowOverride,
+                                        CONST RGNDATA* pDirtyRegion, DWORD dwFlags) override {
+        return m_realEx ? m_realEx->PresentEx(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion, dwFlags) : Present(pSourceRect,pDestRect,hDestWindowOverride,pDirtyRegion);
+    }
+    HRESULT STDMETHODCALLTYPE GetGPUThreadPriority(INT* pPriority) override { return m_realEx ? m_realEx->GetGPUThreadPriority(pPriority) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE SetGPUThreadPriority(INT Priority) override { return m_realEx ? m_realEx->SetGPUThreadPriority(Priority) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE WaitForVBlank(UINT iSwapChain) override { return m_realEx ? m_realEx->WaitForVBlank(iSwapChain) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE CheckResourceResidency(IDirect3DResource9** pResourceArray, UINT32 NumResources) override { return m_realEx ? m_realEx->CheckResourceResidency(pResourceArray, NumResources) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE SetMaximumFrameLatency(UINT MaxLatency) override { return m_realEx ? m_realEx->SetMaximumFrameLatency(MaxLatency) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE GetMaximumFrameLatency(UINT* pMaxLatency) override { return m_realEx ? m_realEx->GetMaximumFrameLatency(pMaxLatency) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE CheckDeviceState(HWND hDestinationWindow) override { return m_realEx ? m_realEx->CheckDeviceState(hDestinationWindow) : D3DERR_INVALIDCALL; }
+    HRESULT STDMETHODCALLTYPE CreateRenderTargetEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample,
+                                                   DWORD MultisampleQuality, BOOL Lockable, IDirect3DSurface9** ppSurface,
+                                                   HANDLE* pSharedHandle, DWORD Usage) override {
+        return m_realEx ? m_realEx->CreateRenderTargetEx(Width, Height, Format, MultiSample, MultisampleQuality, Lockable, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE CreateOffscreenPlainSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DPOOL Pool,
+                                                            IDirect3DSurface9** ppSurface, HANDLE* pSharedHandle, DWORD Usage) override {
+        return m_realEx ? m_realEx->CreateOffscreenPlainSurfaceEx(Width, Height, Format, Pool, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE CreateDepthStencilSurfaceEx(UINT Width, UINT Height, D3DFORMAT Format, D3DMULTISAMPLE_TYPE MultiSample,
+                                                          DWORD MultisampleQuality, BOOL Discard, IDirect3DSurface9** ppSurface,
+                                                          HANDLE* pSharedHandle, DWORD Usage) override {
+        return m_realEx ? m_realEx->CreateDepthStencilSurfaceEx(Width, Height, Format, MultiSample, MultisampleQuality, Discard, ppSurface, pSharedHandle, Usage) : D3DERR_INVALIDCALL;
+    }
+    HRESULT STDMETHODCALLTYPE ResetEx(D3DPRESENT_PARAMETERS* pPresentationParameters, D3DDISPLAYMODEEX* pFullscreenDisplayMode) override {
+        return m_realEx ? m_realEx->ResetEx(pPresentationParameters, pFullscreenDisplayMode) : Reset(pPresentationParameters);
+    }
+    HRESULT STDMETHODCALLTYPE GetDisplayModeEx(UINT iSwapChain, D3DDISPLAYMODEEX* pMode, D3DDISPLAYROTATION* pRotation) override {
+        return m_realEx ? m_realEx->GetDisplayModeEx(iSwapChain, pMode, pRotation) : D3DERR_INVALIDCALL;
+    }
+};
+
+class WrappedD3D9DeviceEx : public WrappedD3D9Device {
+public:
+    explicit WrappedD3D9DeviceEx(IDirect3DDevice9Ex* real)
+        : WrappedD3D9Device(real) {}
 };
 
 /**
@@ -3828,10 +6986,8 @@ public:
         HRESULT hr = m_real->CreateDeviceEx(Adapter, DeviceType, hFocusWindow, BehaviorFlags,
                                             pPresentationParameters, pFullscreenDisplayMode, &realDevice);
         if (SUCCEEDED(hr) && realDevice) {
-            // Note: We wrap as IDirect3DDevice9, but the game expects IDirect3DDevice9Ex
-            // This is a simplification - a full implementation would need a WrappedD3D9DeviceEx
-            LogMsg("CreateDeviceEx succeeded, wrapping device (as base Device9)");
-            *ppReturnedDeviceInterface = (IDirect3DDevice9Ex*)new WrappedD3D9Device(realDevice);
+            LogMsg("CreateDeviceEx succeeded, wrapping device");
+            *ppReturnedDeviceInterface = new WrappedD3D9DeviceEx(realDevice);
         } else {
             LogMsg("CreateDeviceEx failed: 0x%08X", hr);
             *ppReturnedDeviceInterface = nullptr;
@@ -3842,20 +6998,35 @@ public:
 
 // Load configuration from ini file
 void LoadConfig() {
-    char path[MAX_PATH];
-    GetModuleFileNameA(nullptr, path, MAX_PATH);
+    char exePath[MAX_PATH] = {};
+    GetModuleFileNameA(nullptr, exePath, MAX_PATH);
 
+    snprintf(g_gameExePath, sizeof(g_gameExePath), "%s", exePath);
+    CopyFilenameFromPath(g_gameExePath, g_gameExeName, sizeof(g_gameExeName));
+    if (!TryReadFileDescription(g_gameExePath, g_gameDisplayName, sizeof(g_gameDisplayName))) {
+        snprintf(g_gameDisplayName, sizeof(g_gameDisplayName), "%s",
+                 g_gameExeName[0] ? g_gameExeName : "<unknown>");
+    }
+
+    char path[MAX_PATH] = {};
+    snprintf(path, sizeof(path), "%s", exePath);
     char* lastSlash = strrchr(path, '\\');
     if (lastSlash) {
-        strcpy(lastSlash + 1, "camera_proxy.ini");
+        strcpy_s(lastSlash + 1, MAX_PATH - static_cast<size_t>(lastSlash - path) - 1, "camera_proxy.ini");
     }
 
     g_config.viewMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ViewMatrixRegister", -1, path);
     g_config.projMatrixRegister = GetPrivateProfileIntA("CameraProxy", "ProjMatrixRegister", -1, path);
     g_config.worldMatrixRegister = GetPrivateProfileIntA("CameraProxy", "WorldMatrixRegister", -1, path);
+    g_config.mvpMatrixRegister = GetPrivateProfileIntA("CameraProxy", "MVPMatrixRegister", -1, path);
+    g_config.mvMatrixRegister = GetPrivateProfileIntA("CameraProxy", "MVMatrixRegister", -1, path);
+    g_config.vpMatrixRegister = GetPrivateProfileIntA("CameraProxy", "VPMatrixRegister", -1, path);
     g_iniViewMatrixRegister = g_config.viewMatrixRegister;
     g_iniProjMatrixRegister = g_config.projMatrixRegister;
     g_iniWorldMatrixRegister = g_config.worldMatrixRegister;
+    g_iniMvpMatrixRegister = g_config.mvpMatrixRegister;
+    g_iniMvMatrixRegister = g_config.mvMatrixRegister;
+    g_iniVpMatrixRegister = g_config.vpMatrixRegister;
     g_config.enableLogging = GetPrivateProfileIntA("CameraProxy", "EnableLogging", 1, path) != 0;
     g_config.logAllConstants = GetPrivateProfileIntA("CameraProxy", "LogAllConstants", 0, path) != 0;
     g_config.autoDetectMatrices = GetPrivateProfileIntA("CameraProxy", "AutoDetectMatrices", 0, path) != 0;
@@ -3875,6 +7046,17 @@ void LoadConfig() {
     g_profileViewDerivedFromInverse = false;
     g_profileStatusMessage[0] = '\0';
     g_profileDisableStructuralDetection = false;
+    g_barnyardForceWorldFromC0 = GetPrivateProfileIntA("CameraProxy", "BarnyardForceWorldFromC0", 0, path) != 0;
+    g_config.barnyardUseGameSetTransformsForViewProjection =
+        GetPrivateProfileIntA("CameraProxy", "BarnyardUseGameSetTransformsForViewProjection", 1, path) != 0;
+    g_config.disableGameInputWhileMenuOpen =
+        GetPrivateProfileIntA("CameraProxy", "DisableGameInputWhileMenuOpen", 0, path) != 0;
+    g_config.setTransformBypassProxyWhenGameProvides =
+        GetPrivateProfileIntA("CameraProxy", "SetTransformBypassProxyWhenGameProvides", 0, path) != 0;
+    g_config.setTransformRoundTripCompatibilityMode =
+        GetPrivateProfileIntA("CameraProxy", "SetTransformRoundTripCompatibilityMode", 0, path) != 0;
+    g_imguiBarnyardUseGameSetTransformsForViewProjection = g_config.barnyardUseGameSetTransformsForViewProjection;
+    g_imguiDisableGameInputWhileMenuOpen = g_config.disableGameInputWhileMenuOpen;
     if (g_config.gameProfile[0] != '\0' && g_activeGameProfile == GameProfile_None) {
         snprintf(g_profileStatusMessage, sizeof(g_profileStatusMessage),
                  "Unknown GameProfile='%s'. Falling back to structural detection.", g_config.gameProfile);
@@ -3884,6 +7066,14 @@ void LoadConfig() {
     if (g_config.imguiScale > 3.0f) g_config.imguiScale = 3.0f;
     GetPrivateProfileStringA("CameraProxy", "RemixDllName", "d3d9_remix.dll", g_config.remixDllName,
                              MAX_PATH, path);
+    if (g_config.remixDllName[0] == '\0') {
+        snprintf(g_config.remixDllName, sizeof(g_config.remixDllName), "%s", "d3d9_remix.dll");
+    }
+    const char* remixExt = strrchr(g_config.remixDllName, '.');
+    if (!remixExt || _stricmp(remixExt, ".dll") != 0) {
+        LogMsg("WARNING: Invalid RemixDllName '%s' in camera_proxy.ini. Falling back to d3d9_remix.dll", g_config.remixDllName);
+        snprintf(g_config.remixDllName, sizeof(g_config.remixDllName), "%s", "d3d9_remix.dll");
+    }
     g_probeTransposedLayouts = GetPrivateProfileIntA("CameraProxy", "ProbeTransposedLayouts", 1, path) != 0;
     g_probeInverseView = GetPrivateProfileIntA("CameraProxy", "ProbeInverseView", 1, path) != 0;
     g_overrideScopeMode = GetPrivateProfileIntA("CameraProxy", "OverrideScopeMode", Override_Sticky, path);
@@ -3892,16 +7082,16 @@ void LoadConfig() {
     g_config.hotkeyTogglePauseVk = GetPrivateProfileIntA("CameraProxy", "HotkeyTogglePauseVK", VK_F9, path);
     g_config.hotkeyEmitMatricesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyEmitMatricesVK", VK_F8, path);
     g_config.hotkeyResetMatrixOverridesVk = GetPrivateProfileIntA("CameraProxy", "HotkeyResetMatrixOverridesVK", VK_F7, path);
-    g_config.enableCombinedMVP = GetPrivateProfileIntA("CameraProxy", "EnableCombinedMVP", 0, path) != 0;
-    g_config.combinedMVPRequireWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPRequireWorld", 0, path) != 0;
-    g_config.combinedMVPAssumeIdentityWorld = GetPrivateProfileIntA("CameraProxy", "CombinedMVPAssumeIdentityWorld", 1, path) != 0;
-    g_config.combinedMVPForceDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPForceDecomposition", 0, path) != 0;
-    g_config.combinedMVPLogDecomposition = GetPrivateProfileIntA("CameraProxy", "CombinedMVPLogDecomposition", 0, path) != 0;
+    g_config.enableCombinedDecomposition = GetPrivateProfileIntA("CameraProxy", "EnableCombinedDecomposition", 1, path) != 0;
+    g_config.combinedDecompositionLog = GetPrivateProfileIntA("CameraProxy", "CombinedDecompositionLog", 0, path) != 0;
+    g_config.allowGeneratedProjectionForVPDecomposition =
+        GetPrivateProfileIntA("CameraProxy", "AllowGeneratedProjectionForVPDecomposition", 0, path) != 0;
 
     g_config.experimentalCustomProjectionEnabled =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionEnabled", 0, path) != 0;
+    int rawMode = GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionMode", 2, path);
     g_config.experimentalCustomProjectionMode =
-        GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionMode", 2, path);
+        (rawMode == CustomProjectionMode_Manual) ? CustomProjectionMode_Manual : CustomProjectionMode_Auto;
     g_config.experimentalCustomProjectionOverrideDetectedProjection =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionOverrideDetectedProjection", 0, path) != 0;
     g_config.experimentalCustomProjectionOverrideCombinedMVP =
@@ -3918,8 +7108,18 @@ void LoadConfig() {
     g_config.experimentalCustomProjectionAutoFarZ = (float)atof(customBuf);
     GetPrivateProfileStringA("CameraProxy", "ExperimentalCustomProjectionAutoAspectFallback", "1.7777778", customBuf, sizeof(customBuf), path);
     g_config.experimentalCustomProjectionAutoAspectFallback = (float)atof(customBuf);
-    g_config.experimentalCustomProjectionAutoHandedness =
+    int rawHandedness =
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionAutoHandedness", ProjectionHandedness_Left, path);
+    g_config.experimentalCustomProjectionAutoHandedness =
+        (rawHandedness == ProjectionHandedness_Right) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
+
+    g_config.rasterBlendEnabled = GetPrivateProfileIntA("RasterBlend", "Enabled", 0, path) != 0;
+    g_config.rasterBlendMode = GetPrivateProfileIntA("RasterBlend", "Mode", 0, path);
+    g_config.rasterBlendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+    GetPrivateProfileStringA("RasterBlend", "MixStrength", "1.0", customBuf, sizeof(customBuf), path);
+    g_config.rasterBlendMixStrength = (float)atof(customBuf);
+    g_config.rasterBlendMixStrength = std::clamp(g_config.rasterBlendMixStrength, 0.0f, 1.0f);
+    g_config.rasterBlendWhiteMaterials = GetPrivateProfileIntA("RasterBlend", "WhiteMaterials", 1, path) != 0;
 
     D3DMATRIX defaultManualProjection = {};
     CreateProjectionMatrixWithHandedness(&defaultManualProjection,
@@ -3946,84 +7146,24 @@ void LoadConfig() {
     g_config.minFOV = (float)atof(buf);
     GetPrivateProfileStringA("CameraProxy", "MaxFOV", "2.5", buf, sizeof(buf), path);
     g_config.maxFOV = (float)atof(buf);
+    snprintf(g_iniPath, sizeof(g_iniPath), "%s", path);
 }
 
-// DLL entry point
-BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
-    if (fdwReason == DLL_PROCESS_ATTACH) {
-        DisableThreadLibraryCalls(hinstDLL);
-
+static void EnsureProxyInitialized() {
+    std::call_once(g_initOnce, []() {
         LoadConfig();
-
         if (g_config.enableLogging) {
-            g_logFile = fopen("camera_proxy.log", "w");
-            LogMsg("=== DMC4 Camera Proxy for D3D9 ===");
-            LogMsg("View matrix register override: %s", g_config.viewMatrixRegister >= 0 ? "ENABLED" : "auto");
-            if (g_config.viewMatrixRegister >= 0) {
-                LogMsg("  View override range: c%d-c%d", g_config.viewMatrixRegister, g_config.viewMatrixRegister + 3);
-            }
-            LogMsg("Projection matrix register override: %s", g_config.projMatrixRegister >= 0 ? "ENABLED" : "auto");
-            if (g_config.projMatrixRegister >= 0) {
-                LogMsg("  Projection override range: c%d-c%d", g_config.projMatrixRegister, g_config.projMatrixRegister + 3);
-            }
-            LogMsg("World matrix register override: %s", g_config.worldMatrixRegister >= 0 ? "ENABLED" : "auto");
-            if (g_config.worldMatrixRegister >= 0) {
-                LogMsg("  World override range: c%d-c%d", g_config.worldMatrixRegister, g_config.worldMatrixRegister + 3);
-            }
-            LogMsg("Auto-detect matrices: %s", g_config.autoDetectMatrices ? "ENABLED" : "disabled");
-            LogMsg("Log all constants: %s", g_config.logAllConstants ? "ENABLED" : "disabled");
-            LogMsg("Memory scanner: %s", g_config.enableMemoryScanner ? "ENABLED" : "disabled");
-            LogMsg("Use Remix runtime: %s", g_config.useRemixRuntime ? "ENABLED" : "disabled");
-            LogMsg("Remix runtime DLL: %s", g_config.remixDllName);
-            LogMsg("Emit fixed-function transforms: %s", g_config.emitFixedFunctionTransforms ? "ENABLED" : "disabled");
-            LogMsg("Combined MVP handling: %s", g_config.enableCombinedMVP ? "ENABLED" : "disabled");
-            LogMsg("Combined MVP require world: %s", g_config.combinedMVPRequireWorld ? "yes" : "no");
-            LogMsg("Combined MVP assume identity world: %s", g_config.combinedMVPAssumeIdentityWorld ? "yes" : "no");
-            LogMsg("Combined MVP force decomposition: %s", g_config.combinedMVPForceDecomposition ? "yes" : "no");
-            LogMsg("Combined MVP log decomposition: %s", g_config.combinedMVPLogDecomposition ? "yes" : "no");
-            LogMsg("Experimental custom projection: %s", g_config.experimentalCustomProjectionEnabled ? "ENABLED" : "disabled");
-            LogMsg("Experimental custom projection mode: %s",
-                   g_config.experimentalCustomProjectionMode == 1 ? "manual" :
-                   (g_config.experimentalCustomProjectionMode == 2 ? "auto" : "invalid"));
-            LogMsg("Experimental custom projection overrides detected projection: %s",
-                   g_config.experimentalCustomProjectionOverrideDetectedProjection ? "yes" : "no");
-            LogMsg("Experimental custom projection overrides combined MVP: %s",
-                   g_config.experimentalCustomProjectionOverrideCombinedMVP ? "yes" : "no");
-            LogMsg("MGR: use auto projection when c4 projection is invalid: %s",
-                   g_config.mgrrUseAutoProjectionWhenC4Invalid ? "yes" : "no");
-            LogMsg("Experimental custom projection auto params: fov=%.2f near=%.5f far=%.2f aspectFallback=%.5f handedness=%s",
-                   g_config.experimentalCustomProjectionAutoFovDeg,
-                   g_config.experimentalCustomProjectionAutoNearZ,
-                   g_config.experimentalCustomProjectionAutoFarZ,
-                   g_config.experimentalCustomProjectionAutoAspectFallback,
-                   ProjectionHandednessLabel(static_cast<ProjectionHandedness>(g_config.experimentalCustomProjectionAutoHandedness)));
-            LogMsg("Game profile: %s", GameProfileLabel(g_activeGameProfile));
-            if (g_activeGameProfile == GameProfile_DevilMayCry4) {
-                LogMsg("DMC4 layout: mvp/world=c%d-c%d, view=c%d-c%d, proj=c%d-c%d",
-                       g_profileLayout.combinedMvpBase, g_profileLayout.combinedMvpBase + 3,
-                       g_profileLayout.viewInverseBase, g_profileLayout.viewInverseBase + 3,
-                       g_profileLayout.projectionBase, g_profileLayout.projectionBase + 3);
-            }
-            LogMsg("ImGui scale: %.2fx", g_config.imguiScale);
-            LogMsg("Probe transposed layouts: %s", g_probeTransposedLayouts ? "ENABLED" : "disabled");
-            LogMsg("Probe inverse view: %s", g_probeInverseView ? "ENABLED" : "disabled");
-            LogMsg("Override scope mode: %d (N=%d)", g_overrideScopeMode, g_overrideNFrames);
-            LogMsg("Hotkeys (VK): menu=%d pause=%d emit=%d resetOverrides=%d",
-                   g_config.hotkeyToggleMenuVk,
-                   g_config.hotkeyTogglePauseVk,
-                   g_config.hotkeyEmitMatricesVk,
-                   g_config.hotkeyResetMatrixOverridesVk);
-            if (g_config.enableMemoryScanner) {
-                LogMsg("Memory scanner interval: %d sec", g_config.memoryScannerIntervalSec);
-                LogMsg("Memory scanner module: %s", g_config.memoryScannerModule[0]
-                                                   ? g_config.memoryScannerModule
-                                                   : "<main module>");
-            }
+            fopen_s(&g_logFile, "camera_proxy.log", "w");
+            LogMsg("=== %s ===", kCameraProxyVersion);
+            LogMsg("Game executable path: %s", g_gameExePath[0] ? g_gameExePath : "<unknown>");
+            LogMsg("Game executable name: %s", g_gameExeName[0] ? g_gameExeName : "<unknown>");
+            LogMsg("Game display name: %s", g_gameDisplayName[0] ? g_gameDisplayName : "<unknown>");
         }
-
-        // Load the real D3D9 runtime (Remix or system, based on config)
         g_hD3D9 = LoadTargetD3D9();
-
+        if (g_config.useRemixRuntime) {
+            g_remixLightingManager.Initialize();
+			g_customLightsManager.SetSaveFilePath("custom_lights.cltx");
+        }
         if (g_hD3D9) {
             g_origDirect3DCreate9 = (Direct3DCreate9_t)GetProcAddress(g_hD3D9, "Direct3DCreate9");
             g_origDirect3DCreate9Ex = (Direct3DCreate9Ex_t)GetProcAddress(g_hD3D9, "Direct3DCreate9Ex");
@@ -4034,22 +7174,74 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
             g_origD3DPERF_SetMarker = (D3DPERF_SetMarker_t)GetProcAddress(g_hD3D9, "D3DPERF_SetMarker");
             g_origD3DPERF_SetOptions = (D3DPERF_SetOptions_t)GetProcAddress(g_hD3D9, "D3DPERF_SetOptions");
             g_origD3DPERF_SetRegion = (D3DPERF_SetRegion_t)GetProcAddress(g_hD3D9, "D3DPERF_SetRegion");
-            LogMsg("Loaded target d3d9 runtime successfully");
-            LogMsg("  Direct3DCreate9: %p", g_origDirect3DCreate9);
-            LogMsg("  Direct3DCreate9Ex: %p", g_origDirect3DCreate9Ex);
-        } else {
-            LogMsg("ERROR: Failed to load target d3d9 runtime!");
         }
+    });
+}
+
+static void CopyFilenameFromPath(const char* fullPath, char* outName, size_t outNameSize) {
+    if (!outName || outNameSize == 0) return;
+    outName[0] = '\0';
+    if (!fullPath || !fullPath[0]) return;
+
+    const char* lastSlash = strrchr(fullPath, '\\');
+    const char* filename = lastSlash ? (lastSlash + 1) : fullPath;
+    snprintf(outName, outNameSize, "%s", filename);
+}
+
+static bool TryReadFileDescription(const char* exePath, char* outDescription, size_t outDescriptionSize) {
+    if (!exePath || !exePath[0] || !outDescription || outDescriptionSize == 0) return false;
+    outDescription[0] = '\0';
+
+    DWORD handle = 0;
+    DWORD infoSize = GetFileVersionInfoSizeA(exePath, &handle);
+    if (infoSize == 0) return false;
+
+    std::vector<unsigned char> infoData(infoSize);
+    if (!GetFileVersionInfoA(exePath, 0, infoSize, infoData.data())) return false;
+
+    struct LangAndCodepage {
+        WORD language;
+        WORD codePage;
+    };
+
+    LangAndCodepage* translate = nullptr;
+    UINT translateSize = 0;
+    if (!VerQueryValueA(infoData.data(), "\\VarFileInfo\\Translation",
+                        reinterpret_cast<void**>(&translate), &translateSize) ||
+        !translate || translateSize < sizeof(LangAndCodepage)) {
+        return false;
     }
-    else if (fdwReason == DLL_PROCESS_DETACH) {
-        if (g_logFile) {
-            LogMsg("=== Camera Proxy unloading ===");
-            LogMsg("Total frames: %d", g_frameCount);
-            fclose(g_logFile);
+
+    char queryPath[64] = {};
+    snprintf(queryPath, sizeof(queryPath), "\\StringFileInfo\\%04x%04x\\FileDescription",
+             translate[0].language, translate[0].codePage);
+
+    char* value = nullptr;
+    UINT valueSize = 0;
+    if (!VerQueryValueA(infoData.data(), queryPath, reinterpret_cast<void**>(&value), &valueSize) ||
+        !value || valueSize <= 1) {
+        return false;
+    }
+
+    snprintf(outDescription, outDescriptionSize, "%s", value);
+    return true;
+}
+
+// DLL entry point
+BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
+    (void)lpvReserved;
+    if (fdwReason == DLL_PROCESS_ATTACH) {
+        g_moduleInstance = hinstDLL;
+        DWORD modulePathLen = GetModuleFileNameA(hinstDLL, g_modulePath, MAX_PATH);
+        if (modulePathLen == 0 || modulePathLen >= MAX_PATH) {
+            g_modulePath[0] = '\0';
         }
-        if (g_hD3D9) {
-            FreeLibrary(g_hD3D9);
-        }
+        DisableThreadLibraryCalls(hinstDLL);
+    } else if (fdwReason == DLL_PROCESS_DETACH) {
+        g_moduleInstance = nullptr;
+        g_modulePath[0] = '\0';
+        if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
+        if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
     }
     return TRUE;
 }
@@ -4060,10 +7252,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
 
 extern "C" {
     __declspec(dllexport) const CameraMatrices* WINAPI Proxy_GetCameraMatrices() {
-        return &g_cameraMatrices;
+        static CameraMatrices snapshot = {};
+        std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+        snapshot = g_cameraMatrices;
+        return &snapshot;
     }
 
     IDirect3D9* WINAPI Proxy_Direct3DCreate9(UINT SDKVersion) {
+        EnsureProxyInitialized();
         LogMsg("Direct3DCreate9 called (SDK version: %d)", SDKVersion);
 
         if (!g_origDirect3DCreate9) {
@@ -4082,6 +7278,7 @@ extern "C" {
     }
 
     HRESULT WINAPI Proxy_Direct3DCreate9Ex(UINT SDKVersion, IDirect3D9Ex** ppD3D) {
+        EnsureProxyInitialized();
         LogMsg("Direct3DCreate9Ex called (SDK version: %d)", SDKVersion);
 
         if (!g_origDirect3DCreate9Ex) {
