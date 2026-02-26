@@ -8,6 +8,8 @@
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+constexpr int kMaxConstantRegisters = 256;
+
 static float ClampSafe(float v, float lo, float hi) {
     if (v < lo) return lo;
     if (v > hi) return hi;

@@ -46,6 +46,7 @@
 #include "lights_tab_ui.h"
 #include "custom_lights.h"
 #include "custom_lights_ui.h"
+#include "remix_api.h"
 
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND hWnd,
                                                              UINT msg,
@@ -185,6 +186,7 @@ static HINSTANCE g_moduleInstance = nullptr;
 static std::once_flag g_initOnce;
 static FILE* g_logFile = nullptr;
 static int g_frameCount = 0;
+static char g_modulePath[MAX_PATH] = "";
 static char g_gameExePath[MAX_PATH] = "";
 static char g_gameExeName[MAX_PATH] = "";
 static char g_gameDisplayName[256] = "";
@@ -1314,7 +1316,8 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     io.Fonts->Clear();
     g_overlayFontRegular = nullptr;
     g_overlayFontBold = nullptr;
-    std::filesystem::path modulePath = std::filesystem::path(g_modulePath).parent_path();
+    const char* modulePathSource = g_modulePath[0] ? g_modulePath : g_gameExePath;
+    std::filesystem::path modulePath = std::filesystem::path(modulePathSource).parent_path();
     std::filesystem::path regularPath = modulePath / "JetBrainsMono-Regular.ttf";
     std::filesystem::path boldPath = modulePath / "JetBrainsMono-Bold.ttf";
     if (std::filesystem::exists(regularPath) && std::filesystem::exists(boldPath)) {
@@ -6608,9 +6611,14 @@ BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID lpvReserved) {
     (void)lpvReserved;
     if (fdwReason == DLL_PROCESS_ATTACH) {
         g_moduleInstance = hinstDLL;
+        DWORD modulePathLen = GetModuleFileNameA(hinstDLL, g_modulePath, MAX_PATH);
+        if (modulePathLen == 0 || modulePathLen >= MAX_PATH) {
+            g_modulePath[0] = '\0';
+        }
         DisableThreadLibraryCalls(hinstDLL);
     } else if (fdwReason == DLL_PROCESS_DETACH) {
         g_moduleInstance = nullptr;
+        g_modulePath[0] = '\0';
         if (g_logFile) { fclose(g_logFile); g_logFile = nullptr; }
         if (g_hD3D9) { FreeLibrary(g_hD3D9); g_hD3D9 = nullptr; }
     }
