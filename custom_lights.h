@@ -135,8 +135,9 @@ public:
     std::vector<CustomLight>&       Lights()       { return m_lights; }
     const std::vector<CustomLight>& Lights() const { return m_lights; }
 
+    static float    SampleAnimatedScale(const AnimationParams& anim);
+
 private:
-    static float    ComputeAnimatedScale(const AnimationParams& anim);
     static bool     BuildNativeLightInfo(const CustomLight& l,
                                          float animScale,
                                          const float colorMul[3],

@@ -2,4 +2,6 @@
 
 class RemixLightingManager;
 
-void DrawRemixLightsTab(RemixLightingManager& manager);
+void DrawRemixLightsTab(RemixLightingManager& manager, bool showRuntimeStatus = true);
+void PushOverlayBoldFont();
+void PopOverlayBoldFont();

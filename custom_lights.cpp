@@ -112,7 +112,7 @@ void CustomLightsManager::BeginFrame(float deltaSeconds) {
         l.animation.elapsedTime += deltaSeconds;
 }
 
-float CustomLightsManager::ComputeAnimatedScale(const AnimationParams& anim) {
+float CustomLightsManager::SampleAnimatedScale(const AnimationParams& anim) {
     switch (anim.mode) {
     case AnimationMode::None:
         return 1.0f;
@@ -340,7 +340,7 @@ void CustomLightsManager::EndFrame(const CameraState& cam) {
 
         if (!remix_api::g_initialized) continue;
 
-        const float animScale = ComputeAnimatedScale(l.animation);
+        const float animScale = SampleAnimatedScale(l.animation);
         float colorMul[3];
         ComputeAnimatedColorMultiplier(l.animation, colorMul);
 

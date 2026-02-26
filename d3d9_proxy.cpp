@@ -265,6 +265,20 @@ static bool g_imguiMgrrUseAutoProjection = false;
 static bool g_imguiBarnyardUseGameSetTransformsForViewProjection = true;
 static bool g_imguiDisableGameInputWhileMenuOpen = false;
 static bool g_imguiBaseStyleCaptured = false;
+ImFont* g_overlayFontRegular = nullptr;
+ImFont* g_overlayFontBold = nullptr;
+
+void PushOverlayBoldFont() {
+    if (g_overlayFontBold) {
+        ImGui::PushFont(g_overlayFontBold);
+    }
+}
+
+void PopOverlayBoldFont() {
+    if (g_overlayFontBold) {
+        ImGui::PopFont();
+    }
+}
 static bool g_enableShaderEditing = false;
 static bool g_requestManualEmit = false;
 static char g_manualEmitStatus[192] = "";
@@ -1242,7 +1256,32 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
     ImGuiStyle& style = ImGui::GetStyle();
-    // Replace default blue accents with a readable red palette.
+    style.WindowRounding = 8.0f;
+    style.PopupRounding = 8.0f;
+    style.FrameRounding = 6.0f;
+    style.ChildRounding = 6.0f;
+    style.TabRounding = 6.0f;
+    style.ScrollbarRounding = 6.0f;
+    style.GrabRounding = 4.0f;
+    style.WindowPadding = ImVec2(12.0f, 10.0f);
+    style.FramePadding = ImVec2(8.0f, 5.0f);
+    style.ItemSpacing = ImVec2(8.0f, 6.0f);
+    style.ScrollbarSize = 8.0f;
+    style.FrameBorderSize = 0.0f;
+    style.WindowBorderSize = 1.0f;
+    style.PopupBorderSize = 1.0f;
+    style.ChildBorderSize = 1.0f;
+
+    style.Colors[ImGuiCol_WindowBg] = ImVec4(0.055f, 0.055f, 0.059f, 0.96f);
+    style.Colors[ImGuiCol_ChildBg] = ImVec4(0.090f, 0.072f, 0.074f, 0.90f);
+    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.090f, 0.058f, 0.058f, 0.96f);
+    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
+    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
+    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
+    style.Colors[ImGuiCol_TitleBg] = ImVec4(0.06f, 0.06f, 0.07f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
+    style.Colors[ImGuiCol_TitleBgCollapsed] = ImVec4(0.07f, 0.06f, 0.06f, 0.85f);
+
     style.Colors[ImGuiCol_CheckMark] = ImVec4(0.95f, 0.30f, 0.30f, 1.00f);
     style.Colors[ImGuiCol_SliderGrab] = ImVec4(0.88f, 0.28f, 0.28f, 1.00f);
     style.Colors[ImGuiCol_SliderGrabActive] = ImVec4(1.00f, 0.40f, 0.40f, 1.00f);
@@ -1263,18 +1302,32 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     style.Colors[ImGuiCol_TabActive] = ImVec4(0.48f, 0.18f, 0.18f, 1.00f);
     style.Colors[ImGuiCol_TabUnfocused] = ImVec4(0.18f, 0.10f, 0.10f, 0.97f);
     style.Colors[ImGuiCol_TabUnfocusedActive] = ImVec4(0.33f, 0.14f, 0.14f, 1.00f);
-    style.Colors[ImGuiCol_FrameBg] = ImVec4(0.26f, 0.12f, 0.12f, 0.72f);
-    style.Colors[ImGuiCol_PopupBg] = ImVec4(0.14f, 0.07f, 0.07f, 0.95f);
     style.Colors[ImGuiCol_Border] = ImVec4(0.56f, 0.22f, 0.22f, 0.68f);
     style.Colors[ImGuiCol_TextSelectedBg] = ImVec4(0.75f, 0.25f, 0.25f, 0.45f);
-    style.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.55f, 0.20f, 0.20f, 0.80f);
-    style.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.45f, 0.18f, 0.18f, 0.80f);
-    style.Colors[ImGuiCol_TitleBgActive] = ImVec4(0.45f, 0.16f, 0.16f, 1.00f);
     style.Colors[ImGuiCol_NavHighlight] = ImVec4(0.96f, 0.34f, 0.34f, 1.00f);
+
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
     io.ConfigFlags |= ImGuiConfigFlags_NoMouseCursorChange;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
+
+    io.Fonts->Clear();
+    g_overlayFontRegular = nullptr;
+    g_overlayFontBold = nullptr;
+    std::filesystem::path modulePath = std::filesystem::path(g_modulePath).parent_path();
+    std::filesystem::path regularPath = modulePath / "JetBrainsMono-Regular.ttf";
+    std::filesystem::path boldPath = modulePath / "JetBrainsMono-Bold.ttf";
+    if (std::filesystem::exists(regularPath) && std::filesystem::exists(boldPath)) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(regularPath.string().c_str(), 14.0f);
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(boldPath.string().c_str(), 15.0f);
+    }
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontDefault();
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = g_overlayFontRegular;
+    }
+    io.FontDefault = g_overlayFontRegular;
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX9_Init(device);
@@ -1317,6 +1370,42 @@ static void ShutdownImGui() {
     g_imguiPrevWndProc = nullptr;
     g_imguiHwnd = nullptr;
     g_prevShowImGui = false;
+}
+
+static void DrawRemixApiStatusLine(RemixLightingManager& remixManager, CustomLightsManager& customManager) {
+    int shaderActive = 0;
+    for (const auto& kv : remixManager.ActiveLights()) {
+        if (kv.second.handle) {
+            ++shaderActive;
+        }
+    }
+    int customActive = 0;
+    for (const auto& l : customManager.Lights()) {
+        if (l.enabled && l.nativeHandle) {
+            ++customActive;
+        }
+    }
+
+    const bool ready = remix_api::g_initialized;
+    const float t = static_cast<float>(ImGui::GetTime());
+    const float pulse = 0.65f + 0.35f * (0.5f + 0.5f * sinf(t * 6.2831853f));
+    const ImVec4 dotColor = ready ? ImVec4(0.20f, 0.95f, 0.35f, 1.00f) : ImVec4(0.92f, 0.22f, 0.22f, pulse);
+
+    ImVec2 p = ImGui::GetCursorScreenPos();
+    float radius = ready ? 4.0f : 3.0f + pulse * 1.5f;
+    ImGui::GetWindowDrawList()->AddCircleFilled(ImVec2(p.x + 7.0f, p.y + ImGui::GetTextLineHeight() * 0.5f), radius, ImGui::ColorConvertFloat4ToU32(dotColor));
+    ImGui::Dummy(ImVec2(14.0f, 0.0f));
+    ImGui::SameLine(0.0f, 6.0f);
+    if (ready) {
+        ImGui::TextColored(ImVec4(0.50f, 0.95f, 0.60f, 1.0f), "Remix API Ready");
+        ImGui::SameLine();
+        ImGui::TextDisabled("shader: %d  custom: %d", shaderActive, customActive);
+    } else {
+        ImGui::TextColored(ImVec4(0.96f, 0.36f, 0.36f, 1.0f), "Remix API not initialized");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(run with RTX Remix)");
+    }
+    ImGui::Separator();
 }
 
 static void DrawMatrix(const char* label, const D3DMATRIX& mat, bool available) {
@@ -2602,7 +2691,10 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
-        if (ImGui::BeginTabItem("Camera")) {
+        PushOverlayBoldFont();
+        bool cameraTabOpen = ImGui::BeginTabItem("Camera");
+        PopOverlayBoldFont();
+        if (cameraTabOpen) {
             ImGui::Text("Active game profile: %s", GameProfileLabel(g_activeGameProfile));
             ImGui::Text("Game SetTransform seen: WORLD=%s VIEW=%s PROJECTION=%s",
                         g_gameSetTransformSeen[0] ? "yes" : "no",
@@ -2851,7 +2943,10 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Shader")) {
+        PushOverlayBoldFont();
+        bool shaderTabOpen = ImGui::BeginTabItem("Shader");
+        PopOverlayBoldFont();
+        if (shaderTabOpen) {
             static char shaderFilter[64] = "";
             static const char* kShaderListOrderModes[] = {"Insertion order", "Hash (ascending)"};
             static const char* kShaderSearchScopeModes[] = {
@@ -3111,17 +3206,35 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Lights")) {
-            DrawRemixLightsTab(g_remixLightingManager);
+        PushOverlayBoldFont();
+        bool remixApiTabOpen = ImGui::BeginTabItem("Remix API");
+        PopOverlayBoldFont();
+        if (remixApiTabOpen) {
+            DrawRemixApiStatusLine(g_remixLightingManager, g_customLightsManager);
+            PushOverlayBoldFont();
+            if (ImGui::BeginTabBar("RemixApiSubTabs")) {
+                if (ImGui::BeginTabItem("Shader Lights")) {
+                    PopOverlayBoldFont();
+                    DrawRemixLightsTab(g_remixLightingManager, false);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                if (ImGui::BeginTabItem("Custom Lights")) {
+                    PopOverlayBoldFont();
+                    DrawCustomLightsTab(g_customLightsManager);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                ImGui::EndTabBar();
+            }
+            PopOverlayBoldFont();
             ImGui::EndTabItem();
         }
-		
-		if (ImGui::BeginTabItem("Custom API Lights")) {
-			DrawCustomLightsTab(g_customLightsManager);
-			ImGui::EndTabItem();
-		}
 
-        if (ImGui::BeginTabItem("Constants")) {
+        PushOverlayBoldFont();
+        bool constantsTabOpen = ImGui::BeginTabItem("Constants");
+        PopOverlayBoldFont();
+        if (constantsTabOpen) {
             g_constantUploadRecordingEnabled = true;
             ImGui::Text("Per-shader snapshots update every frame.");
             if (g_selectedShaderKey == 0) {
@@ -3469,7 +3582,10 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Memory Scanner")) {
+        PushOverlayBoldFont();
+        bool memoryscannerTabOpen = ImGui::BeginTabItem("Memory Scanner");
+        PopOverlayBoldFont();
+        if (memoryscannerTabOpen) {
             if (ImGui::Button("Start memory scan")) {
                 StartMemoryScanner();
             }
@@ -3515,7 +3631,10 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::EndTabItem();
         }
 
-        if (ImGui::BeginTabItem("Logs")) {
+        PushOverlayBoldFont();
+        bool logsTabOpen = ImGui::BeginTabItem("Logs");
+        PopOverlayBoldFont();
+        if (logsTabOpen) {
             ImGui::Checkbox("Live update", &g_logsLiveUpdate);
             ImGui::SameLine();
             if (ImGui::Button("Refresh")) {
