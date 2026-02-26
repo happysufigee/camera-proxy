@@ -2814,9 +2814,9 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(8.0f, 7.0f));
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.18f, 0.22f, 0.28f, 1.0f));
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.95f, 0.96f, 0.98f, 1.0f));
-                ImGui::PushItemFlag(ImGuiItemFlags_Disabled, true);
+                ImGui::BeginDisabled();
                 ImGui::Button(text, ImVec2(width, textSize.y + 14.0f));
-                ImGui::PopItemFlag();
+                ImGui::EndDisabled();
                 ImGui::PopStyleColor(2);
                 ImGui::PopStyleVar(2);
             };
