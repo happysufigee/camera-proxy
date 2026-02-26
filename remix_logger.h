@@ -23,9 +23,11 @@ inline void RemixLog(const char* fmt, ...) {
         GetModuleFileNameA(hSelf, iniPath, MAX_PATH);
         char* slash = std::strrchr(iniPath, '\\');
         if (slash) {
-            std::strcpy(slash + 1, "camera_proxy.ini");
+            strcpy_s(slash + 1,
+                     MAX_PATH - static_cast<size_t>(slash - iniPath) - 1,
+                     "camera_proxy.ini");
         } else {
-            std::strcpy(iniPath, "camera_proxy.ini");
+            strcpy_s(iniPath, sizeof(iniPath), "camera_proxy.ini");
         }
         s_enabled = GetPrivateProfileIntA("CameraProxy", "EnableRemixApiLog", 0, iniPath) != 0;
     }
@@ -45,7 +47,7 @@ inline void RemixLog(const char* fmt, ...) {
             strcpy_s(slash + 1, MAX_PATH - static_cast<int>(slash - path) - 1, "remix_api.log");
         else
             strcpy_s(path, sizeof(path), "remix_api.log");
-        s_file = fopen(path, "a");
+        fopen_s(&s_file, path, "a");
     }
     if (!s_file) return;
 
