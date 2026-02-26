@@ -146,7 +146,31 @@ struct ProxyConfig {
     float experimentalCustomProjectionAutoAspectFallback = 16.0f / 9.0f;
     ProjectionHandedness experimentalCustomProjectionAutoHandedness = ProjectionHandedness_Left;
     D3DMATRIX experimentalCustomProjectionManualMatrix = {};
+
+    bool rasterBlendEnabled = false;
+    int rasterBlendMode = 0;
+    float rasterBlendMixStrength = 1.0f;
+    bool rasterBlendWhiteMaterials = true;
 };
+
+enum RasterBlendMode {
+    RasterBlendMode_Multiply = 0,
+    RasterBlendMode_Additive = 1,
+    RasterBlendMode_Lerp = 2
+};
+
+struct RasterBlendVertex {
+    float x;
+    float y;
+    float z;
+    float rhw;
+    float u0;
+    float v0;
+    float u1;
+    float v1;
+};
+
+static constexpr DWORD kRasterBlendFVF = D3DFVF_XYZRHW | D3DFVF_TEX2;
 
 struct CombinedDecompositionDebugState {
     bool attempted = false;
@@ -258,6 +282,9 @@ static void UpdateMatrixSource(MatrixSlot slot,
 
 static bool g_imguiInitialized = false;
 static HWND g_imguiHwnd = nullptr;
+static bool g_rasterBlendResourcesFailed = false;
+static bool g_rasterBlendLastRasterCapture = false;
+static bool g_rasterBlendLastRemixCapture = false;
 static bool g_showImGui = false;
 static bool g_prevShowImGui = false;
 static bool g_selectCameraTabOnMenuOpen = false;
@@ -1648,6 +1675,24 @@ static bool SaveConfigRegisterValue(const char* key, int value) {
     char valueBuf[32] = {};
     snprintf(valueBuf, sizeof(valueBuf), "%d", value);
     return WritePrivateProfileStringA("CameraProxy", key, valueBuf, g_iniPath) != FALSE;
+}
+
+static bool SaveConfigRegisterValueInSection(const char* section, const char* key, int value) {
+    if (g_iniPath[0] == '\0') return false;
+    char valueBuf[32] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%d", value);
+    return WritePrivateProfileStringA(section, key, valueBuf, g_iniPath) != FALSE;
+}
+
+static bool SaveConfigBoolValueInSection(const char* section, const char* key, bool value) {
+    return SaveConfigRegisterValueInSection(section, key, value ? 1 : 0);
+}
+
+static bool SaveConfigFloatValueInSection(const char* section, const char* key, float value) {
+    if (g_iniPath[0] == '\0') return false;
+    char valueBuf[64] = {};
+    snprintf(valueBuf, sizeof(valueBuf), "%.7g", value);
+    return WritePrivateProfileStringA(section, key, valueBuf, g_iniPath) != FALSE;
 }
 
 static bool SaveConfigBoolValue(const char* key, bool value) {
@@ -3783,6 +3828,64 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                     ImGui::EndTabItem();
                     PushOverlayBoldFont();
                 }
+                if (ImGui::BeginTabItem("Blend Mode")) {
+                    PopOverlayBoldFont();
+                    bool configDirty = false;
+                    if (ImGui::Checkbox("Enable Raster Blend", &g_config.rasterBlendEnabled)) {
+                        configDirty |= SaveConfigBoolValueInSection("RasterBlend", "Enabled", g_config.rasterBlendEnabled);
+                    }
+                    if (g_config.rasterBlendEnabled && !remix_api::g_initialized) {
+                        ImGui::TextColored(ImVec4(0.95f, 0.85f, 0.25f, 1.0f), "Raster Blend requires RTX Remix to be running.");
+                    }
+                    if (g_config.rasterBlendEnabled) {
+                        static const char* kBlendModes[] = {
+                            "Multiply (raster × remix)",
+                            "Additive (remix + raster)",
+                            "Lerp (mix ratio)"
+                        };
+                        if (ImGui::Combo("Blend Mode", &g_config.rasterBlendMode, kBlendModes, IM_ARRAYSIZE(kBlendModes))) {
+                            g_config.rasterBlendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+                            configDirty |= SaveConfigRegisterValueInSection("RasterBlend", "Mode", g_config.rasterBlendMode);
+                        }
+                        if (ImGui::SliderFloat("Mix Strength", &g_config.rasterBlendMixStrength, 0.0f, 1.0f, "%.2f")) {
+                            configDirty |= SaveConfigFloatValueInSection("RasterBlend", "MixStrength", g_config.rasterBlendMixStrength);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            if (g_config.rasterBlendMode == RasterBlendMode_Multiply) {
+                                ImGui::SetTooltip("1.0 = full multiply, 0.0 = pure Remix");
+                            } else if (g_config.rasterBlendMode == RasterBlendMode_Additive) {
+                                ImGui::SetTooltip("amount of rasterized image added over Remix");
+                            } else {
+                                ImGui::SetTooltip("0.0 = pure Remix, 1.0 = pure rasterizer");
+                            }
+                        }
+                        if (ImGui::Checkbox("White Materials in Remix", &g_config.rasterBlendWhiteMaterials)) {
+                            configDirty |= SaveConfigBoolValueInSection("RasterBlend", "WhiteMaterials", g_config.rasterBlendWhiteMaterials);
+                        }
+                        if (ImGui::IsItemHovered()) {
+                            ImGui::SetTooltip("Enables rtx.whiteMaterialModeEnabled so multiply mode restores original textures over Remix lighting.");
+                        }
+
+                        ImGui::Separator();
+                        ImGui::Text("Status:");
+                        ImGui::TextColored(g_rasterBlendResourcesFailed ? ImVec4(0.95f, 0.35f, 0.35f, 1.0f) : ImVec4(0.35f, 0.95f, 0.35f, 1.0f),
+                                           "Resources: %s", g_rasterBlendResourcesFailed ? "failed" : "ready / pending");
+                        ImGui::TextColored(g_rasterBlendLastRasterCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                                           "Raster capture: %s", g_rasterBlendLastRasterCapture ? "ok" : "missing");
+                        ImGui::TextColored(g_rasterBlendLastRemixCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
+                                           "Remix capture: %s", g_rasterBlendLastRemixCapture ? "ok" : "missing");
+
+                        if (ImGui::CollapsingHeader("Known Limitations")) {
+                            ImGui::TextWrapped("Games that finish to offscreen render targets can produce a blank backbuffer capture at EndScene.");
+                            ImGui::TextWrapped("Raster post-processing (bloom, tone mapping, grading, UI) is captured and can be double-applied with Remix.");
+                            ImGui::TextWrapped("Multiply mode is designed for neutral/white Remix materials; enable White Materials for best results.");
+                            ImGui::TextWrapped("Feature is inactive while Remix is not running.");
+                        }
+                    }
+                    (void)configDirty;
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
                 ImGui::EndTabBar();
             }
             PopOverlayBoldFont();
@@ -4961,6 +5064,188 @@ private:
     uintptr_t m_projLockedShader = 0;
     int m_projLockedRegister = -1;
     bool m_remixFrameOpen = false;
+    IDirect3DSurface9* m_rasterCaptureSurface = nullptr;
+    IDirect3DSurface9* m_remixOutputSurface = nullptr;
+    IDirect3DTexture9* m_rasterCaptureTexture = nullptr;
+    IDirect3DTexture9* m_remixOutputTexture = nullptr;
+    IDirect3DVertexBuffer9* m_blendQuadVB = nullptr;
+    bool m_blendResourceCreationFailed = false;
+    bool m_lastWhiteMaterialApplied = false;
+    bool m_rasterCaptureTakenThisFrame = false;
+    bool m_lastRasterCaptureSucceeded = false;
+    bool m_lastRemixCaptureSucceeded = false;
+    bool m_lastBlendEnabledState = false;
+
+    void ReleaseBlendResources() {
+        if (m_blendQuadVB) { m_blendQuadVB->Release(); m_blendQuadVB = nullptr; }
+        if (m_rasterCaptureSurface) { m_rasterCaptureSurface->Release(); m_rasterCaptureSurface = nullptr; }
+        if (m_remixOutputSurface) { m_remixOutputSurface->Release(); m_remixOutputSurface = nullptr; }
+        if (m_rasterCaptureTexture) { m_rasterCaptureTexture->Release(); m_rasterCaptureTexture = nullptr; }
+        if (m_remixOutputTexture) { m_remixOutputTexture->Release(); m_remixOutputTexture = nullptr; }
+    }
+
+    bool EnsureBlendResources() {
+        if (m_blendResourceCreationFailed) {
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        if (m_rasterCaptureSurface && m_remixOutputSurface && m_blendQuadVB && m_rasterCaptureTexture && m_remixOutputTexture) {
+            return true;
+        }
+
+        IDirect3DSurface9* backBuffer = nullptr;
+        if (FAILED(m_real->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &backBuffer)) || !backBuffer) {
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        D3DSURFACE_DESC bbDesc = {};
+        HRESULT descHr = backBuffer->GetDesc(&bbDesc);
+        backBuffer->Release();
+        if (FAILED(descHr)) {
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        ReleaseBlendResources();
+        HRESULT hr = m_real->CreateTexture(bbDesc.Width, bbDesc.Height, 1, D3DUSAGE_RENDERTARGET, bbDesc.Format,
+                                           D3DPOOL_DEFAULT, &m_rasterCaptureTexture, nullptr);
+        if (FAILED(hr) || !m_rasterCaptureTexture ||
+            FAILED(m_rasterCaptureTexture->GetSurfaceLevel(0, &m_rasterCaptureSurface)) || !m_rasterCaptureSurface) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        hr = m_real->CreateTexture(bbDesc.Width, bbDesc.Height, 1, D3DUSAGE_RENDERTARGET, bbDesc.Format,
+                                   D3DPOOL_DEFAULT, &m_remixOutputTexture, nullptr);
+        if (FAILED(hr) || !m_remixOutputTexture ||
+            FAILED(m_remixOutputTexture->GetSurfaceLevel(0, &m_remixOutputSurface)) || !m_remixOutputSurface) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        hr = m_real->CreateVertexBuffer(sizeof(RasterBlendVertex) * 4, 0, kRasterBlendFVF, D3DPOOL_DEFAULT, &m_blendQuadVB, nullptr);
+        if (FAILED(hr) || !m_blendQuadVB) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+
+        RasterBlendVertex* vbData = nullptr;
+        if (FAILED(m_blendQuadVB->Lock(0, 0, reinterpret_cast<void**>(&vbData), 0)) || !vbData) {
+            ReleaseBlendResources();
+            m_blendResourceCreationFailed = true;
+            g_rasterBlendResourcesFailed = true;
+            return false;
+        }
+        vbData[0] = { -0.5f, -0.5f, 0.0f, 1.0f, 0.0f, 0.0f, 0.0f, 0.0f };
+        vbData[1] = { static_cast<float>(bbDesc.Width) - 0.5f, -0.5f, 0.0f, 1.0f, 1.0f, 0.0f, 1.0f, 0.0f };
+        vbData[2] = { static_cast<float>(bbDesc.Width) - 0.5f, static_cast<float>(bbDesc.Height) - 0.5f, 0.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f };
+        vbData[3] = { -0.5f, static_cast<float>(bbDesc.Height) - 0.5f, 0.0f, 1.0f, 0.0f, 1.0f, 0.0f, 1.0f };
+        m_blendQuadVB->Unlock();
+        g_rasterBlendResourcesFailed = false;
+        return true;
+    }
+
+    void ExecuteRasterBlendPass() {
+        if (!m_rasterCaptureTexture || !m_remixOutputTexture || !m_blendQuadVB) {
+            return;
+        }
+        DWORD zEnable = FALSE, zWrite = FALSE, alphaBlend = FALSE, alphaTest = FALSE, cullMode = D3DCULL_NONE, lighting = FALSE;
+        m_real->GetRenderState(D3DRS_ZENABLE, &zEnable);
+        m_real->GetRenderState(D3DRS_ZWRITEENABLE, &zWrite);
+        m_real->GetRenderState(D3DRS_ALPHABLENDENABLE, &alphaBlend);
+        m_real->GetRenderState(D3DRS_ALPHATESTENABLE, &alphaTest);
+        m_real->GetRenderState(D3DRS_CULLMODE, &cullMode);
+        m_real->GetRenderState(D3DRS_LIGHTING, &lighting);
+
+        IDirect3DVertexShader9* oldVS = nullptr;
+        IDirect3DPixelShader9* oldPS = nullptr;
+        IDirect3DBaseTexture9* oldT0 = nullptr;
+        IDirect3DBaseTexture9* oldT1 = nullptr;
+        IDirect3DVertexBuffer9* oldVB = nullptr;
+        UINT oldOffset = 0, oldStride = 0;
+        DWORD oldFVF = 0;
+        m_real->GetVertexShader(&oldVS);
+        m_real->GetPixelShader(&oldPS);
+        m_real->GetTexture(0, &oldT0);
+        m_real->GetTexture(1, &oldT1);
+        m_real->GetStreamSource(0, &oldVB, &oldOffset, &oldStride);
+        m_real->GetFVF(&oldFVF);
+
+        m_real->SetVertexShader(nullptr);
+        m_real->SetPixelShader(nullptr);
+        m_real->SetRenderState(D3DRS_ZENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+        m_real->SetRenderState(D3DRS_LIGHTING, FALSE);
+        m_real->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+        m_real->SetFVF(kRasterBlendFVF);
+        m_real->SetTexture(0, m_rasterCaptureTexture);
+        m_real->SetTexture(1, m_remixOutputTexture);
+
+        const int blendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+        DWORD tfactor = D3DCOLOR_COLORVALUE(g_config.rasterBlendMixStrength, g_config.rasterBlendMixStrength,
+                                            g_config.rasterBlendMixStrength, g_config.rasterBlendMixStrength);
+        m_real->SetRenderState(D3DRS_TEXTUREFACTOR, tfactor);
+        if (blendMode == RasterBlendMode_Multiply) {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE2X);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_LERP);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+        } else if (blendMode == RasterBlendMode_Additive) {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE | D3DTA_ALPHAREPLICATE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_MODULATE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_ADD);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(2, D3DTSS_COLORARG2, D3DTA_TEMP);
+        } else {
+            m_real->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+            m_real->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_LERP);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG0, D3DTA_TFACTOR);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG1, D3DTA_CURRENT);
+            m_real->SetTextureStageState(1, D3DTSS_COLORARG2, D3DTA_TEXTURE);
+            m_real->SetTextureStageState(2, D3DTSS_COLOROP, D3DTOP_DISABLE);
+        }
+        m_real->SetTextureStageState(3, D3DTSS_COLOROP, D3DTOP_DISABLE);
+
+        m_real->SetStreamSource(0, m_blendQuadVB, 0, sizeof(RasterBlendVertex));
+        m_real->DrawPrimitive(D3DPT_TRIANGLEFAN, 0, 2);
+
+        m_real->SetTexture(0, oldT0);
+        m_real->SetTexture(1, oldT1);
+        m_real->SetStreamSource(0, oldVB, oldOffset, oldStride);
+        m_real->SetFVF(oldFVF);
+        m_real->SetVertexShader(oldVS);
+        m_real->SetPixelShader(oldPS);
+        m_real->SetRenderState(D3DRS_ZENABLE, zEnable);
+        m_real->SetRenderState(D3DRS_ZWRITEENABLE, zWrite);
+        m_real->SetRenderState(D3DRS_ALPHABLENDENABLE, alphaBlend);
+        m_real->SetRenderState(D3DRS_ALPHATESTENABLE, alphaTest);
+        m_real->SetRenderState(D3DRS_CULLMODE, cullMode);
+        m_real->SetRenderState(D3DRS_LIGHTING, lighting);
+
+        if (oldVB) oldVB->Release();
+        if (oldT1) oldT1->Release();
+        if (oldT0) oldT0->Release();
+        if (oldPS) oldPS->Release();
+        if (oldVS) oldVS->Release();
+    }
 
 public:
     WrappedD3D9Device(IDirect3DDevice9* real) : m_real(real) {
@@ -4984,6 +5269,11 @@ public:
     }
 
     ~WrappedD3D9Device() {
+        if (m_lastWhiteMaterialApplied && remix_api::g_initialized && remix_api::g_api.SetConfigVariable) {
+            remix_api::g_api.SetConfigVariable("rtx.whiteMaterialModeEnabled", "0");
+            m_lastWhiteMaterialApplied = false;
+        }
+        ReleaseBlendResources();
         if (m_realEx) {
             m_realEx->Release();
             m_realEx = nullptr;
@@ -5961,6 +6251,38 @@ public:
             }
             m_remixFrameOpen = false;
         }
+
+        if (m_lastBlendEnabledState && !g_config.rasterBlendEnabled) {
+            m_blendResourceCreationFailed = false;
+            g_rasterBlendResourcesFailed = false;
+            g_rasterBlendLastRasterCapture = false;
+            g_rasterBlendLastRemixCapture = false;
+        }
+        m_lastBlendEnabledState = g_config.rasterBlendEnabled;
+
+        if (remix_api::g_initialized && remix_api::g_api.SetConfigVariable) {
+            const bool desiredWhiteMode = g_config.rasterBlendEnabled && g_config.rasterBlendWhiteMaterials;
+            if (desiredWhiteMode != m_lastWhiteMaterialApplied) {
+                remix_api::g_api.SetConfigVariable("rtx.whiteMaterialModeEnabled", desiredWhiteMode ? "1" : "0");
+                m_lastWhiteMaterialApplied = desiredWhiteMode;
+            }
+        }
+
+        m_lastRemixCaptureSucceeded = false;
+        if (g_config.rasterBlendEnabled && remix_api::g_initialized && EnsureBlendResources() &&
+            remix_api::g_api.dxvk_CopyRenderingOutput) {
+            const remixapi_ErrorCode copyResult = remix_api::g_api.dxvk_CopyRenderingOutput(
+                m_remixOutputSurface, REMIXAPI_DXVK_COPY_RENDERING_OUTPUT_TYPE_FINAL_COLOR);
+            m_lastRemixCaptureSucceeded = (copyResult == REMIXAPI_ERROR_CODE_SUCCESS);
+            g_rasterBlendLastRemixCapture = m_lastRemixCaptureSucceeded;
+            if (m_lastRemixCaptureSucceeded) {
+                ExecuteRasterBlendPass();
+            }
+        } else {
+            g_rasterBlendLastRemixCapture = false;
+        }
+
+        m_rasterCaptureTakenThisFrame = false;
         return m_real->Present(pSourceRect, pDestRect, hDestWindowOverride, pDirtyRegion);
     }
 
@@ -5979,6 +6301,7 @@ public:
     HRESULT STDMETHODCALLTYPE GetSwapChain(UINT iSwapChain, IDirect3DSwapChain9** pSwapChain) override { return m_real->GetSwapChain(iSwapChain, pSwapChain); }
     UINT STDMETHODCALLTYPE GetNumberOfSwapChains() override { return m_real->GetNumberOfSwapChains(); }
     HRESULT STDMETHODCALLTYPE Reset(D3DPRESENT_PARAMETERS* pPresentationParameters) override {
+        ReleaseBlendResources();
         if (g_imguiInitialized) {
             ImGui_ImplDX9_InvalidateDeviceObjects();
             // Do NOT call ImGui_ImplWin32_Shutdown here.
@@ -6034,9 +6357,27 @@ public:
 			g_customLightsManager.BeginFrame(g_lastDeltaSec);
             m_remixFrameOpen = true;
         }
+        m_rasterCaptureTakenThisFrame = false;
         return m_real->BeginScene();
     }
-    HRESULT STDMETHODCALLTYPE EndScene() override { return m_real->EndScene(); }
+    HRESULT STDMETHODCALLTYPE EndScene() override {
+        if (g_config.rasterBlendEnabled && remix_api::g_initialized && !m_rasterCaptureTakenThisFrame) {
+            if (EnsureBlendResources()) {
+                IDirect3DSurface9* currentRT = nullptr;
+                if (SUCCEEDED(m_real->GetRenderTarget(0, &currentRT)) && currentRT) {
+                    m_lastRasterCaptureSucceeded = SUCCEEDED(
+                        m_real->StretchRect(currentRT, nullptr, m_rasterCaptureSurface, nullptr, D3DTEXF_NONE));
+                    g_rasterBlendLastRasterCapture = m_lastRasterCaptureSucceeded;
+                    currentRT->Release();
+                    m_rasterCaptureTakenThisFrame = true;
+                } else {
+                    m_lastRasterCaptureSucceeded = false;
+                    g_rasterBlendLastRasterCapture = false;
+                }
+            }
+        }
+        return m_real->EndScene();
+    }
     HRESULT STDMETHODCALLTYPE Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) override { return m_real->Clear(Count, pRects, Flags, Color, Z, Stencil); }
     HRESULT STDMETHODCALLTYPE SetTransform(D3DTRANSFORMSTATETYPE State, const D3DMATRIX* pMatrix) override {
         int transformIdx = -1;
@@ -6703,6 +7044,14 @@ void LoadConfig() {
         GetPrivateProfileIntA("CameraProxy", "ExperimentalCustomProjectionAutoHandedness", ProjectionHandedness_Left, path);
     g_config.experimentalCustomProjectionAutoHandedness =
         (rawHandedness == ProjectionHandedness_Right) ? ProjectionHandedness_Right : ProjectionHandedness_Left;
+
+    g_config.rasterBlendEnabled = GetPrivateProfileIntA("RasterBlend", "Enabled", 0, path) != 0;
+    g_config.rasterBlendMode = GetPrivateProfileIntA("RasterBlend", "Mode", 0, path);
+    g_config.rasterBlendMode = std::clamp(g_config.rasterBlendMode, 0, 2);
+    GetPrivateProfileStringA("RasterBlend", "MixStrength", "1.0", customBuf, sizeof(customBuf), path);
+    g_config.rasterBlendMixStrength = (float)atof(customBuf);
+    g_config.rasterBlendMixStrength = std::clamp(g_config.rasterBlendMixStrength, 0.0f, 1.0f);
+    g_config.rasterBlendWhiteMaterials = GetPrivateProfileIntA("RasterBlend", "WhiteMaterials", 1, path) != 0;
 
     D3DMATRIX defaultManualProjection = {};
     CreateProjectionMatrixWithHandedness(&defaultManualProjection,
