@@ -4026,6 +4026,87 @@ static bool CrossValidateViewAgainstProjection(const D3DMATRIX& candidateView,
            (fabsf(vp_c1 - p_c1) / p_c1 < kTol);
 }
 
+static float MatrixMaxAbsDiff(const D3DMATRIX& a, const D3DMATRIX& b) {
+    const float* pa = reinterpret_cast<const float*>(&a);
+    const float* pb = reinterpret_cast<const float*>(&b);
+    float maxErr = 0.0f;
+    for (int i = 0; i < 16; ++i) {
+        maxErr = (std::max)(maxErr, fabsf(pa[i] - pb[i]));
+    }
+    return maxErr;
+}
+
+enum ViewCandidateConsistency {
+    ViewCandidateConsistency_None,
+    ViewCandidateConsistency_Original,
+    ViewCandidateConsistency_Inverse,
+    ViewCandidateConsistency_Ambiguous
+};
+
+static ViewCandidateConsistency ResolveViewInverseConsistency(const D3DMATRIX& originalView,
+                                                              const D3DMATRIX& inverseView,
+                                                              const D3DMATRIX* knownProjection,
+                                                              bool hasProjection,
+                                                              const D3DMATRIX* knownWorld,
+                                                              bool hasWorld,
+                                                              const D3DMATRIX* knownVP,
+                                                              bool hasVP,
+                                                              const D3DMATRIX* knownWV,
+                                                              bool hasWV,
+                                                              const D3DMATRIX* knownMVP,
+                                                              bool hasMVP) {
+    constexpr float kTolerance = 0.08f;
+    constexpr float kEdge = 0.02f;
+
+    int originalVotes = 0;
+    int inverseVotes = 0;
+    int checks = 0;
+
+    auto voteForLowerError = [&](float originalErr, float inverseErr) {
+        ++checks;
+        const bool originalGood = originalErr <= kTolerance;
+        const bool inverseGood = inverseErr <= kTolerance;
+        if (originalGood && !inverseGood) {
+            ++originalVotes;
+        } else if (inverseGood && !originalGood) {
+            ++inverseVotes;
+        } else if ((std::max)(0.0f, inverseErr - originalErr) > kEdge) {
+            ++originalVotes;
+        } else if ((std::max)(0.0f, originalErr - inverseErr) > kEdge) {
+            ++inverseVotes;
+        }
+    };
+
+    if (hasProjection && hasVP && knownProjection && knownVP) {
+        const D3DMATRIX originalVP = MultiplyMatrix(originalView, *knownProjection);
+        const D3DMATRIX inverseVP = MultiplyMatrix(inverseView, *knownProjection);
+        voteForLowerError(MatrixMaxAbsDiff(originalVP, *knownVP),
+                         MatrixMaxAbsDiff(inverseVP, *knownVP));
+    }
+    if (hasWorld && hasWV && knownWorld && knownWV) {
+        const D3DMATRIX originalWV = MultiplyMatrix(*knownWorld, originalView);
+        const D3DMATRIX inverseWV = MultiplyMatrix(*knownWorld, inverseView);
+        voteForLowerError(MatrixMaxAbsDiff(originalWV, *knownWV),
+                         MatrixMaxAbsDiff(inverseWV, *knownWV));
+    }
+    if (hasWorld && hasProjection && hasMVP && knownWorld && knownProjection && knownMVP) {
+        const D3DMATRIX originalMVP = MultiplyMatrix(MultiplyMatrix(*knownWorld, originalView), *knownProjection);
+        const D3DMATRIX inverseMVP = MultiplyMatrix(MultiplyMatrix(*knownWorld, inverseView), *knownProjection);
+        voteForLowerError(MatrixMaxAbsDiff(originalMVP, *knownMVP),
+                         MatrixMaxAbsDiff(inverseMVP, *knownMVP));
+    }
+
+    if (checks == 0 || originalVotes == inverseVotes) {
+        if (checks > 0 && originalVotes > 0 && inverseVotes > 0) {
+            return ViewCandidateConsistency_Ambiguous;
+        }
+        return ViewCandidateConsistency_None;
+    }
+    return (inverseVotes > originalVotes)
+        ? ViewCandidateConsistency_Inverse
+        : ViewCandidateConsistency_Original;
+}
+
 static bool IsIdentityMatrix(const D3DMATRIX& m, float tolerance) {
     return fabsf(m._11 - 1.0f) < tolerance &&
            fabsf(m._22 - 1.0f) < tolerance &&
@@ -5376,6 +5457,22 @@ public:
         g_profileDisableStructuralDetection = false;
         const bool allowStructuralDetection = !profileActive;
 
+        D3DMATRIX knownCombinedVp = {};
+        D3DMATRIX knownCombinedWv = {};
+        D3DMATRIX knownCombinedMvp = {};
+        bool hasKnownCombinedVp = false;
+        bool hasKnownCombinedWv = false;
+        bool hasKnownCombinedMvp = false;
+        {
+            std::lock_guard<std::mutex> lock(g_cameraMatricesMutex);
+            knownCombinedVp = g_cameraMatrices.vp;
+            knownCombinedWv = g_cameraMatrices.wv;
+            knownCombinedMvp = g_cameraMatrices.mvp;
+            hasKnownCombinedVp = g_cameraMatrices.hasVP;
+            hasKnownCombinedWv = g_cameraMatrices.hasWV;
+            hasKnownCombinedMvp = g_cameraMatrices.hasMVP;
+        }
+
         if (allowStructuralDetection && effectiveConstantData && Vector4fCount >= 12) {
             if (CountStridedCandidates(effectiveConstantData, StartRegister,
                                       Vector4fCount, 4u, MatrixClass_View) > 2) {
@@ -5433,7 +5530,8 @@ public:
                                                             transposed)) {
                         finalClass = MatrixClass_None;
                     }
-                    if (finalClass == MatrixClass_None && g_probeInverseView && rows == 4u) {
+                    if (g_probeInverseView && rows == 4u &&
+                        (finalClass == MatrixClass_None || finalClass == MatrixClass_View)) {
                         const float row0Len = sqrtf(Dot3(mat._11, mat._12, mat._13, mat._11, mat._12, mat._13));
                         const float row1Len = sqrtf(Dot3(mat._21, mat._22, mat._23, mat._21, mat._22, mat._23));
                         const float row2Len = sqrtf(Dot3(mat._31, mat._32, mat._33, mat._31, mat._32, mat._33));
@@ -5445,11 +5543,38 @@ public:
                             fabsf(Dot3(mat._11, mat._12, mat._13, mat._31, mat._32, mat._33)) < 0.05f &&
                             fabsf(Dot3(mat._21, mat._22, mat._23, mat._31, mat._32, mat._33)) < 0.05f;
                         if (orthonormal) {
-                            D3DMATRIX inverseView = InvertSimpleRigidView(mat);
-                            MatrixClassification inverseClass = ClassifyMatrixDeterministic(inverseView, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
-                            if (inverseClass == MatrixClass_View) {
-                                mat = inverseView;
+                            const D3DMATRIX originalMat = mat;
+                            const D3DMATRIX invCandidate = InvertSimpleRigidView(mat);
+                            MatrixClassification inverseClass = ClassifyMatrixDeterministic(invCandidate, static_cast<int>(rows), Vector4fCount, StartRegister, baseReg);
+
+                            if (finalClass == MatrixClass_None && inverseClass == MatrixClass_View) {
+                                mat = invCandidate;
                                 finalClass = inverseClass;
+                            }
+
+                            if (finalClass == MatrixClass_View) {
+                                const ViewCandidateConsistency viewConsistency = ResolveViewInverseConsistency(
+                                    originalMat,
+                                    invCandidate,
+                                    &m_currentProj,
+                                    m_hasProj,
+                                    &m_currentWorld,
+                                    m_hasWorld,
+                                    &knownCombinedVp,
+                                    hasKnownCombinedVp,
+                                    &knownCombinedWv,
+                                    hasKnownCombinedWv,
+                                    &knownCombinedMvp,
+                                    hasKnownCombinedMvp);
+                                if (viewConsistency == ViewCandidateConsistency_Inverse) {
+                                    mat = invCandidate;
+                                    LogMsg("Structural view disambiguation: c%d prefers inverse candidate using composition consistency",
+                                           static_cast<int>(baseReg));
+                                } else if (viewConsistency == ViewCandidateConsistency_Ambiguous ||
+                                           viewConsistency == ViewCandidateConsistency_None) {
+                                    LogMsg("Structural view disambiguation: c%d ambiguous/no consistency signal; keeping classified candidate",
+                                           static_cast<int>(baseReg));
+                                }
                             }
                         }
                     }
