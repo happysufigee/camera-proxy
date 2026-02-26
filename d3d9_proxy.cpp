@@ -1802,6 +1802,21 @@ static void DrawMatrixWithTranspose(const char* label, const D3DMATRIX& mat, boo
     DrawMatrix(label, transposed, available);
 }
 
+static void DrawCameraMatrixPanel(const char* childId,
+                                  const char* title,
+                                  MatrixSlot slot,
+                                  const D3DMATRIX& mat,
+                                  bool available,
+                                  bool transpose) {
+    if (ImGui::BeginChild(childId, ImVec2(0, 0), true)) {
+        ImGui::TextUnformatted(title);
+        ImGui::Separator();
+        DrawMatrixWithTranspose("Matrix", mat, available, transpose);
+        DrawMatrixSourceInfo(slot, available);
+    }
+    ImGui::EndChild();
+}
+
 static ShaderConstantState* GetShaderState(uintptr_t shaderKey, bool createIfMissing) {
     if (shaderKey == 0 && !createIfMissing) {
         return nullptr;
@@ -2757,17 +2772,35 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 }
             }
             ImGui::Separator();
-            DrawMatrixWithTranspose("World", camSnapshot.world, camSnapshot.hasWorld,
-                                    g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_World, camSnapshot.hasWorld);
-            ImGui::Separator();
-            DrawMatrixWithTranspose("View", camSnapshot.view, camSnapshot.hasView,
-                                    g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_View, camSnapshot.hasView);
-            ImGui::Separator();
-            DrawMatrixWithTranspose("Projection", camSnapshot.projection,
-                                    camSnapshot.hasProjection, g_showTransposedMatrices);
-            DrawMatrixSourceInfo(MatrixSlot_Projection, camSnapshot.hasProjection);
+            const float matrixPanelHeight = ImGui::GetTextLineHeightWithSpacing() * 11.5f;
+            ImGui::Columns(3, "CameraPrimaryMatrices", false);
+            ImGui::BeginChild("WorldMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("WorldMatrixPanelInner",
+                                  "World",
+                                  MatrixSlot_World,
+                                  camSnapshot.world,
+                                  camSnapshot.hasWorld,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ViewMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("ViewMatrixPanelInner",
+                                  "View",
+                                  MatrixSlot_View,
+                                  camSnapshot.view,
+                                  camSnapshot.hasView,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::NextColumn();
+            ImGui::BeginChild("ProjectionMatrixPanel", ImVec2(0, matrixPanelHeight), false);
+            DrawCameraMatrixPanel("ProjectionMatrixPanelInner",
+                                  "Projection",
+                                  MatrixSlot_Projection,
+                                  camSnapshot.projection,
+                                  camSnapshot.hasProjection,
+                                  g_showTransposedMatrices);
+            ImGui::EndChild();
+            ImGui::Columns(1);
             if (g_projectionDetectedByNumericStructure) {
                 ImGui::Text("Projection numeric detection: ACTIVE");
                 ImGui::Text("FOV: %.2f deg (%.3f rad)",
@@ -2930,6 +2963,39 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             if (g_matrixAssignStatus[0] != '\0') {
                 ImGui::TextWrapped("%s", g_matrixAssignStatus);
             }
+
+            ImGui::Separator();
+            ImGui::Text("Currently bound custom projection");
+            D3DMATRIX customProjectionPreview = {};
+            bool customProjectionUsesAuto = false;
+            float customProjectionAspect = 0.0f;
+            UINT customProjectionWidth = 0;
+            UINT customProjectionHeight = 0;
+            bool customProjectionAvailable = BuildExperimentalCustomProjectionMatrix(device,
+                                                                                      g_imguiHwnd,
+                                                                                      &customProjectionPreview,
+                                                                                      &customProjectionUsesAuto,
+                                                                                      &customProjectionAspect,
+                                                                                      &customProjectionWidth,
+                                                                                      &customProjectionHeight);
+            if (customProjectionAvailable) {
+                ImGui::Text("Mode: %s", customProjectionUsesAuto ? "auto-generated" : "manual");
+                if (customProjectionUsesAuto) {
+                    ImGui::Text("Resolved aspect: %.6f", customProjectionAspect);
+                    if (customProjectionWidth > 0 && customProjectionHeight > 0) {
+                        ImGui::Text("Source viewport: %ux%u", customProjectionWidth, customProjectionHeight);
+                    }
+                }
+            } else if (!g_config.experimentalCustomProjectionEnabled) {
+                ImGui::TextDisabled("Unavailable (ExperimentalCustomProjectionEnabled=0)");
+            } else {
+                ImGui::TextDisabled("Unavailable (projection mode or inputs invalid)");
+            }
+            DrawMatrixWithTranspose("Custom projection matrix",
+                                    customProjectionPreview,
+                                    customProjectionAvailable,
+                                    g_showTransposedMatrices);
+
             ImGui::EndTabItem();
         }
 
