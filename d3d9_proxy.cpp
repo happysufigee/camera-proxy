@@ -2974,6 +2974,36 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             }
 
             ImGui::Columns(3, "ShaderCols", true);
+            ImGui::BeginChild("ShaderBrowserTools", ImVec2(0, 72), true);
+            ImGui::TextUnformatted("Shader dump tools");
+            ImGui::Spacing();
+            const float dumpButtonWidth = (ImGui::GetContentRegionAvail().x - ImGui::GetStyle().ItemSpacing.x);
+            const float halfDumpButtonWidth = dumpButtonWidth > 0.0f ? dumpButtonWidth * 0.5f : 0.0f;
+            if (ImGui::Button("Dump all assembly", ImVec2(halfDumpButtonWidth, 0))) {
+                std::filesystem::create_directories("Shader_dump");
+                for (ShaderRecord* recPtr : shaderSnapshot) {
+                    if (!recPtr) continue;
+                    char path[128];
+                    snprintf(path, sizeof(path), "Shader_dump/%08X.asm.txt", recPtr->hash);
+                    std::ofstream(path) << recPtr->editableAssembly;
+                }
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Dump all bytecode", ImVec2(halfDumpButtonWidth, 0))) {
+                std::filesystem::create_directories("Shader_dump");
+                for (ShaderRecord* recPtr : shaderSnapshot) {
+                    if (!recPtr) continue;
+                    char path[128];
+                    snprintf(path, sizeof(path), "Shader_dump/%08X.bytecode.bin", recPtr->hash);
+                    std::ofstream f(path, std::ios::binary);
+                    const std::vector<uint32_t>& data = recPtr->replacementEnabled && !recPtr->modifiedBytecode.empty()
+                                                             ? recPtr->modifiedBytecode
+                                                             : recPtr->originalBytecode;
+                    f.write(reinterpret_cast<const char*>(data.data()), data.size() * sizeof(uint32_t));
+                }
+            }
+            ImGui::EndChild();
+            ImGui::Spacing();
             ImGui::BeginChild("ShaderBrowser", ImVec2(0, 420), true);
             for (ShaderRecord* recPtr : shaderSnapshot) {
                 if (!recPtr) continue;
