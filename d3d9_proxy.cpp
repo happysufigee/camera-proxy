@@ -2633,9 +2633,6 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
     }
     ImGui::SameLine();
     ImGui::Text("Status: %s", g_pauseRendering ? "Paused" : "Running");
-    ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them "
-                       "to the RTX Remix runtime through SetTransform() so Remix gets camera data in D3D9 titles.");
-
     if (ImGui::SliderFloat("UI scale", &g_imguiScaleRuntime, 0.5f, 3.0f, "%.2fx")) {
         ApplyImGuiScale(g_imguiHwnd);
         g_config.imguiScale = g_imguiScaleRuntime;
@@ -2681,16 +2678,6 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                          ImVec2(0, 80));
         ImGui::PopStyleColor(2);
     }
-
-    ImGui::Separator();
-    ImGui::Text("Credits: ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
-    ImGui::SameLine();
-    ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
-    ImGui::Text("modified by ");
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
 
     ImGui::Separator();
     if (ImGui::BeginTabBar("MainTabs")) {
@@ -2947,7 +2934,7 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
         }
 
         PushOverlayBoldFont();
-        bool shaderTabOpen = ImGui::BeginTabItem("Shader");
+        bool shaderTabOpen = ImGui::BeginTabItem("Shaders");
         PopOverlayBoldFont();
         if (shaderTabOpen) {
             static char shaderFilter[64] = "";
@@ -3206,31 +3193,6 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             }
             ImGui::EndChild();
             ImGui::Columns(1);
-            ImGui::EndTabItem();
-        }
-
-        PushOverlayBoldFont();
-        bool remixApiTabOpen = ImGui::BeginTabItem("Remix API");
-        PopOverlayBoldFont();
-        if (remixApiTabOpen) {
-            DrawRemixApiStatusLine(g_remixLightingManager, g_customLightsManager);
-            PushOverlayBoldFont();
-            if (ImGui::BeginTabBar("RemixApiSubTabs")) {
-                if (ImGui::BeginTabItem("Shader Lights")) {
-                    PopOverlayBoldFont();
-                    DrawRemixLightsTab(g_remixLightingManager, false);
-                    ImGui::EndTabItem();
-                    PushOverlayBoldFont();
-                }
-                if (ImGui::BeginTabItem("Custom Lights")) {
-                    PopOverlayBoldFont();
-                    DrawCustomLightsTab(g_customLightsManager);
-                    ImGui::EndTabItem();
-                    PushOverlayBoldFont();
-                }
-                ImGui::EndTabBar();
-            }
-            PopOverlayBoldFont();
             ImGui::EndTabItem();
         }
 
@@ -3586,6 +3548,31 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
         }
 
         PushOverlayBoldFont();
+        bool remixApiTabOpen = ImGui::BeginTabItem("Remix API");
+        PopOverlayBoldFont();
+        if (remixApiTabOpen) {
+            DrawRemixApiStatusLine(g_remixLightingManager, g_customLightsManager);
+            PushOverlayBoldFont();
+            if (ImGui::BeginTabBar("RemixApiSubTabs")) {
+                if (ImGui::BeginTabItem("Shader Lights")) {
+                    PopOverlayBoldFont();
+                    DrawRemixLightsTab(g_remixLightingManager, false);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                if (ImGui::BeginTabItem("Custom Lights")) {
+                    PopOverlayBoldFont();
+                    DrawCustomLightsTab(g_customLightsManager);
+                    ImGui::EndTabItem();
+                    PushOverlayBoldFont();
+                }
+                ImGui::EndTabBar();
+            }
+            PopOverlayBoldFont();
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
         bool memoryscannerTabOpen = ImGui::BeginTabItem("Memory Scanner");
         PopOverlayBoldFont();
         if (memoryscannerTabOpen) {
@@ -3667,6 +3654,46 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                     ImGui::SetScrollHereY(1.0f);
                 }
             }
+            ImGui::EndChild();
+            ImGui::EndTabItem();
+        }
+
+        PushOverlayBoldFont();
+        bool howToUseTabOpen = ImGui::BeginTabItem("How to Use");
+        PopOverlayBoldFont();
+        if (howToUseTabOpen) {
+            ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them to the RTX Remix runtime through SetTransform() so Remix receives stable camera data in D3D9 titles.");
+            ImGui::Separator();
+            PushOverlayBoldFont();
+            ImGui::Text("Credits");
+            PopOverlayBoldFont();
+            ImGui::Text("Original project:");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "Overseer");
+            ImGui::SameLine();
+            ImGui::Text("- https://github.com/mencelot/dmc4-camera-proxy");
+            ImGui::Text("Modified by ");
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.78f, 0.34f, 0.34f, 1.0f), "cobalticarus92");
+
+            ImGui::Separator();
+            PushOverlayBoldFont();
+            ImGui::Text("How to use each tab effectively for matrix hunting");
+            PopOverlayBoldFont();
+            ImGui::BeginChild("HowToUseGuide", ImVec2(0, 390), true);
+            ImGui::TextWrapped("1) Camera tab: Start here every session. Use this tab to verify whether the game is feeding transform state (SetTransform seen flags), inspect currently detected matrices, and pin candidate registers once you find stable slots. If values look correct but Remix camera still drifts, compare WORLD/VIEW/PROJECTION update cadence and use this tab's pin/reset controls to lock known-good registers while testing scene transitions.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("2) Shaders tab: Use this tab to discover where matrices originate. Filter shader labels and inspect disassembly to find constant ranges used by active vertex shaders. Prioritize shaders with high usage counts and stable hashes in gameplay camera states. The constant monitor in this tab highlights transform-related registers, which helps you map suspicious constants back to concrete shader programs before assigning overrides.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("3) Constants tab: Use this as the high-precision register inspector. Select the active shader, watch live c-register values, and group into 4-register matrices to quickly spot VIEW/PROJECTION patterns (orthonormal rows for view, perspective terms for projection). Apply overrides only after you confirm temporal stability across movement, FOV changes, cutscenes, and pause states. If a matrix breaks under transitions, clear that override and return to Shaders/Camera to re-validate source registers.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("4) Remix API tab: Use this tab after matrix detection is stable. Confirm API readiness, inspect shader light behavior, and verify custom light data without conflating lighting issues with matrix issues. If camera transforms are correct in Camera/Constants but Remix output still looks wrong, this tab helps isolate runtime-side integration problems rather than register selection mistakes.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("5) Memory Scanner tab: Use this for fallback discovery when shader-constant heuristics are inconclusive. Scan memory for matrix candidates, then assign promising hits as VIEW or PROJECTION and immediately validate in Camera tab. Treat scan hits as hypotheses: accept only candidates that remain coherent as camera position, orientation, and FOV evolve over time.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("6) Logs tab: Use this tab to correlate UI observations with runtime events. Look for matrix assignment messages, shader changes, scan result timings, and API state transitions. During troubleshooting, keep logs live and reproduce camera movement patterns; when a matrix interpretation is wrong, logs usually reveal the exact frame range or event where values diverged.");
+            ImGui::Spacing();
+            ImGui::TextWrapped("Recommended workflow: Camera -> Shaders -> Constants -> (optional) Memory Scanner -> Camera re-check -> Remix API -> Logs verification. This sequence minimizes false positives and helps you separate matrix identification errors from runtime or lighting behavior.");
             ImGui::EndChild();
             ImGui::EndTabItem();
         }
