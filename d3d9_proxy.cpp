@@ -32,6 +32,7 @@
 #include <sstream>
 #include <fstream>
 #include <filesystem>
+#include <array>
 #include <cctype>
 #include <cstdint>
 #include <cstring>
@@ -1351,16 +1352,53 @@ static void InitializeImGui(IDirect3DDevice9* device, HWND hwnd) {
     io.Fonts->Clear();
     g_overlayFontRegular = nullptr;
     g_overlayFontBold = nullptr;
-    const char* modulePathSource = g_modulePath[0] ? g_modulePath : g_gameExePath;
-    std::filesystem::path modulePath = std::filesystem::path(modulePathSource).parent_path();
-    std::filesystem::path regularPath = modulePath / "JetBrainsMono-Regular.ttf";
-    std::filesystem::path boldPath = modulePath / "JetBrainsMono-Bold.ttf";
-    if (std::filesystem::exists(regularPath) && std::filesystem::exists(boldPath)) {
-        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(regularPath.string().c_str(), 14.0f);
-        g_overlayFontBold = io.Fonts->AddFontFromFileTTF(boldPath.string().c_str(), 15.0f);
+
+    char windowsDir[MAX_PATH] = {};
+    if (GetWindowsDirectoryA(windowsDir, MAX_PATH) > 0) {
+        std::filesystem::path fontsDir = std::filesystem::path(windowsDir) / "Fonts";
+        constexpr std::array<const char*, 2> kRobotoRegularCandidates = {
+            "Roboto-Regular.ttf",
+            "Roboto/static/Roboto-Regular.ttf"
+        };
+        constexpr std::array<const char*, 2> kRobotoBoldCandidates = {
+            "Roboto-Bold.ttf",
+            "Roboto/static/Roboto-Bold.ttf"
+        };
+
+        for (const char* candidate : kRobotoRegularCandidates) {
+            std::filesystem::path fontPath = fontsDir / candidate;
+            if (std::filesystem::exists(fontPath)) {
+                g_overlayFontRegular = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 14.0f);
+                if (g_overlayFontRegular) {
+                    break;
+                }
+            }
+        }
+        for (const char* candidate : kRobotoBoldCandidates) {
+            std::filesystem::path fontPath = fontsDir / candidate;
+            if (std::filesystem::exists(fontPath)) {
+                g_overlayFontBold = io.Fonts->AddFontFromFileTTF(fontPath.string().c_str(), 15.0f);
+                if (g_overlayFontBold) {
+                    break;
+                }
+            }
+        }
+    }
+
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeui.ttf", 14.0f);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\segoeuib.ttf", 15.0f);
     }
     if (!g_overlayFontRegular) {
-        g_overlayFontRegular = io.Fonts->AddFontDefault();
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arial.ttf", 14.0f);
+    }
+    if (!g_overlayFontBold) {
+        g_overlayFontBold = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\arialbd.ttf", 15.0f);
+    }
+    if (!g_overlayFontRegular) {
+        g_overlayFontRegular = io.Fonts->AddFontFromFileTTF("C:\\Windows\\Fonts\\tahoma.ttf", 14.0f);
     }
     if (!g_overlayFontBold) {
         g_overlayFontBold = g_overlayFontRegular;
