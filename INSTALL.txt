@@ -1,12 +1,14 @@
-DMC4 Camera Proxy - Installation Instructions
-=============================================
+Camera Proxy - Installation Instructions
+========================================
 
-1. Copy these files to your DMC4 game folder (where DevilMayCry4.exe is located):
-   - d3d9.dll
+1. Build the proxy for the target architecture:
+   - x86 game: build\x86\d3d9.dll
+   - x64 game: build\x64\d3d9.dll
+
+2. Copy these files to your game folder (where the game EXE is located):
+   - d3d9.dll (matching game architecture)
    - camera_proxy.ini
 
-2. Launch the game
+3. Launch the game.
 
-3. Press Alt+M to open the camera menu
-
-That's it! Enjoy your custom camera controls.
+4. Press F10 to open the camera menu.
