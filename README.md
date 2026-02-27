@@ -140,7 +140,9 @@ If a matrix is unknown, identity is used as a safe fallback.
 1. **Install RTX Remix** runtime files in your game directory
 2. **Rename** Remix's runtime DLL to `d3d9_remix.dll`  
    *(or configure `RemixDllName` in the INI)*
-3. **Copy** this proxy's `d3d9.dll` into the game directory
+3. **Copy** the proxy `d3d9.dll` that matches your game architecture into the game directory
+   - x86 game -> `build\x86\d3d9.dll`
+   - x64 game -> `build\x64\d3d9.dll`
 4. **Copy** `camera_proxy.ini` into the same directory
 5. **Launch** the game and press **F10** to open the overlay
 
@@ -264,16 +266,16 @@ GameProfile = Barnyard  # or Barnyard2006
 ### Option A: Visual Studio Developer Command Prompt
 
 ```bat
-build.bat
+build.bat both   # or: build.bat x86 / build.bat x64
 ```
 
 ### Option B: Auto-detect VS Toolchain
 
 ```bat
-do_build.bat
+do_build.bat both   # or: do_build.bat x86 / do_build.bat x64
 ```
 
-**Output:** 32-bit `d3d9.dll` in the build directory.
+**Output:** `build/x86/d3d9.dll` and/or `build/x64/d3d9.dll`, depending on target.
 
 ---
 
