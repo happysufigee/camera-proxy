@@ -1,7 +1,5 @@
 # Camera Proxy for RTX Remix
 
-> **⚠️ Experimental Branch** - Shader-driven Remix compatibility for arbitrary DirectX 9 engines
-
 A Direct3D9 proxy DLL that enables RTX Remix support for games using programmable shaders by extracting and forwarding transform matrices at draw time.
 
 ---
