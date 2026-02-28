@@ -5960,7 +5960,7 @@ public:
                 bool transposed = false;
                 if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                       configuredRegister, static_cast<int>(rows), false, &mat)) {
-                    if (!g_config.probeTransposedLayouts ||
+                    if (!g_probeTransposedLayouts ||
                         !TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                           configuredRegister, static_cast<int>(rows), true, &mat)) {
                         continue;

@@ -6,6 +6,40 @@
 #include <cstdio>
 #include <cstring>
 
+namespace {
+
+FILE* OpenFileForReadWrite(const char* path, const char* mode) {
+#ifdef _MSC_VER
+    FILE* f = nullptr;
+    return (fopen_s(&f, path, mode) == 0) ? f : nullptr;
+#else
+    return fopen(path, mode);
+#endif
+}
+
+int ScanFloat3(const char* text, float* a, float* b, float* c) {
+#ifdef _MSC_VER
+    return sscanf_s(text, "%f %f %f", a, b, c);
+#else
+    return sscanf(text, "%f %f %f", a, b, c);
+#endif
+}
+
+int ScanFloat12(const char* text,
+                float* m00, float* m01, float* m02, float* m03,
+                float* m10, float* m11, float* m12, float* m13,
+                float* m20, float* m21, float* m22, float* m23) {
+#ifdef _MSC_VER
+    return sscanf_s(text, "%f %f %f %f %f %f %f %f %f %f %f %f",
+                    m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23);
+#else
+    return sscanf(text, "%f %f %f %f %f %f %f %f %f %f %f %f",
+                  m00, m01, m02, m03, m10, m11, m12, m13, m20, m21, m22, m23);
+#endif
+}
+
+} // namespace
+
 // ─── internal helpers ─────────────────────────────────────────────────────────
 
 void CustomLightsManager::NormalizeInPlace(float v[3]) {
@@ -440,7 +474,7 @@ static AnimationMode StrToAnim(const char* s) {
 
 bool CustomLightsManager::SaveToFile(const char* path) const {
     if (!path || !path[0]) return false;
-    FILE* f = fopen(path, "w");
+    FILE* f = OpenFileForReadWrite(path, "w");
     if (!f) { RemixLog("CustomLights: SaveToFile failed to open '%s'", path); return false; }
 
     for (const auto& l : m_lights) {
@@ -493,7 +527,7 @@ bool CustomLightsManager::SaveToFile(const char* path) const {
 
 bool CustomLightsManager::LoadFromFile(const char* path) {
     if (!path || !path[0]) return false;
-    FILE* f = fopen(path, "r");
+    FILE* f = OpenFileForReadWrite(path, "r");
     if (!f) { RemixLog("CustomLights: LoadFromFile failed to open '%s'", path); return false; }
 
     m_lights.clear();
@@ -527,30 +561,30 @@ bool CustomLightsManager::LoadFromFile(const char* path) {
         else if (strcmp(key,"name")           == 0) { snprintf(cur->name, sizeof(cur->name), "%s", val); }
         else if (strcmp(key,"enabled")        == 0) { cur->enabled = atoi(val) != 0; }
         else if (strcmp(key,"type")           == 0) { cur->type = StrToType(val); }
-        else if (strcmp(key,"color")          == 0) { sscanf(val, "%f %f %f", &cur->color[0], &cur->color[1], &cur->color[2]); }
+        else if (strcmp(key,"color")          == 0) { ScanFloat3(val, &cur->color[0], &cur->color[1], &cur->color[2]); }
         else if (strcmp(key,"intensity")      == 0) { cur->intensity = (float)atof(val); }
         else if (strcmp(key,"volumetricScale")== 0) { cur->volumetricRadianceScale = (float)atof(val); }
-        else if (strcmp(key,"position")       == 0) { sscanf(val, "%f %f %f", &cur->position[0], &cur->position[1], &cur->position[2]); }
+        else if (strcmp(key,"position")       == 0) { ScanFloat3(val, &cur->position[0], &cur->position[1], &cur->position[2]); }
         else if (strcmp(key,"radius")         == 0) { cur->radius = (float)atof(val); }
-        else if (strcmp(key,"xAxis")          == 0) { sscanf(val, "%f %f %f", &cur->xAxis[0], &cur->xAxis[1], &cur->xAxis[2]); }
-        else if (strcmp(key,"yAxis")          == 0) { sscanf(val, "%f %f %f", &cur->yAxis[0], &cur->yAxis[1], &cur->yAxis[2]); }
+        else if (strcmp(key,"xAxis")          == 0) { ScanFloat3(val, &cur->xAxis[0], &cur->xAxis[1], &cur->xAxis[2]); }
+        else if (strcmp(key,"yAxis")          == 0) { ScanFloat3(val, &cur->yAxis[0], &cur->yAxis[1], &cur->yAxis[2]); }
         else if (strcmp(key,"xSize")          == 0) { cur->xSize = (float)atof(val); }
         else if (strcmp(key,"ySize")          == 0) { cur->ySize = (float)atof(val); }
         else if (strcmp(key,"xRadius")        == 0) { cur->xRadius = (float)atof(val); }
         else if (strcmp(key,"yRadius")        == 0) { cur->yRadius = (float)atof(val); }
-        else if (strcmp(key,"axis")           == 0) { sscanf(val, "%f %f %f", &cur->axis[0], &cur->axis[1], &cur->axis[2]); }
+        else if (strcmp(key,"axis")           == 0) { ScanFloat3(val, &cur->axis[0], &cur->axis[1], &cur->axis[2]); }
         else if (strcmp(key,"axisLength")     == 0) { cur->axisLength = (float)atof(val); }
-        else if (strcmp(key,"direction")      == 0) { sscanf(val, "%f %f %f", &cur->direction[0], &cur->direction[1], &cur->direction[2]); }
+        else if (strcmp(key,"direction")      == 0) { ScanFloat3(val, &cur->direction[0], &cur->direction[1], &cur->direction[2]); }
         else if (strcmp(key,"angularDiam")    == 0) { cur->angularDiameterDegrees = (float)atof(val); }
         else if (strcmp(key,"domeTex")        == 0) { snprintf(cur->domeTexturePath, sizeof(cur->domeTexturePath), "%s", val); }
         else if (strcmp(key,"domeTransform")  == 0) {
-            sscanf(val, "%f %f %f %f %f %f %f %f %f %f %f %f",
-                   &cur->domeTransform[0][0], &cur->domeTransform[0][1], &cur->domeTransform[0][2], &cur->domeTransform[0][3],
-                   &cur->domeTransform[1][0], &cur->domeTransform[1][1], &cur->domeTransform[1][2], &cur->domeTransform[1][3],
-                   &cur->domeTransform[2][0], &cur->domeTransform[2][1], &cur->domeTransform[2][2], &cur->domeTransform[2][3]);
+            ScanFloat12(val,
+                        &cur->domeTransform[0][0], &cur->domeTransform[0][1], &cur->domeTransform[0][2], &cur->domeTransform[0][3],
+                        &cur->domeTransform[1][0], &cur->domeTransform[1][1], &cur->domeTransform[1][2], &cur->domeTransform[1][3],
+                        &cur->domeTransform[2][0], &cur->domeTransform[2][1], &cur->domeTransform[2][2], &cur->domeTransform[2][3]);
         }
         else if (strcmp(key,"shaping")        == 0) { cur->shaping.enabled = atoi(val) != 0; }
-        else if (strcmp(key,"shaping_dir")    == 0) { sscanf(val, "%f %f %f", &cur->shaping.direction[0], &cur->shaping.direction[1], &cur->shaping.direction[2]); }
+        else if (strcmp(key,"shaping_dir")    == 0) { ScanFloat3(val, &cur->shaping.direction[0], &cur->shaping.direction[1], &cur->shaping.direction[2]); }
         else if (strcmp(key,"shaping_cone")   == 0) { cur->shaping.coneAngleDegrees = (float)atof(val); }
         else if (strcmp(key,"shaping_soft")   == 0) { cur->shaping.coneSoftness = (float)atof(val); }
         else if (strcmp(key,"shaping_focus")  == 0) { cur->shaping.focusExponent = (float)atof(val); }
@@ -561,7 +595,7 @@ bool CustomLightsManager::LoadFromFile(const char* path) {
         else if (strcmp(key,"anim_fade_dur")  == 0) { cur->animation.fadeDuration = (float)atof(val); }
         else if (strcmp(key,"anim_saturation") == 0) { cur->animation.saturation = (float)atof(val); }
         else if (strcmp(key,"followCamera") == 0) { cur->followCamera = atoi(val) != 0; }
-        else if (strcmp(key,"cameraOffset") == 0) { sscanf(val, "%f %f %f", &cur->cameraOffset[0], &cur->cameraOffset[1], &cur->cameraOffset[2]); }
+        else if (strcmp(key,"cameraOffset") == 0) { ScanFloat3(val, &cur->cameraOffset[0], &cur->cameraOffset[1], &cur->cameraOffset[2]); }
     }
 
     fclose(f);
