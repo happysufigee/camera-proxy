@@ -299,6 +299,13 @@ void RemixLightingManager::ProcessDrawCall(const ShaderLightingMetadata& meta,
         else toWorld = world;
     }
 
+    // Critical correctness guard: view/object-space light constants must never be
+    // forwarded to Remix as-if they were world-space when transforms are missing.
+    // Doing so produces camera-relative lights that appear to follow the camera.
+    if (!canTransform && meta.lightSpace != LightingSpace::World) {
+        return;
+    }
+
     for (int i = 0; i < lightCount; ++i) {
         ManagedLight l = {};
         int reg = base + i * 4;

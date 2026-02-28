@@ -34,8 +34,11 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
 
     const char* kAnimNames[] = { "None", "Pulse", "Strobe", "FadeIn", "FadeOut", "Flicker", "ColorCycle", "Breathe", "FireFlicker", "ElectricFlicker" };
 
+    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+    ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.10f, 0.13f, 0.55f));
     ImGui::Columns(3, "CLCols", true);
 
+    ImGui::BeginChild("CustomLightListPanel", ImVec2(0, 0), true);
     PushOverlayBoldFont(); ImGui::Text("Lights"); PopOverlayBoldFont();
     ImGui::Separator();
     if (ImGui::Button("+ Add Light")) ImGui::OpenPopup("AddLightPopup");
@@ -70,15 +73,18 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
     if (ImGui::Button("Clear Handles")) manager.DestroyAllNativeHandles();
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("Destroys native handles. They are recreated automatically next frame.");
 
+    ImGui::EndChild();
+
     ImGui::NextColumn();
+    ImGui::BeginChild("CustomLightEditorPanel", ImVec2(0, 0), true);
     PushOverlayBoldFont(); ImGui::Text("Edit Light"); PopOverlayBoldFont();
     ImGui::Separator();
 
     CustomLight* lp = nullptr;
     for (auto& l : manager.Lights()) if (l.id == selectedId) { lp = &l; break; }
-    if (!lp) { ImGui::TextDisabled("Select a light to edit."); ImGui::NextColumn(); goto column3; }
-
-    {
+    if (!lp) {
+        ImGui::TextDisabled("Select a light to edit.");
+    } else {
         CustomLight& l = *lp;
         int typeIdx = static_cast<int>(l.type);
         if (ImGui::InputText("Name", l.name, sizeof(l.name))) l.dirty = true;
@@ -161,8 +167,10 @@ void DrawCustomLightsTab(CustomLightsManager& manager) {
         } else { PopOverlayBoldFont(); }
     }
 
+    ImGui::EndChild();
+
     ImGui::NextColumn();
-column3:
+    ImGui::BeginChild("CustomLightFilePanel", ImVec2(0, 0), true);
     PushOverlayBoldFont(); ImGui::Text("File"); PopOverlayBoldFont();
     ImGui::Separator();
     ImGui::InputText("##filepath", filePath, sizeof(filePath));
@@ -180,5 +188,9 @@ column3:
     ImGui::Text("Active handles: %d", active);
     ImGui::Text("API: %s", remix_api::g_initialized ? "Ready" : "Not initialized");
 
+    ImGui::EndChild();
+
     ImGui::Columns(1);
+    ImGui::PopStyleColor();
+    ImGui::PopStyleVar();
 }
