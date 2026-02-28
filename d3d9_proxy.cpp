@@ -2655,7 +2655,8 @@ static void UpdateHotkeys() {
     if (g_showImGui && !g_prevShowImGui) {
         // Menu just became visible — release any game mouse capture.
         ReleaseCapture();
-        g_selectCameraTabOnMenuOpen = true;
+        // Preserve the user's last selected tab instead of forcibly selecting Camera.
+        g_selectCameraTabOnMenuOpen = false;
     }
     g_prevShowImGui = g_showImGui;
     UpdateInputBlockHooks();
@@ -3882,23 +3883,30 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
         PopOverlayBoldFont();
         if (remixApiTabOpen) {
             DrawRemixApiStatusLine(g_remixLightingManager, g_customLightsManager);
-            PushOverlayBoldFont();
+            ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 8.0f);
+            ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.08f, 0.10f, 0.13f, 0.65f));
             if (ImGui::BeginTabBar("RemixApiSubTabs")) {
                 if (ImGui::BeginTabItem("Shader Lights")) {
-                    PopOverlayBoldFont();
+                    ImGui::BeginChild("ShaderLightsPanel", ImVec2(0, 0), true);
+                    ImGui::TextColored(ImVec4(0.62f, 0.89f, 1.0f, 1.0f), "Shader-derived Remix lights");
+                    ImGui::Separator();
                     DrawRemixLightsTab(g_remixLightingManager, false);
+                    ImGui::EndChild();
                     ImGui::EndTabItem();
-                    PushOverlayBoldFont();
                 }
                 if (ImGui::BeginTabItem("Custom Lights")) {
-                    PopOverlayBoldFont();
+                    ImGui::BeginChild("CustomLightsPanel", ImVec2(0, 0), true);
+                    ImGui::TextColored(ImVec4(0.73f, 1.0f, 0.72f, 1.0f), "Authored Remix API lights");
+                    ImGui::Separator();
                     DrawCustomLightsTab(g_customLightsManager);
+                    ImGui::EndChild();
                     ImGui::EndTabItem();
-                    PushOverlayBoldFont();
                 }
                 if (ImGui::BeginTabItem("Blend Mode")) {
-                    PopOverlayBoldFont();
                     bool configDirty = false;
+                    ImGui::BeginChild("BlendModePanel", ImVec2(0, 0), true);
+                    ImGui::TextColored(ImVec4(1.0f, 0.86f, 0.62f, 1.0f), "Raster/Remix compositing");
+                    ImGui::Separator();
                     if (ImGui::Checkbox("Enable Raster Blend", &g_config.rasterBlendEnabled)) {
                         configDirty |= SaveConfigBoolValueInSection("RasterBlend", "Enabled", g_config.rasterBlendEnabled);
                     }
@@ -3934,8 +3942,9 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                             ImGui::SetTooltip("Enables rtx.whiteMaterialModeEnabled so multiply mode restores original textures over Remix lighting.");
                         }
 
+                        ImGui::Spacing();
                         ImGui::Separator();
-                        ImGui::Text("Status:");
+                        ImGui::Text("Capture status");
                         ImGui::TextColored(g_rasterBlendResourcesFailed ? ImVec4(0.95f, 0.35f, 0.35f, 1.0f) : ImVec4(0.35f, 0.95f, 0.35f, 1.0f),
                                            "Resources: %s", g_rasterBlendResourcesFailed ? "failed" : "ready / pending");
                         ImGui::TextColored(g_rasterBlendLastRasterCapture ? ImVec4(0.35f, 0.95f, 0.35f, 1.0f) : ImVec4(0.95f, 0.35f, 0.35f, 1.0f),
@@ -3951,12 +3960,13 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                         }
                     }
                     (void)configDirty;
+                    ImGui::EndChild();
                     ImGui::EndTabItem();
-                    PushOverlayBoldFont();
                 }
                 ImGui::EndTabBar();
             }
-            PopOverlayBoldFont();
+            ImGui::PopStyleColor();
+            ImGui::PopStyleVar();
             ImGui::EndTabItem();
         }
 
@@ -4937,10 +4947,24 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
                 changed = true;
             }
         }
+        if (knownHasMv && !*hasWorld && *hasView) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*view, knownMv, &solved) &&
+                solveWorld(solved, "World = inv(View) * MV (column-order fallback)")) {
+                changed = true;
+            }
+        }
         if (knownHasMv && !*hasView && *hasWorld) {
             D3DMATRIX solved = {};
             if (TrySolveFromInverseLeftMultiply(*world, knownMv, &solved) &&
                 solveView(solved, "View = inv(World) * MV")) {
+                changed = true;
+            }
+        }
+        if (knownHasMv && !*hasView && *hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseRightMultiply(knownMv, *world, &solved) &&
+                solveView(solved, "View = MV * inv(World) (column-order fallback)")) {
                 changed = true;
             }
         }
@@ -4952,10 +4976,24 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
                 changed = true;
             }
         }
+        if (knownHasVp && !*hasView && *hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(*projection, knownVp, &solved) &&
+                solveView(solved, "View = inv(Projection) * VP (column-order fallback)")) {
+                changed = true;
+            }
+        }
         if (knownHasVp && !*hasProjection && *hasView) {
             D3DMATRIX solved = {};
             if (TrySolveFromInverseLeftMultiply(*view, knownVp, &solved) &&
                 solveProjection(solved, "Projection = inv(View) * VP")) {
+                changed = true;
+            }
+        }
+        if (knownHasVp && !*hasProjection && *hasView) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseRightMultiply(knownVp, *view, &solved) &&
+                solveProjection(solved, "Projection = VP * inv(View) (column-order fallback)")) {
                 changed = true;
             }
         }
@@ -4967,10 +5005,24 @@ static void TryDecomposeCombinedMatricesDeterministic(D3DMATRIX* world,
                 changed = true;
             }
         }
+        if (knownHasMvp && knownHasVp && !*hasWorld) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseLeftMultiply(knownVp, knownMvp, &solved) &&
+                solveWorld(solved, "World = inv(VP) * MVP (column-order fallback)")) {
+                changed = true;
+            }
+        }
         if (knownHasMvp && knownHasMv && !*hasProjection) {
             D3DMATRIX solved = {};
             if (TrySolveFromInverseLeftMultiply(knownMv, knownMvp, &solved) &&
                 solveProjection(solved, "Projection = inv(MV) * MVP")) {
+                changed = true;
+            }
+        }
+        if (knownHasMvp && knownHasMv && !*hasProjection) {
+            D3DMATRIX solved = {};
+            if (TrySolveFromInverseRightMultiply(knownMvp, knownMv, &solved) &&
+                solveProjection(solved, "Projection = MVP * inv(MV) (column-order fallback)")) {
                 changed = true;
             }
         }
@@ -5905,22 +5957,28 @@ public:
             }
             for (UINT rows : {4u, 3u}) {
                 D3DMATRIX mat = {};
+                bool transposed = false;
                 if (!TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
                                                       configuredRegister, static_cast<int>(rows), false, &mat)) {
-                    continue;
+                    if (!g_config.probeTransposedLayouts ||
+                        !TryBuildMatrixFromConstantUpdate(effectiveConstantData, StartRegister, Vector4fCount,
+                                                          configuredRegister, static_cast<int>(rows), true, &mat)) {
+                        continue;
+                    }
+                    transposed = true;
                 }
                 slotResolvedByOverride[slot] = true;
                 if (slot == MatrixSlot_World) {
                     m_currentWorld = mat;
                     m_hasWorld = true; m_everHadWorld = true;
                 m_worldLastFrame = g_frameCount;
-                    StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                    StoreWorldMatrix(m_currentWorld, shaderKey, configuredRegister, static_cast<int>(rows), transposed, true,
                                      "explicit register override");
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = mat;
                     m_hasView = true; m_everHadView = true;
                 m_viewLastFrame = g_frameCount;
-                    StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                    StoreViewMatrix(m_currentView, shaderKey, configuredRegister, static_cast<int>(rows), transposed, true,
                                     "explicit register override");
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = mat;
@@ -5930,16 +5988,16 @@ public:
                     g_projectionDetectedRegister = configuredRegister;
                     g_projectionDetectedHandedness = ProjectionHandedness_Unknown;
                     g_projectionDetectedFovRadians = 0.0f;
-                    StoreProjectionMatrix(m_currentProj, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                    StoreProjectionMatrix(m_currentProj, shaderKey, configuredRegister, static_cast<int>(rows), transposed, true,
                                           "explicit register override");
                 } else if (slot == MatrixSlot_MVP) {
-                    StoreMVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                    StoreMVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), transposed, true,
                                    "explicit register override");
                 } else if (slot == MatrixSlot_VP) {
-                    StoreVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                    StoreVPMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), transposed, true,
                                   "explicit register override");
                 } else if (slot == MatrixSlot_WV) {
-                    StoreWVMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), false, true,
+                    StoreWVMatrix(mat, shaderKey, configuredRegister, static_cast<int>(rows), transposed, true,
                                   "explicit register override");
                 }
                 return;
