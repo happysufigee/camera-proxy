@@ -2837,7 +2837,7 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
                 ImGui::PopStyleVar(2);
             };
 
-            ImGui::TextWrapped("This proxy detects World, View, and Projection matrices from shader constants and forwards them to RTX Remix through SetTransform(). The guidance below explains where each matrix typically appears, how to validate it, and how to avoid false positives.");
+            ImGui::TextWrapped("Camera Proxy helps older DirectX 9 games speak the camera language RTX Remix expects. It watches shader constants for World, View, and Projection matrices, then forwards the best-known transforms at draw time through SetTransform(). Use this page as a field guide: start with the live camera state, follow the evidence back to the shader constants, and only pin registers once they stay reliable across real gameplay.");
             ImGui::Separator();
 
             PushOverlayBoldFont();
@@ -2854,21 +2854,21 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
 
             ImGui::Separator();
             PushOverlayBoldFont();
-            ImGui::Text("Detailed tab guide for matrix hunting and verification");
+            ImGui::Text("Practical guide for finding and checking camera matrices");
             PopOverlayBoldFont();
             ImGui::BeginChild("AboutGuide", ImVec2(0, 430), true);
 
-            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Important: start from Camera, validate in Constants, then confirm source shaders before pinning overrides.");
+            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Start with Camera, validate in Constants, then confirm the source shader before pinning an override.");
             ImGui::Spacing();
 
-            DrawSectionLabel("1) Camera tab (default workflow anchor)");
-            ImGui::TextWrapped("Use Camera as your live truth panel. Verify SetTransform seen flags, monitor current World/View/Projection captures, and compare stability during movement, cutscenes, pause states, and FOV changes. Pin registers only after repeated scene transitions confirm stable behavior. If Remix drifts while matrices look plausible, compare update cadence (which matrix changes per frame) and reset overrides that desynchronize.");
+            DrawSectionLabel("1) Camera tab (your home base)");
+            ImGui::TextWrapped("Use Camera as the live readout while you play. Check whether the game already calls SetTransform, watch the current World/View/Projection captures, and see how they behave during movement, cutscenes, pause screens, and FOV changes. Pin a register only after it survives a few scene changes. If Remix starts drifting even though the numbers look reasonable, compare how often each matrix updates and reset any override that falls out of sync.");
             ImGui::Spacing();
 
             PushOverlayBoldFont();
-            ImGui::Text("Matrix taxonomy and literature-style examples");
+            ImGui::Text("Matrix patterns worth recognizing");
             PopOverlayBoldFont();
-            ImGui::TextWrapped("Reference conventions vary (row-major vs column-major, left-handed vs right-handed). Focus on recognizable patterns and behavior rather than exact sign placement.");
+            ImGui::TextWrapped("Games disagree on row order, column order, and handedness. Treat these as recognizable shapes, then trust how the candidate behaves in motion more than one exact sign layout.");
             ImGui::Spacing();
 
             ImGui::BeginChild("MatrixExamples", ImVec2(0, 290), true);
@@ -2893,7 +2893,7 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             DrawCenteredLine("[ 0    0    B    0 ]", ImVec4(0.90f, 1.0f, 0.92f, 1.0f));
             ImGui::Spacing();
 
-            DrawCenteredLine("Red flags for incorrect matrix candidates", ImVec4(1.0f, 0.78f, 0.78f, 1.0f));
+            DrawCenteredLine("Warning signs that a candidate is probably wrong", ImVec4(1.0f, 0.78f, 0.78f, 1.0f));
             DrawCenteredLine("- random high-magnitude jumps every frame", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
             DrawCenteredLine("- no coherent response to camera rotation/translation", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
             DrawCenteredLine("- perspective terms missing or unstable under FOV changes", ImVec4(1.0f, 0.88f, 0.88f, 1.0f));
@@ -2901,29 +2901,29 @@ static void RenderImGuiOverlay(IDirect3DDevice9* device) {
             ImGui::Spacing();
 
             DrawSectionLabel("2) Shaders tab (source attribution and assembly forensics)");
-            ImGui::TextWrapped("Use Shaders to identify exactly which vertex shader owns suspicious constants. Sort/filter by usage count and stable hash, then inspect disassembly comments to spot constant register ranges (for example, comments near dp4/mad instructions that reference c0-c3, c4-c7, c8-c11). These assembly comments often reveal matrix intent directly, making it faster to map constants to World, View, Projection, or combined MVP blocks before applying any override.");
-            ImGui::TextWrapped("When comments expose transform semantics, cross-check the same registers in Constants and verify temporal coherence over multiple camera motions. This prevents selecting short-lived registers used for effects instead of camera transforms.");
+            ImGui::TextWrapped("Use Shaders to find which vertex shader owns suspicious constants. Sort or filter by usage count and stable hash, then inspect the disassembly around dp4/mad instructions that read ranges such as c0-c3, c4-c7, or c8-c11. Those nearby comments and register groups often make the intended World, View, Projection, or combined MVP block much easier to spot.");
+            ImGui::TextWrapped("When a shader looks promising, cross-check the same registers in Constants and move the camera a few different ways. That extra pass helps avoid pinning a short-lived effect constant instead of the real camera transform.");
             ImGui::Spacing();
 
             DrawSectionLabel("3) Constants tab (precision register validation)");
-            ImGui::TextWrapped("Constants is the high-precision inspector. Pick an active shader, watch live c-register values, and inspect 4-register groups as candidate 4x4 matrices. Validate candidates by structure first, then by motion response: view matrices should rotate/translate coherently with camera movement, while projection rows should reflect perspective scaling and depth mapping.");
+            ImGui::TextWrapped("Constants is the close-up view. Pick an active shader, watch the live c-register values, and inspect four-register groups as possible 4x4 matrices. Check the shape first, then the motion: view matrices should follow camera rotation and translation, while projection rows should stay tied to perspective scaling, depth mapping, and FOV changes.");
             ImGui::Spacing();
 
             DrawSectionLabel("4) Remix API tab (runtime integration sanity checks)");
-            ImGui::TextWrapped("Use this tab after matrices are stable. Confirm API readiness, inspect shader/custom light state, and separate camera extraction issues from runtime-side lighting/integration behavior.");
+            ImGui::TextWrapped("Use this after the matrices look stable. Confirm that the Remix API is ready, inspect shader and custom-light state, and separate camera extraction problems from runtime-side lighting or integration behavior.");
             ImGui::Spacing();
 
             DrawSectionLabel("5) Memory Scanner tab (fallback hypothesis generation)");
-            ImGui::TextWrapped("When shader heuristics fail, scan memory for 4x4 candidates. Treat each hit as a hypothesis: assign temporarily, return to Camera, and reject any candidate that breaks under rapid movement, FOV change, area transitions, or pause/unpause.");
+            ImGui::TextWrapped("When shader-based detection is not enough, scan memory for 4x4 candidates. Treat every hit as a lead, not an answer: assign it temporarily, return to Camera, and reject it if it breaks during quick movement, FOV changes, area loads, or pause/unpause.");
             ImGui::Spacing();
 
             DrawSectionLabel("6) Logs tab (frame-accurate correlation)");
-            ImGui::TextWrapped("Correlate assignment events, shader switches, and scan timings with what you observe in Camera/Constants. Logs are the fastest way to identify the exact frame window where a matrix starts diverging.");
+            ImGui::TextWrapped("Use Logs to line up assignment events, shader switches, and scan timings with what you saw in Camera and Constants. When a matrix starts drifting, the log usually narrows the problem down to the exact frame window.");
             ImGui::Spacing();
             ImGui::Separator();
             ImGui::Spacing();
             ImGui::Spacing();
-            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Recommended workflow: Camera -> Shaders -> Constants -> (optional) Memory Scanner -> Camera re-check -> Remix API -> Logs.");
+            ImGui::TextColored(ImVec4(0.99f, 0.85f, 0.32f, 1.0f), "Suggested workflow: Camera -> Shaders -> Constants -> optional Memory Scanner -> Camera re-check -> Remix API -> Logs.");
 
             ImGui::EndChild();
             ImGui::EndTabItem();
@@ -5648,7 +5648,7 @@ public:
                 } else if (slot == MatrixSlot_View) {
                     m_currentView = manualMat;
                     m_hasView = true; m_everHadView = true;
-                m_viewLastFrame = g_frameCount;
+                    m_viewLastFrame = g_frameCount;
                     StoreViewMatrix(m_currentView, shaderKey, binding.baseRegister, binding.rows, false, true);
                 } else if (slot == MatrixSlot_Projection) {
                     m_currentProj = manualMat;
@@ -5746,8 +5746,9 @@ public:
                         resolvedProjection = generatedProjection;
                         m_currentProj = generatedProjection;
                         m_hasProj = true; m_everHadProj = true;
-                m_projLastFrame = g_frameCount;
+                        m_projLastFrame = g_frameCount;
                         g_mgrProjCapturedThisFrame = true;
+                        g_mgrProjectionRegisterValid = true;
                         g_projectionDetectedByNumericStructure = true;
                         g_projectionDetectedRegister = 8;
                         g_projectionDetectedHandedness = generatedProjectionInfo.handedness;
@@ -6471,7 +6472,6 @@ public:
             g_mgrWorldCapturedForDraw = false;
             g_mgrProjCapturedThisFrame = false;
             g_mgrViewCapturedThisFrame = false;
-            g_mgrProjectionRegisterValid = false;
         } else if (g_activeGameProfile == GameProfile_None) {
             m_viewLockedShader = 0;
             m_viewLockedRegister = -1;
